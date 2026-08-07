@@ -64,8 +64,8 @@ class Engine:
                         dtype: torch.dtype = torch.bfloat16) -> "Engine":
         return cls.from_checkpoint(load_checkpoint(path, device=device), device, dtype)
 
-    def allocate_cache(self, max_len: int, batch: int = 1) -> Cache:
-        return Cache.allocate(self.config, batch, max_len, self.device, self.dtype)
+    def allocate_cache(self, max_len: int, max_slots: int = 1) -> Cache:
+        return Cache.allocate(self.config, max_slots, max_len, self.device, self.dtype)
 
     # --- forward -------------------------------------------------------------
 
@@ -82,23 +82,64 @@ class Engine:
         materialise: the vocab is 248,320 wide, so logits cost ~1 MB per token in
         bf16 and 2 GB for a 2,048-token window in fp32. Perplexity applies the
         head in slices over *these*; generation only ever needs the last row.
+
+        With a cache, rows may be at **different lengths** — the batch is a set
+        of independent sequences, not a padded rectangle. `positions` is
+        therefore per row, and so is rope.
         """
         B, T = input_ids.shape
-        past = cache.seq_len if cache is not None else 0
+        slots = positions = attn_mask = None
+        kv_len = None
+
+        if cache is not None:
+            if cache.slots.numel() < B:
+                raise ValueError(f"cache assigns {cache.slots.numel()} slots for B={B}")
+            slots = cache.slots[:B]
+            positions = cache.lengths.index_select(0, slots)
+            kv_len = int(positions.max().item()) + T
+            if kv_len > cache.max_len:
+                raise ValueError(f"KV overflow: {kv_len} > max_len {cache.max_len}")
+            attn_mask = self._decode_mask(positions, T, kv_len)
+            pos = positions[:, None] + torch.arange(T, device=self.device)[None]
+        else:
+            pos = torch.arange(T, device=self.device)[None].expand(B, T)
 
         h = F.embedding(input_ids, self.embed_tokens)
-        pos = torch.arange(past, past + T, device=self.device)[None].expand(B, T)
         cos, sin = self.rope(pos)
 
         for i, layer in enumerate(self.layers):
-            h = layer(h, cos, sin, cache=cache.layers[i] if cache is not None else None)
+            h = layer(h, cos, sin,
+                      cache=cache.layers[i] if cache is not None else None,
+                      slots=slots, positions=positions, kv_len=kv_len,
+                      attn_mask=attn_mask)
 
         if cache is not None:
-            cache.seq_len += T
+            cache.lengths.index_copy_(0, slots, positions + T)
 
         if last_only:
             h = h[:, -1:]
         return rms_norm(h, self.final_norm, self.config.rms_norm_eps)
+
+    def _decode_mask(self, positions: torch.Tensor, T: int,
+                     kv_len: int) -> torch.Tensor | None:
+        """`[B, 1, T, kv_len]` additive mask, or `None` when `is_causal` suffices.
+
+        Two things have to be masked at once and they are easy to conflate:
+        **causality** (query t may not see key t+1) and **occupancy** (row b's
+        KV beyond its own length is another sequence's business, or zeros).
+        When every row is at the same length and T == kv_len, SDPA's `is_causal`
+        covers both; otherwise it covers neither correctly, because its mask is
+        aligned top-left.
+        """
+        same_length = bool((positions == positions[0]).all())
+        if same_length and T == kv_len:
+            return None
+        key = torch.arange(kv_len, device=self.device)
+        # query q of row b sits at absolute position positions[b] + q
+        q_abs = positions[:, None] + torch.arange(T, device=self.device)[None]   # [B, T]
+        allowed = key[None, None, :] <= q_abs[:, :, None]                        # [B, T, kv]
+        mask = torch.zeros(allowed.shape, device=self.device, dtype=self.dtype)
+        return mask.masked_fill_(~allowed, torch.finfo(self.dtype).min)[:, None]
 
     @torch.no_grad()
     def forward(
@@ -123,27 +164,84 @@ class Engine:
         eos_token_id: int | None = None,
         max_len: int | None = None,
     ) -> torch.Tensor:
-        """Greedy at `temperature == 0`, else top-p sampling. Returns `[B, n_new]`."""
+        """Single sequence. `[1, T] -> [1, n_new]`. See `generate_batch` for B>1."""
         if input_ids.shape[0] != 1:
-            raise NotImplementedError("B=1 only in Phase 2; the batch axis is Phase 3")
-        cache = self.allocate_cache(max_len or input_ids.shape[1] + max_new_tokens + 1)
+            raise ValueError("generate takes one sequence; use generate_batch")
+        out = self.generate_batch([input_ids[0].tolist()], max_new_tokens, temperature,
+                                  top_p, seed, eos_token_id, max_len)
+        return torch.tensor([out[0]], device=self.device, dtype=torch.long)
+
+    @torch.no_grad()
+    def generate_batch(
+        self,
+        prompts: list[list[int]],
+        max_new_tokens: int = 32,
+        temperature: float = 0.0,
+        top_p: float = 1.0,
+        seed: int | None = None,
+        eos_token_id: int | None = None,
+        max_len: int | None = None,
+        slots: list[int] | None = None,
+    ) -> list[list[int]]:
+        """Prefill each prompt on its own, then decode all of them together.
+
+        **Prefill is per sequence, decode is batched**, which is what a real
+        continuous-batching engine does and is also what the two halves of this
+        model can each support today: the GDN scan carries a per-sequence
+        recurrence, so a padded rectangle would feed pad tokens through it and
+        corrupt the state unless separately masked. Ragged batched prefill is
+        Phase 3 item 3.
+
+        `slots` assigns pool entries explicitly. Passing a non-identity
+        permutation is the test that the indirection is real rather than an
+        arange that happens to work.
+        """
+        B = len(prompts)
+        longest = max(len(p) for p in prompts)
+        max_len = max_len or longest + max_new_tokens + 1
+        n_slots = max(B, (max(slots) + 1) if slots else 0)
+        cache = self.allocate_cache(max_len, max_slots=n_slots)
+        assign = list(range(B)) if slots is None else list(slots)
+        if len(set(assign)) != B:
+            raise ValueError(f"slot assignment {assign} reuses a slot")
+
         gen = (torch.Generator(device=self.device).manual_seed(seed)
                if seed is not None else None)
 
-        logits = self.forward(input_ids, cache)[:, -1]
-        out: list[int] = []
+        # --- prefill, one sequence at a time into its own slot ---------------
+        last_logits = torch.empty(B, self.config.vocab_size,
+                                  device=self.device, dtype=self.dtype)
+        for row, (prompt, slot) in enumerate(zip(prompts, assign)):
+            cache.reset_slot(slot)
+            one = cache.select([slot])
+            ids = torch.tensor([prompt], device=self.device, dtype=torch.long)
+            last_logits[row] = self.forward(ids, one)[0, -1]
+
+        # --- decode, all rows together ---------------------------------------
+        batch = cache.select(assign)
+        out: list[list[int]] = [[] for _ in range(B)]
+        done = [False] * B
         for _ in range(max_new_tokens):
-            nxt = self._sample(logits, temperature, top_p, gen)
-            tok = int(nxt.item())
-            out.append(tok)
-            if eos_token_id is not None and tok == eos_token_id:
+            nxt = self._sample(last_logits, temperature, top_p, gen)   # [B]
+            for r, tok in enumerate(nxt.tolist()):
+                if not done[r]:
+                    out[r].append(tok)
+                    if eos_token_id is not None and tok == eos_token_id:
+                        done[r] = True
+            if all(done):
                 break
-            logits = self.forward(nxt[None], cache)[:, -1]
-        return torch.tensor([out], device=self.device, dtype=torch.long)
+            last_logits = self.forward(nxt[:, None], batch)[:, -1]
+        return out
 
     @staticmethod
     def _sample(logits: torch.Tensor, temperature: float, top_p: float,
                 gen: torch.Generator | None) -> torch.Tensor:
+        """`[B, vocab] -> [B]`. Every reduction is per row.
+
+        A sampler that reads its parameters — or its RNG draw — from row 0 is one
+        of the batch-leakage bugs the token-identity gate exists to catch, and it
+        is invisible at B=1.
+        """
         if temperature <= 0.0:
             return logits.argmax(-1)
         probs = torch.softmax(logits.float() / temperature, dim=-1)

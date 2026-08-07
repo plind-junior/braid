@@ -265,7 +265,9 @@ def test_caches_are_exact_in_fp32(cfg, layer_idx):
             mod = GatedDeltaNet(cfg, w)
             bulk = mod(x)
             c = RecurrentCache(cfg, 1, dev, dt)
-            step = torch.cat([mod(x[:, t:t + 1], cache=c) for t in range(T)], dim=1)
+            slot = torch.zeros(1, dtype=torch.int64, device=dev)
+            step = torch.cat([mod(x[:, t:t + 1], cache=c, slots=slot) for t in range(T)],
+                             dim=1)
         else:
             mod = Attention(cfg, w)
             rope = RotaryEmbedding(cfg, dev, dt)
@@ -273,10 +275,13 @@ def test_caches_are_exact_in_fp32(cfg, layer_idx):
             cos, sin = rope(pos)
             bulk = mod(x, cos, sin)
             kv = KVCache(cfg, 1, T + 2, dev, dt)
+            slot = torch.zeros(1, dtype=torch.int64, device=dev)
             outs = []
             for t in range(T):
                 ct, st = rope(pos[:, t:t + 1])
-                outs.append(mod(x[:, t:t + 1], ct, st, cache=kv))
+                where = torch.tensor([t], device=dev)
+                outs.append(mod(x[:, t:t + 1], ct, st, cache=kv, slots=slot,
+                                positions=where, kv_len=t + 1))
             step = torch.cat(outs, dim=1)
 
     r, c = _assert_parity(step, bulk, f"cache layer {layer_idx}",
@@ -306,7 +311,7 @@ def test_decode_matches_prefill(engine):
         cache = engine.allocate_cache(max_len=T + 4)
         step = torch.cat([engine.forward(ids[:, t: t + 1], cache) for t in range(T)], dim=1)
 
-    assert cache.seq_len == T
+    assert int(cache.lengths[0]) == T
     r, c = _metrics(step, bulk)
     print(f"\n  decode vs prefill (bf16, 32 layers): rel_l2={r:.3e} cosine={c:.9f}")
     assert torch.equal(step.argmax(-1), bulk.argmax(-1)), "greedy tokens differ"

@@ -48,7 +48,8 @@ class GatedDeltaNet:
 
     # --- convolution ---------------------------------------------------------
 
-    def _conv(self, x: torch.Tensor, cache: RecurrentCache | None) -> torch.Tensor:
+    def _conv(self, x: torch.Tensor, cache: RecurrentCache | None,
+              slots: torch.Tensor | None) -> torch.Tensor:
         """Depthwise causal conv + SiLU. `x` is `[B, C, T]`.
 
         SiLU is applied to **all** of Q, K and V, not just V.
@@ -58,28 +59,36 @@ class GatedDeltaNet:
         w = self.conv1d.unsqueeze(1)  # [C, 1, K]
 
         if cache is not None and T == 1:
-            # Decode: splice the window, then one dot per channel.
-            joined = torch.cat([cache.conv, x], dim=-1)
-            cache.conv.copy_(joined[:, :, -K:])
+            # Decode: splice each row's own window, then one dot per channel.
+            window = cache.conv.index_select(0, slots)          # [B, C, K]
+            joined = torch.cat([window, x], dim=-1)
+            cache.conv.index_copy_(0, slots, joined[:, :, -K:])
             out = F.conv1d(joined, w, self.conv_bias, padding=0, groups=C)
             return F.silu(out[:, :, -1:])
 
         if cache is not None:
+            if B != 1:
+                raise NotImplementedError(
+                    f"multi-token GDN at B={B}; batched prefill is Phase 3 item 3")
             # The cached window is the last K PRE-conv inputs. For T >= K this
             # pad is negative, i.e. a left truncation — HF's own trick.
-            cache.conv.copy_(F.pad(x, (K - T, 0)) if T < K else x[:, :, -K:])
+            new = F.pad(x, (K - T, 0)) if T < K else x[:, :, -K:]
+            cache.conv.index_copy_(0, slots, new)
         out = F.conv1d(x, w, self.conv_bias, padding=K - 1, groups=C)
         return F.silu(out[:, :, :T])
 
     # --- forward -------------------------------------------------------------
 
-    def forward(self, x: torch.Tensor, cache: RecurrentCache | None = None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, cache: RecurrentCache | None = None,
+                slots: torch.Tensor | None = None) -> torch.Tensor:
         cfg, g = self.cfg, self.g
         B, T, _ = x.shape
         dtype = x.dtype
+        if cache is not None and slots is None:
+            raise ValueError("a pooled cache needs a slot assignment")
 
         qkv = F.linear(x, self.in_proj_qkv).transpose(1, 2)   # [B, C, T]
-        qkv = self._conv(qkv, cache).transpose(1, 2)          # [B, T, C]
+        qkv = self._conv(qkv, cache, slots).transpose(1, 2)   # [B, T, C]
 
         # [Q | K | V], Q FIRST. Settled empirically by tests/test_hf_parity.py,
         # not read off the reference engine — the two readings of it disagree and
@@ -109,9 +118,15 @@ class GatedDeltaNet:
         kn = _l2norm(k).float()
         vf = v.float()
 
-        state = (cache.state if cache is not None else
-                 torch.zeros(B, g.n_heads, g.state_size, g.head_dim,
-                             device=x.device, dtype=torch.float32))
+        # Gather each row's slab, run the recurrence, scatter it back. The two
+        # copies are 2 MiB per row per layer each way — the whole reason the
+        # Phase 1 CUDA kernel takes `slot_idx` and does the indirection on the
+        # device instead. This torch path exists to be obviously correct.
+        if cache is not None:
+            state = cache.state.index_select(0, slots)
+        else:
+            state = torch.zeros(B, g.n_heads, g.state_size, g.head_dim,
+                                device=x.device, dtype=torch.float32)
 
         y = torch.empty(B, T, g.n_heads, g.head_dim, device=x.device, dtype=torch.float32)
         for t in range(T):
@@ -119,6 +134,8 @@ class GatedDeltaNet:
                 state=state, q=qn[:, t], k=kn[:, t], v=vf[:, t],
                 alpha=alpha[:, t], beta=beta[:, t], cfg=g, normalize=False,
             )
+        if cache is not None:
+            cache.state.index_copy_(0, slots, state)
 
         # HF casts the scan output back to the activation dtype BEFORE gating.
         core = y.to(dtype).reshape(-1, g.head_dim)

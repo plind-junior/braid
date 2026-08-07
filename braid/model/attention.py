@@ -90,6 +90,9 @@ class Attention:
         sin: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
         cache: "KVCache | None" = None,
+        slots: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        kv_len: int | None = None,
     ) -> torch.Tensor:
         cfg = self.cfg
         B, T, _ = x.shape
@@ -109,16 +112,19 @@ class Attention:
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
         if cache is not None:
+            if slots is None or positions is None or kv_len is None:
+                raise ValueError("a pooled KV cache needs slots, positions and kv_len")
             # SDPA's `is_causal` aligns its mask TOP-LEFT, so it is only correct
-            # when q_len == kv_len. Chunked prefill (T > 1 onto a non-empty
-            # cache) needs an explicit mask; refuse rather than mask wrongly.
-            if T > 1 and cache.length > 0 and attn_mask is None:
+            # when q_len == kv_len. A T>1 forward onto a non-empty cache needs an
+            # explicit mask; refuse rather than mask wrongly.
+            if T > 1 and kv_len != T and attn_mask is None:
                 raise NotImplementedError(
-                    f"chunked prefill (T={T} onto {cache.length} cached tokens) needs an "
+                    f"chunked prefill (T={T} onto {kv_len - T} cached tokens) needs an "
                     "explicit attn_mask; is_causal would align the mask top-left. "
-                    "Phase 3."
+                    "Phase 3 item 3."
                 )
-            k, v = cache.append(k, v)
+            cache.write(k, v, slots, positions)
+            k, v = cache.read(slots, kv_len)
 
         o = F.scaled_dot_product_attention(
             q, k, v,

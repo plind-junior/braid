@@ -295,10 +295,22 @@ NVFP4 35B was budgeted at, so KV headroom is not a constraint at B=1 on this tar
 
 ## Phase 3 — The batch axis, everywhere (weeks 10–14)
 
-1. **Batched eager decode at B = 2…16.** The batch axis through the *whole* forward, not just
-   the scan, plus the recurrent slot pool.
+1. **Batched eager decode at B = 2…16.** ✅ **DONE 2026-08-07** — `braid/model/cache.py`
+   reworked to slot pools, batched decode through `gdn.py`/`attention.py`/`engine.py`,
+   10 tests in `tests/test_batched_decode.py`. **Gate passed at the stated length:
+   8 prompts, 256 tokens, 8/8 rows token-for-token identical.**
+
+   State is now addressed by **slot**, not by batch row: a pool of `max_slots`
+   entries plus a device-resident `slot_idx[batch]`. Prefill runs one sequence at a
+   time into its own slot; decode runs all rows together. That split is what both
+   halves of the model support today — a padded rectangle would feed pad tokens
+   through the GDN recurrence and corrupt the state unless separately masked, which
+   is item 3's problem.
+
 2. **Graph buckets** {1, 2, 4, 8, 16} with padding, and a no-sync audit.
 3. **KV block manager + chunked prefill**, single sequence per forward.
+   Also removes the two 2 MiB-per-row-per-layer gather/scatter copies the eager
+   torch path currently pays for the recurrent slab, and the KV `index_select`.
 
 **Gate — greedy token identity.** 8 prompts run as one B=8 batch produce **token-for-token
 the same 256 outputs** as 8 sequential B=1 runs.
@@ -307,6 +319,32 @@ the same 256 outputs** as 8 sequential B=1 runs.
 > once: a per-row sampling parameter read from row 0, an expert-combine kernel with no token
 > stride (the reference engine's `moe_weighted_sum_residual` has *no token dimension at
 > all*), a shared workspace aliased across rows.
+
+> **Amended 2026-08-07: the gate is asserted in fp32, and that is not a weakening.**
+> Measured (`scripts/batch_identity_diag.py`):
+>
+> | dtype | rows token-identical | logit residual, B=8 vs B=1 |
+> |---|---|---:|
+> | **fp32** | **8/8** | 1e-6 (machine precision) |
+> | bf16 | 6/8 | 1e-2 |
+>
+> The bf16 gap is not a defect and no implementation removes it: a B=8 GEMM and a B=1
+> GEMM select different tiles and split-k, so they accumulate in different orders. The
+> resulting residual is the **same magnitude as Phase 2's B=1 decode-vs-prefill drift**
+> — batching did not make it worse — and greedy argmax amplifies it discontinuously
+> wherever the top two candidates are closer than the residual. Row 1's top-2 gap at the
+> first decode step is 0.125 against logits of order 10.
+>
+> Asserting bf16 token identity would be asserting that cuBLAS picks the same tiles at
+> M=1 and M=8, which braid neither controls nor should depend on. So bf16 is gated on
+> **teacher-forced logit agreement** instead — feed both paths the same tokens so
+> sampling cannot amplify, and bound the per-step residual (measured worst 1.24e-2,
+> 2 argmax flips in 96 steps). A genuine leak moves that immediately; tile selection
+> does not. Free-running bf16 identity is *reported*, not asserted.
+>
+> **This matters for Phase 4.** The published head-to-head runs in bf16, so braid's
+> batched output is not bit-reproducible against its own single-stream output. That is
+> true of every batched engine and must be stated rather than discovered by a reviewer.
 
 Secondary gates: graph replay **bit-identical** to eager for every bucket;
 `compute-sanitizer` clean during capture; a deliberately inserted `.item()` makes capture

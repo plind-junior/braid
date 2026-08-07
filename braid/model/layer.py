@@ -33,9 +33,17 @@ class DecoderLayer:
         cos: torch.Tensor,
         sin: torch.Tensor,
         cache: KVCache | RecurrentCache | None = None,
+        slots: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        kv_len: int | None = None,
+        attn_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         h = rms_norm(x, self.input_layernorm, self.cfg.rms_norm_eps)
-        h = self.mixer(h, cache=cache) if self.is_gdn else self.mixer(h, cos, sin, cache=cache)
+        if self.is_gdn:
+            h = self.mixer(h, cache=cache, slots=slots)
+        else:
+            h = self.mixer(h, cos, sin, attn_mask=attn_mask, cache=cache,
+                           slots=slots, positions=positions, kv_len=kv_len)
         x = x + h
 
         h = rms_norm(x, self.post_attention_layernorm, self.cfg.rms_norm_eps)
