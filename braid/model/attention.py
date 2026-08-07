@@ -81,12 +81,24 @@ def grouped_decode_attention(
 ) -> torch.Tensor:
     """T=1 GQA attention that never materialises the replicated K and V.
 
-    `F.scaled_dot_product_attention(..., enable_gqa=True)` is correct and, at
-    `head_dim = 256`, expensive in a specific way. Every fused backend on this
-    box declines that head width ("head_dim should be no more than 128"), so
-    SDPA falls to the **math** backend, which `repeat_interleave`s K and V up to
-    the full head count and then scales the *transposed key*. Profiled at B=16,
-    `kv_len=512`, per step across the 8 attention layers:
+    `F.scaled_dot_product_attention(..., enable_gqa=True)` is correct and, as
+    braid calls it, expensive in a specific way: it falls to the **math**
+    backend, which `repeat_interleave`s K and V up to the full head count and
+    then scales the *transposed key*, in fp32.
+
+    **The reason is the explicit `attn_mask`, not `head_dim`.** An earlier
+    revision of this comment blamed the head width, and that is measurably
+    wrong (`scripts/sdpa_backend_diag.py`): flash accepts `head_dim = 256` on
+    this box for every shape braid issues, decode included, and the default
+    dispatcher picks `flash_fwd_splitkv_kernel` for T=1. Only `mem_efficient`
+    and `cudnn` decline the head width. What flash will not take is an
+    arbitrary additive mask — and `decode_step` must pass one, because `kv_len`
+    is pinned to `max_len` while rows have different live lengths.
+
+    So flash-decoding is reachable, and reaching it means giving attention
+    per-row KV lengths instead of a mask — varlen or a paged kernel, which is
+    Phase 3 item 3's block manager. Until then this is the fast correct path.
+    Profiled at B=16, `kv_len=512`, per step across the 8 attention layers:
 
         1.70 ms   aten::copy_  [16, 4, 4, 512, 256]   the 4x replication of K,V
         1.38 ms   aten::mul    [16, 16, 256, 512]     scaling the expanded key

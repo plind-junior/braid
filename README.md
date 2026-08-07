@@ -142,8 +142,16 @@ Each excluded on someone's published measurement, not on taste:
 - **WY / SSD / tensor-core chunkwise scan variants.** Every tensor-core variant loses to a
   plain chunk-cached scalar loop.
 - **NVFP4 on GDN projections.** Measured −9% to −20% decode; tuned FP16 wins on those shapes.
-- **INT8 / FP8 weight paths in stock PyTorch.** `torch._weight_int8pack_mm` is 5–50× *slower*
-  than bf16 here; `torch._scaled_mm` FP8 returns `CUBLAS_STATUS_NOT_SUPPORTED` on sm_120.
+- **`torch._weight_int8pack_mm` as an INT8 weight path.** 5–50× *slower* than bf16 here —
+  it is doing M separate GEMVs. Re-confirmed 2026-08-08 at the real decode shapes: 0.06×.
+
+> **Correction, 2026-08-08.** This list previously also held *"`torch._scaled_mm` FP8 returns
+> `CUBLAS_STATUS_NOT_SUPPORTED` on sm_120"*. That is **no longer true** on this box
+> (torch 2.11.0+cu128, CUDA 12.8.61): `_scaled_mm` runs, and at the MLP decode shape from an
+> HBM-resident working set it is **1.95× bf16** (1.81× including the activation cast). It is
+> W8A8, not weight-only, so the open question is accuracy rather than availability — see
+> `braid/bench/gemm_paths.py`. This is currently the only reduced-byte weight path on this
+> card that works at all, which makes it the Phase 4 quantization candidate.
 - **Multi-GPU, tensor parallelism, CPU offload.** One card is the premise.
 
 ## Documentation

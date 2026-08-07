@@ -25,13 +25,24 @@ the offset entirely is the failure the gate is actually for; that is the
 from __future__ import annotations
 
 import torch
+import torch.nn.functional as F
 
 
 def rms_norm(x: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Tensor:
-    """gamma is the EFFECTIVE gamma — already `1 + W` where that applies."""
-    xf = x.float()
-    xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    return (xf * gamma).type_as(x)
+    """gamma is the EFFECTIVE gamma — already `1 + W` where that applies.
+
+    Spelled as `F.rms_norm` over an **fp32** input rather than the hand-written
+    `pow -> mean -> rsqrt -> mul -> mul`. That is 5 kernels collapsed into 1, and
+    a decode step runs ~105 norms. Measured at `[16, 1, 2560]`: 12.11 -> 5.22 us
+    per call, and `torch.equal` against the hand-written form — **bit-exact**,
+    not merely close (`scripts/rmsnorm_probe.py`).
+
+    The fp32 input is load-bearing and is why the faster spelling is not used.
+    Handing `F.rms_norm` a bf16 tensor directly is another 1.6x on top, and it
+    computes the reduction in bf16: 2.8e-3 relative, a numerics change wearing a
+    perf change's clothes. braid's contract is fp32-then-cast, matching HF.
+    """
+    return F.rms_norm(x.float(), (x.shape[-1],), gamma, eps).type_as(x)
 
 
 def rms_norm_gated(
@@ -52,8 +63,9 @@ def rms_norm_gated(
     no-op. `tests/test_full_forward.py` exercises it in bf16.
     """
     input_dtype = x.dtype
-    xf = x.float()
-    xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
+    # `weight=None`: gamma is applied *after* the cast below, not inside the
+    # norm, which is the whole point of this function.
+    xf = F.rms_norm(x.float(), (x.shape[-1],), None, eps)
     h = gamma * xf.to(input_dtype)
-    h = h * torch.nn.functional.silu(gate.float())
+    h = h * F.silu(gate.float())
     return h.to(input_dtype)

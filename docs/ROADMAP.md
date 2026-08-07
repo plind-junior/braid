@@ -336,13 +336,14 @@ NVFP4 35B was budgeted at, so KV headroom is not a constraint at B=1 on this tar
    > `braid/bench/decode_profile.py` is the tool; `docs/runbooks/decode-profile.md`
    > is the record.
    >
-   > It also re-ranks the rest of this item. The step is now GEMM-dominated
-   > (8.17 ms of 12.07 at B=16, 68% of the weight-read roofline), so the two
-   > remaining pieces are worth **0.43 ms** (the KV `index_select`, which exists
-   > only because attention cannot address the pool through `slot_idx` the way the
-   > GDN kernels already do) and a length-dependent share of the attention bmms
-   > (bucketing `kv_len`). Both are real; neither is the biggest lever any more.
-   > `ncu` on `cutlass_80_wmma_tensorop_bf16_s161616gemm` is.
+   > It also re-ranks the rest of this item, and raises its value. The two remaining
+   > pieces are worth **0.43 ms** directly (the KV `index_select`, which exists only
+   > because attention cannot address the pool through `slot_idx` the way the GDN
+   > kernels already do) plus a length-dependent share of the attention bmms
+   > (bucketing `kv_len`) — but they also **unlock flash-decoding**. Flash accepts
+   > `head_dim = 256` on this box for every shape braid issues; what it will not take
+   > is the explicit additive mask `decode_step` must pass *because* `kv_len` is
+   > pinned to `max_len`. Give attention per-row KV lengths and the mask goes away.
 
 **Gate — greedy token identity.** 8 prompts run as one B=8 batch produce **token-for-token
 the same 256 outputs** as 8 sequential B=1 runs.
@@ -393,35 +394,53 @@ modelled and Phase 4's gate needs revisiting before it is run.
 >
 > | batch | tok/s when it fired | tok/s now | ms/step |
 > |---|---:|---:|---:|
-> | 1 | 113.5 | **123.1** | 8.12 |
-> | 8 | 606.4 | **718.7** | 11.13 |
-> | 16 | 956.6 | **1,326.2** | 12.07 |
+> | 1 | 113.5 | **130.5** | 7.66 |
+> | 8 | 606.4 | **760.1** | 10.53 |
+> | 16 | 956.6 | **1,408.0** | 11.36 |
 >
 > **The ~8 ms/step that was unaccounted for is explained, and 4.6 ms of it is gone.**
 > `head_dim = 256` disqualifies every fused SDPA backend on this box, so decode
 > attention fell to the math backend, which replicates K and V 4× for GQA **and runs
 > the whole thing in fp32** — 3.1 ms/step of copies to feed 1.3 ms of matmul.
 > `grouped_decode_attention` groups the query instead and leaves K and V at their
-> stored width and dtype. B=16: 16.73 → 12.07 ms, **+38.6%**. Details, including a
-> 0.35 ms GDN lever that was measured and *rejected* for moving bf16 prefill off HF's
-> greedy tokens, are in the decode-profile runbook.
+> stored width and dtype. A second fix followed from the same profile: `rms_norm` was
+> five kernels and a step runs ~105 norms, so it is now `F.rms_norm` over an fp32
+> input — **bit-exact**, one kernel. Together B=16: 16.73 → 11.36 ms, **+47.2%**.
+> Details, including a 0.35 ms GDN lever measured and *rejected* for moving bf16
+> prefill off HF's greedy tokens, are in the decode-profile runbook.
 >
-> **A claim made when this fired was wrong and is retracted.** It read the 0.51×
-> against llama.cpp as "exactly the BF16:Q8_0 weight-byte ratio, not a coincidence".
-> braid is now at **0.705×** with no change to weight bytes at all: the 0.51× was 2×
-> weight bytes *and* 4.6 ms of fp32 attention, coinciding. A ratio matching a model is
-> evidence for that model only once the other terms are measured, and they were not.
+> **Two claims made around this trigger were wrong and are retracted.**
 >
-> **What survives is the conclusion, not its arithmetic.** braid still carries 2×
-> llama.cpp's weight bytes, and the step is now GEMM-dominated — 8.17 ms of 12.07,
-> against a 5.58 ms weight-read floor, in an sm_80 WMMA kernel on an sm_120 card. So
-> ARCHITECTURE §0's *"the MVP needs INT8/Q8_0-class weight-only quantization or the
-> claim is dismissible"* stands, and **weight quantization remains the single gating
-> decision for Phase 4.**
+> *The ratio.* It read the 0.51× against llama.cpp as "exactly the BF16:Q8_0
+> weight-byte ratio, not a coincidence". braid is now at **0.749×** with no change to
+> weight bytes at all: the 0.51× was 2× weight bytes *and* 4.6 ms of fp32 attention,
+> coinciding. A ratio matching a model is evidence for that model only once the other
+> terms are measured, and they were not.
 >
-> Read the cleared margin honestly: 123.1 is 2.6% over the line against a 1.65% box
-> noise floor. Clear, not comfortable, and c=1 is the number most exposed to the fixed
-> per-step term — re-check it whenever the step changes shape.
+> *The headroom.* A follow-up read the GEMMs as "68% of the measured roofline" and
+> projected 68% → 90% as available. That divided weight bytes by a **copy** benchmark;
+> a weight GEMM only reads. Measured against a same-tensor streaming read, the bf16
+> GEMMs are at **86% aggregate and 99–105% on every shape that dominates the bytes**.
+> There is no kernel-choice win. `cublaslt` is identical and padding M is worse; both
+> tested, both refuted.
+>
+> **What survives is the conclusion, and it has narrowed to one path.** braid still
+> carries 2× llama.cpp's weight bytes, the step is still GEMM-dominated, and the only
+> lever left on it is fewer bytes. Of the reduced-byte paths, `_weight_int8pack_mm` is
+> 0.06× and NVFP4-on-GDN is already refuted — but **`torch._scaled_mm` fp8 runs on
+> sm_120 and measures 1.81–1.95×**, contradicting a README claim that it was
+> unsupported. It is W8A8, so the open question is accuracy, not availability.
+> **Weight quantization remains the single gating decision for Phase 4**, now with a
+> working kernel behind it.
+>
+> Read the cleared margin honestly: 130.5 is 8.8% over the line against a 1.65% box
+> noise floor. Clear, and c=1 is still the number most exposed to the fixed per-step
+> term — re-check it whenever the step changes shape.
+>
+> **And `ncu` cannot run on this box** — `ERR_NVGPUCTRPERM`, which needs a host-level
+> driver flag and a reboot that vast.ai does not give us. This item's stated first task
+> was "ncu with graphs on"; torch.profiler over graph replays replaced it, reconciled
+> to 96% of the wall clock.
 
 ---
 
