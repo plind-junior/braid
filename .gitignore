@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+*.egg-info/
+
+# Internal working documents: measurement runbooks and the superpowers
+# spec/plan pair. Kept on disk, deliberately not published.
+docs/runbooks/
+docs/superpowers/
+
+# torch.utils.cpp_extension JIT output (normally ~/.cache/torch_extensions,
+# but TORCH_EXTENSIONS_DIR can redirect it here)
+build/
+*.so
