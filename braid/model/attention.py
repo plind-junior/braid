@@ -17,11 +17,16 @@ Four places this differs from a textbook Llama block:
 """
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 import torch.nn.functional as F
 
 from braid.model.config import ModelConfig
 from braid.model.norm import rms_norm
+
+if TYPE_CHECKING:
+    from braid.model.cache import KVCache
 
 
 class RotaryEmbedding:
@@ -84,6 +89,7 @@ class Attention:
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
+        cache: "KVCache | None" = None,
     ) -> torch.Tensor:
         cfg = self.cfg
         B, T, _ = x.shape
@@ -101,6 +107,18 @@ class Attention:
         v = F.linear(x, self.v_proj).view(B, T, KVH, D).transpose(1, 2)
 
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
+
+        if cache is not None:
+            # SDPA's `is_causal` aligns its mask TOP-LEFT, so it is only correct
+            # when q_len == kv_len. Chunked prefill (T > 1 onto a non-empty
+            # cache) needs an explicit mask; refuse rather than mask wrongly.
+            if T > 1 and cache.length > 0 and attn_mask is None:
+                raise NotImplementedError(
+                    f"chunked prefill (T={T} onto {cache.length} cached tokens) needs an "
+                    "explicit attn_mask; is_causal would align the mask top-left. "
+                    "Phase 3."
+                )
+            k, v = cache.append(k, v)
 
         o = F.scaled_dot_product_attention(
             q, k, v,

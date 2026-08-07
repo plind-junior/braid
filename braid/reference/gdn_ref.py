@@ -69,8 +69,16 @@ def gdn_decode_naive(
 def gdn_decode_vectorized(
     state: torch.Tensor, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
     alpha: torch.Tensor, beta: torch.Tensor, cfg: GDNConfig,
+    normalize: bool = True,
 ) -> torch.Tensor:
-    """Batched tensor form of `gdn_decode_naive`. Same contract."""
+    """Batched tensor form of `gdn_decode_naive`. Same contract.
+
+    `normalize=False` takes q and k as ALREADY l2-normalised. HF normalises in
+    the activation dtype (bf16) and only then casts to fp32 for the recurrence;
+    re-normalising a unit vector here is not free, it multiplies by
+    `rsqrt(1 + 1e-6)` once per token per layer, so the engine normalises upstream
+    and passes `False`. The CUDA-kernel oracle path leaves it `True`.
+    """
     hpg = cfg.heads_per_group
     scale = cfg.head_dim ** -0.5
 
@@ -78,8 +86,8 @@ def gdn_decode_vectorized(
     # This is the GROUPED (HF SafeTensors) layout, g = h // hpg. The tiled
     # (GGUF) layout g = h % n_groups is a different permutation of the same
     # index range and produces plausible garbage rather than a crash.
-    qh = _l2norm(q).repeat_interleave(hpg, dim=1)
-    kh = _l2norm(k).repeat_interleave(hpg, dim=1)
+    qh = (_l2norm(q) if normalize else q).repeat_interleave(hpg, dim=1)
+    kh = (_l2norm(k) if normalize else k).repeat_interleave(hpg, dim=1)
 
     a = alpha[..., None]                                   # [B, H, 1]
     bt = beta[..., None]                                   # [B, H, 1]

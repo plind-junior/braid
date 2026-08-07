@@ -211,11 +211,50 @@ Correctness only. **No speed claim is made or measured in this phase.**
    from the other side: the gather+SDPA shim exists but is not a fused path, so
    FlashInfer at `head_dim=256` is now load-bearing for Phase 3, not optional.
 
-3. **Full forward, B=1, eager, greedy.** **32 layers** on the 24-GDN/8-attention
-   period-4 schedule, dense SwiGLU MLP (`mlp_only_layers: []` — no MoE on this
-   target), **tied** LM head, sampler.
-   Proof of life: `"The capital of France is"` → `" Paris"`, 128 coherent tokens,
-   degeneration battery clean at temp 0.7.
+3. **Full forward, B=1, eager, greedy.** ✅ **DONE 2026-08-07** —
+   `braid/model/{gdn,layer,cache,engine}.py`, 10 tests in
+   `tests/test_full_forward.py`. 32 layers on the 24-GDN/8-attention period-4
+   schedule, dense SwiGLU MLP, tied LM head, KV + conv + recurrent caches, greedy
+   and top-p sampling.
+
+   **Proof of life:** `"The capital of France is"` → `" Paris."`; 128 greedy
+   tokens with no repeated 8-gram. Weights 7.83 GiB, peak 23.7 GiB (that peak is
+   the fp32 *test*, which holds two copies; the bf16 engine alone is well under).
+
+   | check | measured |
+   |---|---|
+   | one GDN layer vs HF | **bit-identical** at T ≤ 4; 4.8e-5 at T=24 |
+   | full 32 layers, fp32 vs HF | **rel L2 6.4e-7**, cosine 1.000000000 |
+   | full 32 layers, bf16 vs HF | rel L2 8.3e-3, **100% greedy token identity** |
+   | caches: decode vs prefill, fp32 | rel L2 4.7e-7 (GDN), 4.9e-7 (attention) |
+
+   **Where the gate belongs.** Item 2's 5e-3 / 0.99999 is a *single-layer*
+   threshold; applied to a 32-layer bf16 stack it measures accumulated rounding,
+   not correctness. The per-layer trace (`scripts/layer_trace_diag.py`) shows the
+   residual growing smoothly from 1.9e-4 at layer 0 and plateauing near 1e-2,
+   with no step at any layer — and the same forward in fp32 lands at 6.4e-7. So
+   the gate is applied on the fp32 arm, and the bf16 arm is gated on **greedy
+   token identity** plus a drift tripwire. Same for decode-vs-prefill: exact in
+   fp32, ~1.2e-2 in bf16 purely because a T=8 GEMM and eight T=1 GEMMs
+   accumulate differently.
+
+   **Prefill runs the decode recurrence in a loop.** Slow and deliberate — it
+   makes prefill and decode the same arithmetic by construction, so the standard
+   "generation drifts after the first token" bug cannot exist. Phase 5's ragged
+   chunkwise scan replaces it; this phase makes no speed claim.
+
+   **Two silent numeric deviations found and fixed**, neither in the plan:
+   HF takes `beta`'s sigmoid in the *activation* dtype and only then widens
+   (computing it in fp32 moves the layer by 4.8e-3), and the **gated** norm
+   rounds to the activation dtype *mid-computation*, before applying gamma, where
+   the plain norm stays fp32 throughout.
+
+   **And one trap in the test harness, not the engine.** `module.to(bfloat16)`
+   followed by `load_state_dict` copies *into* the bf16 parameter, silently
+   truncating the tensors this checkpoint deliberately stores as F32 —
+   `linear_attn.norm` moves 2.4e-3 and the "reference" becomes a worse model than
+   braid. That artefact accounted for nearly all of the GDN layer's apparent
+   parity gap. Reference models are built on `meta` and loaded with `assign=True`.
 4. **Perplexity gate** against an HF bf16 CPU reference over a pinned ≥10k-token
    corpus (the box has 251 GB RAM — this is an overnight one-off). **Measure the
    absolute value; do not expect 6.8, which is the 35B's.** The diagnostic ratio

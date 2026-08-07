@@ -179,11 +179,18 @@ def load_checkpoint(
     device: str | torch.device = "cuda",
     layers: Iterable[int] | None = None,
     include_embeddings: bool = True,
+    dtype: torch.dtype | None = None,
 ) -> Checkpoint:
     """mmap the safetensors shards and materialise the text tower on `device`.
 
     `layers` restricts to a subset — the parity tests need two layers, not 8.8 GB.
     `include_embeddings=False` skips the 1.27 GB tied embedding table with it.
+
+    `dtype` recasts the BF16 weights on the way through, on the host and before
+    the transfer, so an fp32 run never has a bf16 and an fp32 copy resident at
+    once — that doubling is what puts a 4B model over a 32 GB card. Tensors the
+    checkpoint stores as fp32 (`A_log`, `linear_attn.norm`) are left alone; they
+    are fp32 deliberately, and widening is not the same as not narrowing.
     """
     root = Path(path)
     cfg = ModelConfig.from_pretrained(root)
@@ -235,7 +242,10 @@ def load_checkpoint(
     for shard, items in per_file.items():
         with safe_open(root / shard, framework="pt") as f:
             for hf_key, name in items:
-                t = f.get_tensor(hf_key).to(device, non_blocking=True)
+                t = f.get_tensor(hf_key)
+                if dtype is not None and t.dtype != torch.float32 and t.is_floating_point():
+                    t = t.to(dtype)
+                t = t.to(device, non_blocking=True)
                 tensors[name] = _apply_transform(hf_key, name, t, report)
 
     if cfg.tie_word_embeddings and "embed_tokens" in tensors:

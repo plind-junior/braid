@@ -37,7 +37,23 @@ def rms_norm(x: torch.Tensor, gamma: torch.Tensor, eps: float) -> torch.Tensor:
 def rms_norm_gated(
     x: torch.Tensor, gate: torch.Tensor, gamma: torch.Tensor, eps: float
 ) -> torch.Tensor:
-    """Normalise FIRST, then gate — the opposite order from the Mamba2 path."""
+    """Normalise FIRST, then gate — the opposite order from the Mamba2 path.
+
+    The `.to(input_dtype)` in the middle is **not** redundant with the one at the
+    end, and it is not tidiness: HF rounds the normalised value to the activation
+    dtype *before* applying gamma (`self.weight * hidden_states.to(input_dtype)`),
+    where the plain norm above stays in fp32 all the way through. Keeping this
+    line in fp32 makes braid one bf16 epsilon *cleaner* than the reference, which
+    is still a 3.1e-3 relative deviation from it across the whole GDN layer —
+    measured in `scripts/gdn_layer_diag.py`.
+
+    `tests/test_hf_parity.py::test_gated_norm_has_no_unit_offset_but_plain_norm_does`
+    does not catch this: it feeds the gated norm fp32 inputs, where the cast is a
+    no-op. `tests/test_full_forward.py` exercises it in bf16.
+    """
+    input_dtype = x.dtype
     xf = x.float()
     xf = xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps)
-    return (xf * gamma * torch.nn.functional.silu(gate.float())).type_as(x)
+    h = gamma * xf.to(input_dtype)
+    h = h * torch.nn.functional.silu(gate.float())
+    return h.to(input_dtype)
