@@ -513,6 +513,38 @@ modelled and Phase 4's gate needs revisiting before it is run.
 4. **The sweep:** c ∈ {1, 2, 4, 8, 16}, **ABBA order, 5 processes per arm per point**, on
    the reference engine's own `tools/agent_bench.py` where possible.
 
+> ### Items 1–2 ✅ 2026-08-08. **Items 3–4 are BLOCKED, and not on schedule.**
+>
+> `braid/serve/{scheduler,server}.py` and `braid/bench/serve_bench.py`. Continuous
+> batching, admission-only, chunked prefill, per-row sampling, SSE over stdlib
+> `http.server`, slot release on completion **and on a hard socket disconnect**. 157
+> tests, including the roadmap's own gate (concurrent streams token-identical to solo
+> runs, fp32) with a peak-decode-batch assertion beside it so the gate cannot be
+> vacuous.
+>
+> **The measurement stops the head-to-head.** At 128-token prompts, c=16:
+>
+> | | decode alone | served |
+> |---|---:|---:|
+> | tok/s | 1,592 | **120** |
+>
+> **Prefill is 91% of the wall clock and runs at a flat 262 tok/s at every
+> concurrency.** Flat is the tell: prefill does not batch, because `gdn.py` runs the
+> decode recurrence in a Python loop over T, one sequence per forward — "slow and
+> deliberate" by its own docstring. Shortening the prompt confirms it directly: at
+> c=8, 128-token prompts give 112.6 tok/s and 8-token prompts give 469.9.
+>
+> Running the GO/NO-GO now would compare braid's *placeholder prefill* against a
+> mature engine and call the result a verdict on batched decode. That is the wrong
+> question answered with a real number, which is worse than no number.
+>
+> **This promotes Phase 5 item 5 to blocking.** That item already reads "promoted from
+> last to first" on the strength of the reference engine's profile; this is braid's own
+> measurement saying the same of braid. The scheduler knob does not rescue it —
+> `prefill_chunk` trades the ITL tail against throughput (490 ms p99 / 114.5 tok/s at
+> 256, versus 68 ms / 58.6 at 8) with no good setting. Full curve in the serving
+> runbook.
+
 **GO / NO-GO.** Braid's median aggregate at c=8 must exceed theirs at c=8 by more than
 the combined spread of the two arms, with every correctness pre-gate green — **and the c=1
 row published unchanged even though we lose it.**
