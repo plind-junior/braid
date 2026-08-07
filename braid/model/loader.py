@@ -136,7 +136,7 @@ def _apply_transform(
         # Keyed on the SOURCE NAME, which is unambiguous for a safetensors load:
         # `A_log` is stored, `A = -exp(A_log)` is what the recurrence wants.
         #
-        # ARCHITECTURE.md:409 prescribes deciding by VALUE instead ("any element
+        # The original spec prescribed deciding by VALUE instead ("any element
         # >= 0 => raw HF"). That heuristic is unsound on this checkpoint and
         # measured so: every one of layer 0's 32 `A_log` entries is negative
         # (-4.22 .. -0.96), so the value test reads "already transformed", skips

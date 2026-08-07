@@ -1,676 +1,689 @@
 # braid — architecture
 
-**Status:** proposed
-**Date:** 2026-08-07
-**Target hardware:** one NVIDIA RTX 5090 (GB202, `sm_120a`), 32 GB GDDR7, 1,792 GB/s datasheet / **1,508 GB/s measured**
-**Reference competitor:** a mature single-GPU C++/CUDA engine @ `d8aabf88` — ~135k lines, 447 source files
+**What this document is:** a map of the code as it exists today. Present tense throughout.
+If the code and this document disagree, the code wins — but the disagreement is a bug in
+this document and should be fixed.
 
-This document supersedes the architecture section of the original batched-hybrid-decode
-design spec. The thesis there is correct; **its stated mechanism is wrong**, and the correction
-makes the case stronger. Everything below is cited against the reference engine's source
-and its own committed measurement data at HEAD.
+**What this document is not:** the argument for why braid should exist, what the competition
+is doing, or which optimisations have been ruled out. That is [`THESIS.md`](THESIS.md).
+The build order and the gates are [`ROADMAP.md`](ROADMAP.md).
 
----
-
-## 0. The thesis, replaced — read this before §1
-
-> **2026-08-07, measured.** §1 below argued that the reference engine's inability to batch
-> the recurrent scan is the opening. That is true *of that engine* and **false as a claim
-> about the field**.
-> **llama.cpp already batches GDN recurrent decode** and scales 11.7× to B=64 on
-> Qwen3.5-4B, measured on this box 2026-08-07.
-> The batched scan is table stakes, not IP.
->
-> **The replacement thesis is stronger, because it is a reproducible number rather than a
-> claim about someone else's kernel signatures:**
->
-> > At concurrency, llama.cpp runs a GDN hybrid at **35% of the memory wall at B=16 and
-> > 13% at B=64**, against 74% at batch 1. The reference engine does not compete on that
-> > axis at all — every llama.cpp comparison it publishes is single-stream.
-> > **braid targets the wall.**
->
-> | parallel | llama.cpp | roofline | ms/step | % of roofline |
-> |---:|---:|---:|---:|---:|
-> | 1 | 250 | ~340 | 4.00 | 74% |
-> | 16 | 1,880 | ~3,900 | 8.52 | 35% |
-> | 64 | 2,928 | ~8,400 | 21.85 | 13% |
->
-> **New target: beat 1,880 tok/s at B=16 and 2,928 at B=64 on Qwen3.5-4B**, publishing the
-> batch-1 row unchanged even where we lose it.
->
-> **Load-bearing consequence:** BF16 weights are 2× the bytes of llama.cpp's Q8_0, which
-> loses at B≤8 and wins only above B=16. The MVP needs INT8/Q8_0-class weight-only
-> quantization or the claim is dismissible. This is now the gating design decision.
->
-> §1–§9 below remain accurate about **the reference engine** and about the mechanics of the
-> scan. Read them as the engine-specific case, not as the market case.
-
-## 1. The thesis, corrected (engine-specific — superseded by §0 as the competitive claim)
-
-The original claim was: *the reference engine cannot batch the recurrent scan, and the scan
-is the bottleneck.* The first half is confirmed. The second half is false, and repeating it
-in public would be refuted in one profiler run.
-
-**The GDN scan is 6.72% of hybrid decode time.** From the reference engine's own committed
-nsys extract (`tools/roofline/history/raw/cf1b382a_20260711_193211/nvfp4-hybrid_tg256_r0.nsys_extract.json`,
-class `gdn_scan`): `gdn_scan_fused_kernel` 4.87% + `ssm_conv1d_decode_f32_silu` 1.85%.
-Per step that is ~0.20 ms of a 3.06 ms decode step.
-
-So the scan is not a bottleneck. **It is a lock.**
-
-| Kernel class | Share of hybrid decode | Batches? |
-|---|---:|---|
-| `gemv_nvfp4` | 34.0% | yes |
-| `gemv_fp` (FP8 SSM-projection sidecar) | 22.7% | yes |
-| `attn_decode_paged` | 14.0% | yes |
-| `moe_routing` | 8.5% | yes |
-| **`gdn_scan` + `ssm_conv1d`** | **6.7%** | **no — this is the lock** |
-| `rmsnorm` | 3.7% | yes |
-| `gdn_norm_gate`, `rope` | 2.2% | yes |
-
-*Source: `docs/audit/roofline_2026_07_11.md:35-41` plus the raw extract for the two rows
-their own report omits.*
-
-93% of the step batches perfectly well. The reference engine proves it: on non-recurrent
-models it takes Qwen3-Coder-30B-A3B-FP4 from **396 tok/s single-stream to 1,173 aggregate
-at c=16** (2.96×, `docs/BENCHMARKS.md:269`) — above vLLM's published 1,157 on the same
-model class. That machinery already exists there and works.
-
-But a 6.7% kernel with no batch axis forces `decode_batch.resize(1)` on the whole engine
-(`src/runtime/engine_scheduler.cpp:1475`), so none of the other 93% ever gets to batch on a
-hybrid. **The tail wags the dog.** Removing the lock costs us the scan scaling linearly in
-sequence count; it buys the entire weight sweep being amortised across the batch.
-
-### The arithmetic
-
-At B=1, the reference engine's hybrid step is 3.06 ms of kernel time (783.4 ms / 256 steps),
-which implies 327 tok/s against 311–320 measured — so hybrid decode is **GPU-busy-bound, not
-host-bound**. Do not plan a win around Python overhead; there isn't one to reclaim.
-
-Decompose that step:
-
-```
-scan + conv (linear in B)   ≈ 0.20 ms
-everything else (amortises) ≈ 2.86 ms
-```
-
-At B=8 the state traffic is the only term that grows: 8 sequences × 125.8 MB of h_state
-read+write per step = 1.006 GB, which at the **measured** 1,508 GB/s is ~667 µs. The
-weight sweep is read once regardless of B. Per-sequence attention and MoE-expert
-divergence add real cost, so this is a ceiling, not a forecast:
-
-Recomputed properly against their per-class data, the split is **~66–69% fixed** (weight
-reads: `gemv_nvfp4` 34.31 + `gemv_fp` 22.66 + `moe_routing` 8.62 + `rmsnorm` 3.73) and
-**~28% linear** (`gdn_scan` 6.72 + `attn_decode_paged` 13.27 + elementwise/unclassified
-7.74). That gives a two-parameter model:
-
-```
-step(B) = fixed + linear·B  ms
-
-central      2.0 + 0.86·B   ⇒ c=8:   901 tok/s   c=16: 1,014   asymptote 1,163
-pessimistic  3.0 + 1.00·B   ⇒ c=8:   727         c=16:   842
-optimistic   2.0 + 0.55·B   ⇒ c=8: 1,250         c=16: 1,481
-```
-
-against a **flat ~317** at any concurrency. **Even the pessimistic floor is 2.3×.**
-The central case converges with their own independently measured dense batching factor
-(2.96× at c=16, and ~3× at c=15 in `docs/audit/PERF_LOG.md:604-619`), which is a good sign
-that the model is not fantasy.
-
-Two consequences that must go into the plan:
-
-- **The target is an absolute number, not a multiplier.** "3× the reference engine" hides
-  the real risk, which is that `braid_c1` will be below their 320 — they run the scan at
-  47% of HBM peak and have six refuted GEMV tuning campaigns behind them.
-  **Gate: ≥800 tok/s at c=8 and ≥1,000 at c=16.**
-- **The curve saturates near c=16.** At B×133.7 MB of state traffic per step, the linear
-  term overtakes the fixed weight sweep around B=14–18. c=32 is pointless on throughput
-  grounds and does not fit on VRAM grounds (§2). **Cap the graph buckets at 16.**
-
-There is unmodelled upside: `attn_decode_paged` runs at **26.8 GB/s = 1.5% of roofline** on
-the hybrid — purely latency-bound at M=1, and batching is the textbook fix for that. The
-scan itself achieves 843 GB/s = 47% of peak *from 19% of the SMs*, so it should get more
-efficient per sequence as B grows, until the L2 cliff.
-
-### Cross-check: bottom-up byte arithmetic
-
-The class-share model above is top-down. A bottom-up count of bytes moved per decode step at
-B=8, 4k context, on the published checkpoint disagrees in an instructive way:
-
-| Tensor class | Bytes/step @ B=8 | Amortises with B? |
-|---|---:|---|
-| Routed experts, NVFP4, ~56 unique of 256 | 3.50 GB | **barely** |
-| LM head, BF16 `[248320, 2048]` | 1.02 GB | yes |
-| GDN in/out projections, BF16, 30 layers | 1.01 GB | yes |
-| GDN recurrent state, read+write | 1.02 GB | **no — linear in B** |
-| KV read, 20 KiB/tok × 4096 × 8 | 0.64 GB | **no — linear in B** |
-| Attention projections, NVFP4, 10 layers | 0.14 GB | yes |
-| Shared experts, NVFP4, 40 layers | 0.06 GB | yes |
-| **Total** | **≈ 7.4 GB** | |
-
-**The routed-expert term is the whole game, and it is the one that does not amortise.** With
-top-8 of 256 experts, B=1 touches 8 experts but B=8 touches
-`E[unique] = 256·(1−(1−1/256)^64) ≈ 56` — 7× the weights for 8× the tokens, i.e. only ~12%
-saved per token. An A3B MoE is structurally worse at batching than a dense model, and the
-model must not pretend otherwise.
-
-At 1,508 GB/s measured and the reference engine's own observed efficiency band (30–41% of
-roofline for MoE-shaped decode), a B=8 step lands at 8.8–12.0 ms → **660–910 aggregate
-tok/s**. The same arithmetic at B=1 gives ≈2.9 GB/step → 520 tok/s at 100% efficiency,
-against their measured 320 = **62%**, which calibrates the band.
-
-**Take the bottom-up number as the planning figure: 660–910 tok/s at c=8 — 2.1–2.8× the
-reference engine.**
-It is more conservative than the class-share model and it is built from bytes rather than
-from percentages. The gate stays at ≥800 at c=8 — inside the band, so it is a real gate.
-
-### Two hazards this arithmetic hides
-
-1. **The L2 cliff.** Per-sequence GDN state is 63.8 MiB; the 5090's L2 is 96 MB
-   (`docs/sm120.md:17`). Their B=1 scan may be **entirely L2-resident**, and B≥2 is not.
-   Our B=1 datapoint may therefore look artificially good and B=2 artificially bad. The
-   scaling curve must be measured from B=1 to B=32, not extrapolated from two points.
-2. **The reference engine's 320 is not a fixed target.** Their own ranked lever list has two
-   unbuilt hybrid decode levers: `gemv_nvfp4` @ +21.4% and `attn_decode_paged` @ +13.7%
-   (`docs/audit/roofline_2026_07_11.md:157,161`). Their hybrid c=1 could be ~430 without
-   any batching work. Do not build a moat on 320.
-
-### The second, larger, undefended target
-
-**`gdn_scan_chunkwise_kernel` is 40.13% of hybrid *prefill*** — 122.3 ms of a 304.8 ms
-pp512 window, the single largest kernel class in that cell. The scan class totals 43.96%.
-Their published roofline table for that cell lists five kernels summing to 46.1% and
-**does not include it at all** (`docs/audit/roofline_2026_07_11.md:30-34`).
-
-The reason is structural: their ncu capture regex is
-`"gemv|nvjet|device_kernel|paged_attention|rmsnorm|rope|qknorm|write_kv|argmax|topk|softmax|apply_|residual"`
-(`tools/roofline/config.json:176`), and report rows are built only from ncu-captured
-kernels. **`gdn_scan_*` matches nothing in it.** The scan has never had an arithmetic
-intensity, an achieved GB/s, a %-roofline, or an occupancy number computed for it — in any
-of their 12 committed runs.
-
-And it runs on a grid of `n_heads` = **32 blocks on a 170-SM card** (`src/compute/gdn.cu:21`,
-`gdn_scan.cu:508`), at 8.33% occupancy, serialising over tokens inside one block per head.
-81% of the GPU is idle during 44% of prefill.
-
-Prefill is TTFT. An agent session pays TTFT on every one of 20–100 tool calls. This is a
-bigger and better-defended win than decode, and it is invisible to their own instruments.
-It is Phase 5, not because it is smaller, but because decode is where the head-to-head
-number lives.
+Sections open in plain language and then get specific. If a term is unfamiliar, the
+[glossary](#glossary) at the end defines it. **Section 9 is the "you are here" —** it lists
+what is actually built and what is still a stub.
 
 ---
 
-## 2. Target model — exact shapes
+## 1. What braid is, in plain terms
 
-`mmangkad/Qwen3.6-35B-A3B-NVFP4`, 18 GB, arch `QWEN36_MOE`. The reference engine decodes it
-at 320 tok/s. Every constant below is confirmed against its loader and kernels.
+braid is a program that runs a large language model on one graphics card and answers
+**many people at once**.
 
-| Property | Value | Source |
+Here is the problem it exists to solve. A language model is a very large table of
+numbers — 4 billion of them for the model braid runs, taking up about 8.4 gigabytes.
+Producing a single word of an answer means reading essentially that entire table and doing
+arithmetic with it. Then reading the whole table again for the next word. And again.
+
+The graphics card can read about 1.5 trillion bytes per second. Divide that by the 8.4
+billion bytes of the table and you get roughly **180 words per second, and no amount of
+clever programming beats that number** — for one user. The card is not thinking too slowly;
+it is *reading* as fast as it physically can.
+
+The way out is that the reading can be *shared*. If eight people ask questions at the same
+moment, the card can read the table once and use it to advance all eight answers together.
+The reading was the expensive part, and now eight people paid for it instead of one. Do it
+for sixteen people and the arithmetic barely changes but the total output roughly
+sixteen-folds.
+
+**braid is an engine built so that the shared read is the normal case.** Almost every
+inference engine can do this for conventional models. The model braid targets has a
+component — the *recurrent scan*, §5.1 — that is much harder to share, and most engines
+respond by giving up and serving one person at a time. braid does not.
+
+The one thing that genuinely cannot be shared is each person's own conversation state, which
+must be tracked separately per person. Keeping that cost small, and keeping everything
+*else* shared, is the whole design.
+
+---
+
+## 2. The model braid runs
+
+The MVP target is **Qwen3.5-4B**, a *hybrid* model. "Hybrid" means its 32 layers are not all
+the same kind. Three out of every four are a **Gated DeltaNet** layer, and the fourth is a
+conventional **attention** layer.
+
+The difference matters for how memory is used, so it is worth one paragraph in plain terms:
+
+- An **attention** layer remembers by *keeping every past word around* and re-reading them
+  all. It is exact, and its memory grows with the length of the conversation.
+- A **Gated DeltaNet** layer remembers by *maintaining a fixed-size summary* that it updates
+  once per word. It is approximate, and its memory does **not** grow — a 100-word chat and a
+  100,000-word chat cost exactly the same to store.
+
+A hybrid gets most of the accuracy of the first and most of the cheapness of the second. It
+also means braid has to implement two completely different memory systems and keep them in
+step, which is what §4 and §5 are about.
+
+### Exact shapes
+
+Everything below comes out of the checkpoint's own `config.json` and is parsed by
+[`ModelConfig`](../braid/model/config.py).
+
+| Property | Value |
+|---|---|
+| Layers | 32 = **24 Gated DeltaNet + 8 attention**, period 4 (`layer_types`) |
+| Layer pattern | `3 × (GDN → MLP) → 1 × (attention → MLP)` |
+| `hidden_size` | 2,560 |
+| MLP | dense SwiGLU, `intermediate_size` 9,216 — **no mixture-of-experts on this target** |
+| Attention | 16 heads, `head_dim` **256**, 4 key/value heads (GQA 4:1), output-gated |
+| Rotary | `partial_rotary_factor` 0.25 → only the first **64** of each 256-wide head rotates |
+| GDN heads / groups | 32 value heads, 16 key groups (2 heads per group) |
+| GDN dims | `head_dim` 128, `state_size` 128, inner 4,096 |
+| GDN conv | 8,192 channels, kernel width 4 |
+| Vocabulary | 248,320, **tied** — there is no separate `lm_head` tensor in the file |
+| Weights | BF16 throughout, **7.83 GiB** (8.4 GB) |
+
+Three of those will bite anyone who assumes the usual:
+
+1. **`head_dim` is 256, and 16 × 256 = 4,096 ≠ 2,560.** The near-universal
+   `hidden_size // num_attention_heads` fallback gives 160 here, which is wrong by a factor
+   of 1.6. [`ModelConfig.from_dict`](../braid/model/config.py) *refuses* to infer it rather
+   than relying on the fact that this particular checkpoint happens to raise on the reshape.
+2. **The config is nested.** The published checkpoint is a vision-language model; every
+   shape above lives under `text_config`, and the top level carries a `vision_config` whose
+   `hidden_size` is 1,024. Reading the top level silently gives you the *visual tower's*
+   dimensions.
+3. **738 tensors are in the file; braid runs 426.** The other 312 are a 24-block visual
+   tower (297) and a multi-token-prediction head (15). Neither is in the GGUF that llama.cpp
+   runs, so loading them would not merely waste memory — it would make any head-to-head
+   comparison compare two different models. The loader filters by prefix and *reports* what
+   it dropped.
+
+**Per-sequence memory**, which is the cost that is *not* shared between users:
+
+```
+recurrent state    24 GDN layers × (2 MiB state + 128 KiB conv window)  =  51 MiB per user, fixed
+KV cache            8 attention layers × 4 KV heads × 256 × 2 × 2 bytes =  32 KiB per user per token
+```
+
+The 51 MiB is constant no matter how long the conversation runs. The 32 KiB/token is not.
+
+The competitive target, `Qwen3.6-35B-A3B-NVFP4`, returns in Phase 5+; its GDN block is
+dimensionally identical, which is why the 4B is the MVP. Its shapes are in
+[`THESIS.md` §3](THESIS.md).
+
+---
+
+## 3. Where the code lives
+
+```
+braid/
+  config.py              GDNConfig — the shape parameters the CUDA kernels need
+  model/
+    config.py            ModelConfig — the whole model's config, parsed from config.json
+    loader.py            checkpoint → a flat dict of tensors, with four load-time transforms
+    engine.py            Engine — construction, forward(), generate()
+    layer.py             DecoderLayer — one layer: norm, mixer, residual, norm, MLP, residual
+    gdn.py               GatedDeltaNet — the recurrent mixer
+    attention.py         Attention + RotaryEmbedding — the conventional mixer
+    mlp.py               MLP — dense SwiGLU
+    norm.py              rms_norm and rms_norm_gated
+    cache.py             KVCache, RecurrentCache, Cache — per-sequence state
+  reference/
+    gdn_ref.py           the fp32 oracle for the recurrence: naive and vectorized forms
+  kernels/
+    loader.py            JIT-compiles the CUDA extension for sm_120a
+    csrc/gdn_decode.cu   batched recurrent decode step
+    csrc/conv1d_decode.cu  batched slotted causal conv + SiLU
+    csrc/bindings.cpp    pybind entry points
+  bench/
+    noise_floor.py       measures the variance floor, so gates aren't coin flips
+    scan_scaling.py      Phase 1 evidence: does the scan scale with batch?
+    gemm_probe.py        weight-only GEMM options at M ∈ 1..64
+    fp8_probe.py         is there a usable reduced-byte weight path on sm_120?
+scripts/
+  parity_report.py       parity metrics + ablations proving the gate discriminates
+  layer_trace_diag.py    per-LAYER divergence vs HF: smooth growth = rounding, a step = a bug
+  gdn_layer_diag.py      per-STAGE divergence inside one GDN layer
+  gdn_stage_diag.py      the same, staged differently
+  cache_diag.py          is decode ≠ prefill a cache bug or bf16 accumulation?
+tests/                   see §8
+docs/
+  ARCHITECTURE.md        this file
+  THESIS.md              why braid exists; what is ruled out
+  ROADMAP.md             build order and gates
+  runbooks/              recorded measurements: scan scaling, noise floor, llama.cpp baseline
+```
+
+Two organising principles, both deliberate:
+
+- **`braid/reference/` is the source of truth for arithmetic, and it is written in plain
+  PyTorch.** The CUDA kernels are checked against it; so is the engine. When a fast path and
+  the oracle disagree, the oracle is right until proven otherwise.
+- **No class inherits from `torch.nn.Module`.** The sublayers are plain objects holding
+  tensors. There is no parameter registration, no `state_dict`, no autograd. braid never
+  trains anything, and the module machinery would only obscure where the memory is.
+
+---
+
+## 4. How a request flows
+
+Four phases, same shape as any inference engine.
+
+### Phase 1 — Load (once per process)
+
+**Plain version:** read 8.4 GB of numbers off disk onto the graphics card, throw away the
+parts of the file braid does not run, and apply a handful of fixed-up-front adjustments so
+the rest of the code never has to think about them.
+
+Entry: `load_checkpoint(path, device="cuda")` → `Checkpoint`
+([`braid/model/loader.py`](../braid/model/loader.py)).
+
+It reads `config.json` into a [`ModelConfig`](../braid/model/config.py), walks
+`model.safetensors.index.json`, keeps only tensors under `model.language_model.`, and
+renames them into a flat namespace (`layers.7.self_attn.q_proj`, `embed_tokens`, `norm`).
+`Checkpoint.layer(i)` returns one layer's dict; `Checkpoint["embed_tokens"]` returns a named
+global. A `LoadReport` records what was dropped.
+
+**Four transforms happen at load time**, each of which is silently wrong if missed:
+
+| Transform | Why it is here and not at use time |
+|---|---|
+| `A = −exp(A_log)` | The decay rate the recurrence needs. Keyed on the **source tensor name**, not on dtype and not on value — see §6. |
+| `gamma = 1 + W` on plain norms | Qwen3.5 stores RMSNorm weights as *deltas*. Folded in fp32 at load so a caller cannot apply it twice — and deliberately **not** applied to `linear_attn.norm`, which is the gated form and stores gamma directly. |
+| `conv1d.weight` `[C,1,K]` → `[C,K]` | The kernel wants the 2-D form. |
+| `lm_head` ← `embed_tokens` | `tie_word_embeddings` is true; there is no `lm_head` tensor in the file at all. |
+
+`_validate` then asserts every expected tensor is present with the expected shape, so a
+missing or misnamed weight fails at load rather than as a confusing reshape error 30 layers
+in.
+
+### Phase 2 — Build (once per process)
+
+Entry: `Engine.from_checkpoint(ckpt, device, dtype)` or the one-shot
+`Engine.from_pretrained(path)` ([`braid/model/engine.py`](../braid/model/engine.py)).
+
+This constructs 32 [`DecoderLayer`](../braid/model/layer.py) objects — each of which picks
+its mixer from `cfg.layer_types[i]`, **not** from index arithmetic — plus the embedding
+table, the final norm, the tied head, and a
+[`RotaryEmbedding`](../braid/model/attention.py).
+
+No memory is allocated for a conversation here. That is `Engine.allocate_cache(max_len)`,
+which builds one [`Cache`](../braid/model/cache.py) holding a `KVCache` for each of the 8
+attention layers and a `RecurrentCache` for each of the 24 GDN layers.
+
+> **Dispatching on `layer_types` rather than on `i % 4`** looks like pedantry and is not.
+> A checkpoint that broke the period-4 pattern would load cleanly under index arithmetic and
+> then mix the wrong sublayer into 24 of 32 layers — fluent output, wrong model.
+
+### Phase 3 — Prefill (once per request)
+
+**Plain version:** read the user's whole question at once and bring the model's memory up to
+date, ending with a prediction for the first word of the answer. This is what determines how
+long you wait before the first word appears.
+
+Entry: `Engine.forward(input_ids, cache, last_only=True)` with `input_ids` of shape `[1, T]`.
+
+```
+embed → for each of 32 layers: DecoderLayer(h, cos, sin, cache) → final RMSNorm → LM head
+        └───────────────────── Engine.hidden_states ──────────────────────┘
+```
+
+**`hidden_states` and `forward` are separate entry points** because the LM head is the
+expensive part to materialise: the vocabulary is 248,320 wide, so logits cost ~1 MB per token
+in bf16 and 2 GB for a 2,048-token window in fp32. Generation only ever needs the last row
+(`last_only=True`); the perplexity gate applies the head in slices over the hidden states
+instead.
+
+### Phase 4 — Decode (once per generated word)
+
+**Plain version:** feed the word just produced back in, advance every layer's memory by one
+step, and predict the next word. Repeat until the model says it is finished.
+
+Entry: `Engine.generate(input_ids, max_new_tokens, temperature, top_p, seed, eos_token_id)`.
+
+Each step is the same `forward` call with `T = 1`, which is what makes the caches
+load-bearing: the attention layers append one key/value pair each, and the GDN layers advance
+their conv window and recurrent state in place. Then `_sample` — argmax at `temperature == 0`,
+otherwise temperature + top-p with an explicit `torch.Generator` so a seed reproduces a run.
+
+**Today this is batch-1 only** and `generate` raises `NotImplementedError` on anything wider.
+The batch axis is Phase 3 of the roadmap; see §9.
+
+---
+
+## 5. Inside one layer
+
+Every layer, both kinds, is the same six steps
+([`braid/model/layer.py`](../braid/model/layer.py)):
+
+```
+h = rms_norm(x, input_layernorm)
+h = mixer(h, cache)                 ← the only part that differs
+x = x + h                           ← residual
+
+h = rms_norm(x, post_attention_layernorm)
+x = x + mlp(h)                      ← residual
+```
+
+The `mixer` is a `GatedDeltaNet` on 24 layers and an `Attention` on 8. The
+[`MLP`](../braid/model/mlp.py) is the same on all 32: dense SwiGLU,
+`down(silu(gate(x)) * up(x))`.
+
+### 5.1 The Gated DeltaNet layer
+
+**Plain version.** This layer keeps a fixed-size scratchpad — a 2 MB grid of numbers per
+layer per user — and each incoming word does two things to it: it *fades* everything already
+written there slightly, and it *writes* a correction. Then it reads an answer back out. The
+fade rate and the correction size are themselves computed from the word, which is what
+"gated" means. Because the scratchpad never grows, a long conversation costs no more to
+remember than a short one.
+
+The catch, and the reason this is the hard part of the whole project: **step *t* cannot start
+until step *t−1* has finished**, because it reads the scratchpad that step *t−1* just wrote.
+Nearly everything else in a language model can be done for a thousand words simultaneously.
+This cannot.
+
+**Exactly** ([`braid/model/gdn.py`](../braid/model/gdn.py)):
+
+```
+1. qkv    = x @ in_proj_qkv                     [8192, 2560]
+2. qkv    = silu(causal_conv1d(qkv, conv_state, W[8192,4], b))
+3. q,k,v  = split(qkv, [2048, 2048, 4096])      ← Q FIRST, see §6
+              q,k → [B,T,16,128]   v → [B,T,32,128]
+4. beta   = sigmoid(x @ in_proj_b)              step size,  [B,T,32]
+   alpha  = exp(A · softplus(x @ in_proj_a + dt_bias))   decay,  [B,T,32]
+5. y      = scan(state, l2norm(q), l2norm(k), v, alpha, beta)   ← the recurrence
+6. z      = x @ in_proj_z                       [4096, 2560]
+   y      = rms_norm_gated(y, z, norm)          normalise THEN gate
+7. out    = y @ out_proj                        [2560, 4096]
+```
+
+The recurrence in step 5, per head, with thread `d` owning column `d`:
+
+```
+kv[d]  = Σ_s H[s,d] · k̂[s]              reduction on the UNDECAYED state
+δ[d]   = (v[d] − g · kv[d]) · β
+H[s,d] = g · H[s,d] + k̂[s] · δ[d]
+y[d]   = (Σ_s H_new[s,d] · q̂[s]) · rsqrt(head_dim)
+```
+
+The state update and the `y` accumulation **share one loop**. Splitting them into
+"update, then read" is algebraically identical and not fp32-identical.
+
+> **Prefill runs the one-token step in a Python loop.** That is slow and it is deliberate:
+> it makes prefill and decode the *same arithmetic by construction* rather than by test, so
+> the classic "generation drifts after the first token" bug cannot exist. The ragged
+> chunkwise prefill scan that replaces the loop is Phase 5. No speed claim is made about
+> this path.
+
+The conv window (step 2) holds the last 4 **pre-convolution** inputs, matching HF's
+`causal_conv1d_update` convention. Holding post-conv outputs instead decodes fluently and
+wrongly. On a `T ≥ 4` prefill the cache write is `x[:, :, -K:]`; on `T < 4` it is a left-pad.
+
+### 5.2 The attention layer
+
+**Plain version:** the conventional mechanism — every new word compares itself against every
+previous word and pulls in a weighted blend of them. Exact, and the stored history grows one
+entry per word. There are only 8 of these layers out of 32, which is why the growing cost is
+tolerable.
+
+**Exactly** ([`braid/model/attention.py`](../braid/model/attention.py)). Four departures from
+a textbook Llama block, all of them silent if missed:
+
+- **`head_dim = 256` with 16 heads over `hidden_size = 2560`.** Every reshape uses the
+  configured value; none derives it.
+- **Output gating.** `q_proj` emits `2 × n_heads × head_dim = 8192` and the split is
+  **per head** — `[q_h0 | gate_h0 | q_h1 | gate_h1 | …]`, not `[all_q | all_gate]`. braid
+  views it as `[B, T, H, 2D]` and chunks the last axis. Splitting the flat 8,192 in half
+  instead pairs head *h* with the gate of head *h/2*: plausible output, wrong model. The
+  gate is applied as `o *= sigmoid(gate)` **after** attention and **before** `o_proj`.
+- **q/k RMSNorm over the head dim, before rope**, with the `1 + W` gamma already folded at
+  load.
+- **Partial rope.** Only the first 64 dims of each 256-wide head rotate; the top 192 pass
+  through unchanged. Rotating all 256 is not a shape error — it is a 0.37 relative-L2
+  regression that a shape check will never catch (measured in `scripts/parity_report.py`).
+
+`RotaryEmbedding` computes the text case directly. HF's module is MRoPE — it expands
+positions into three grids (temporal, height, width) and interleaves their frequencies — but
+for text HF broadcasts the same row three times, so the interleave selects between equal
+values and is a no-op. The equivalence is *pinned by* `test_rope_matches_hf`, not assumed.
+
+`forward` calls `F.scaled_dot_product_attention` and **refuses** the chunked-prefill case
+(`T > 1` onto a non-empty cache with no explicit mask) rather than masking wrongly: SDPA's
+`is_causal` aligns its mask top-left, which is only correct when query length equals key
+length. Chunked prefill is Phase 3.
+
+> **`head_dim = 256` disqualifies every fused attention backend on this box.** Flash,
+> mem-efficient and cuDNN all decline with *"head_dim should be no more than 128"*, and
+> PyTorch silently falls back to the math backend, which materialises the full
+> `[B, H, T, T]` score matrix. This is fine for correctness work and is *not* fine for
+> Phase 3 — which is why FlashInfer at `head_dim = 256` is load-bearing there rather than
+> optional.
+
+### 5.3 The two norms
+
+[`braid/model/norm.py`](../braid/model/norm.py) has exactly two functions, and the difference
+between them is worth ~2× perplexity:
+
+| | stores | effective gamma | used by |
+|---|---|---|---|
+| `rms_norm` | a **delta** | `1 + W` (folded at load) | `input_layernorm`, `post_attention_layernorm`, `q_norm`, `k_norm` |
+| `rms_norm_gated` | gamma **directly** | `W` | `linear_attn.norm` only |
+
+Both compute in fp32 and cast on the way out. `rms_norm_gated` normalises **first, then
+gates** — the opposite order from the Mamba2 path in most reference implementations:
+
+```
+inv_rms = rsqrt(mean(y²) + eps)          ← eps INSIDE the sqrt, AFTER the mean
+out     = y · inv_rms · gamma · silu(gate)
+```
+
+`gamma` is `[head_dim] = [128]`, **shared across all 32 heads** — not a `[4096]`
+per-inner-dim gamma.
+
+---
+
+## 6. The numerics contract
+
+**Plain version:** braid must produce the same numbers as the reference implementation the
+model was trained against, to many decimal places. This is not perfectionism. A language
+model that is slightly wrong does not crash and does not produce obvious nonsense — it
+produces *fluent, confident, subtly worse text*, and there is no alarm that fires. The only
+way to know is to compare against a known-good implementation, on real weights, at every
+commit. That is what this section pins down and what §8 enforces.
+
+The reference is **Hugging Face `transformers`**, not the C++ reference engine, because HF
+is the implementation the checkpoint was trained with. Always compare against the HF
+implementation that shares braid's numerics — bf16 against `sdpa`, fp32 against `eager`.
+
+### Where the gate belongs
+
+**rel L2 ≤ 5e-3 and cosine ≥ 0.99999 is a *single-layer* threshold.** On a 32-layer bf16
+stack it measures accumulated rounding, not correctness: `scripts/layer_trace_diag.py` shows
+the residual growing smoothly from 1.9e-4 and plateauing near 1e-2 **with no step at any
+layer**, while the same forward in fp32 reads 6.4e-7. Gating the bf16 stack on 5e-3 would be
+gating on depth.
+
+So the contract is split by arm:
+
+| Arm | Gate | Measured |
 |---|---|---|
-| Layers | 40 = **30 GDN + 10 gated attention**, period 4 | `executor_workspace_config.cu:305-314` |
-| Layer pattern | `3 × (GDN → MoE-FFN) → 1 × (gated attn → MoE-FFN)` | dispatched per-layer by weight presence, not by index |
-| `d_model` | 2048 | `hf_config_loader.cpp:416-490` |
-| Attention | `n_heads=16`, `head_dim=256`, `n_kv_heads=2` | — |
-| GDN heads / groups | `n_heads=32`, `n_groups=16` (2 heads per group) | `linear_num_value_heads` / `linear_num_key_heads` |
-| GDN dims | `head_dim=128`, `state_size=128`, `inner=4096` | `linear_value_head_dim` / `linear_key_head_dim` |
-| Conv | `conv_channels=8192`, `conv_kernel=4` | `4096 + 2×16×128` |
-| MoE | 256 experts, per-expert intermediate 512, plus an always-on shared expert | `executor_workspace_config.cu:78-93` |
+| single sublayer, either dtype | rel L2 ≤ 5e-3, cosine ≥ 0.99999 | attention fp32 **bit-exact**; MLP **bit-exact**; one GDN layer **bit-identical at T ≤ 4**, 4.8e-5 at T=24 |
+| full stack, fp32 | the same strict gate | **rel L2 6.4e-7**, cosine 1.000000000 |
+| full stack, bf16 | **greedy token identity** | rel L2 8.3e-3, **100% argmax agreement with HF** |
+| caches (decode == prefill), fp32 | the strict gate | 4.7e-7 (GDN), 4.9e-7 (attention) |
 
-**Per-sequence recurrent state:**
+Same reasoning for decode-vs-prefill: run the exactness check in fp32, where a cache bug
+cannot hide behind rounding, and check the bf16 arm on tokens.
 
-```
-h_state     [32, 128, 128] fp32  = 2 MiB     per GDN layer   (head_dim fastest-varying)
-conv_state  [8192, 4]      fp32  = 128 KiB   per GDN layer   (per-channel window contiguous)
-                                   ─────────
-            × 30 GDN layers, each sub-block 256B-aligned  =  63.8 MiB / sequence
-```
+### Settled by measurement
 
-At c=8 that is 510 MiB, at c=16 it is 1,020 MiB. **Recurrent state is not what caps
-concurrency.** KV is cheap here too — only 10 attention layers with `n_kv_heads=2`, so
-~20,480 B/token (`src/runtime/vram_budget.cpp:539-540`).
+Each of these was an open question, resolved empirically rather than by reading anyone's
+source, and each is pinned by a test.
 
-**What actually caps the reference engine's concurrency is a constant.** On every
-native-NVFP4 model it adds `phase3_reserve = 10% of card + 1 GiB = 4,284.7 MiB` to the
-weight-cache demand
-(`src/runtime/vram_budget.cpp:371-372,388`). On the 35B, whose entire distributable budget
-after weight upload is 6,083 MiB (`src/memory/plan.cpp:101-103`), that single safety margin
-is **70% of the budget** — and it is why their KV pool comes out at 4,096 tokens on a first
-start. A planner that charges exact bytes recovers ~4.2 GiB, which is the difference
-between c=8 and c=16 being reachable. **Exact capacity planning is a component of this
-architecture, not an optimisation.**
+| Item | Resolution | Evidence |
+|---|---|---|
+| **conv split order** | `[Q \| K \| V]`, **Q first** | `tests/test_hf_parity.py`. Two independent readings of the reference engine disagreed; HF's `torch.split(mixed_qkv, [key_dim, key_dim, value_dim])` supports Q-first. Getting it wrong is fluent and completely wrong, with no crash. |
+| **`1 + W` on `linear_attn.norm`** | **No offset** — it is the gated form | `tests/test_hf_parity.py`. Dropping the offset on a *plain* norm is the 13.65 → 6.82 perplexity bug. |
+| **l2norm form** | additive `1e-6` (HF), applied in the **activation** dtype and only then widened to fp32 | `braid/model/gdn.py`. The reference engine uses clamped-rsqrt `rsqrtf(fmax(Σk², 1e-12))` instead, which differs by 10⁶ in the degenerate case. |
+| **`A = −exp(A_log)`** | keyed on the **source tensor name** | Neither published heuristic works here — see below. |
+| **Gate clamps** | **not applied** | The reference engine clamps `A·dt` at −20 and `b_raw` at ±20. Both are no-ops on real activations (`sigmoid(20)` is 1 to within 2e-9) and HF does not clamp, so parity beats the deviation. |
+| **fp32 fold of the gamma offset** | fp32, not bf16 | `scripts/parity_report.py`: fp32 fold 0.0 rel-L2; bf16 fold 1.86e-3; no offset at all 8.04e-1. The bf16 fold would still *clear* the gate — fp32 is chosen because it costs nothing (2,560 floats per layer) and buys back three orders of magnitude of headroom. |
+
+**The `A_log` transform deserves its own paragraph**, because both published heuristics are
+wrong on this checkpoint. The architecture spec originally prescribed *"any element ≥ 0 ⇒
+raw HF"*. Measured: **every one of layer 0's 32 `A_log` entries is negative (−4.22 … −0.96)**,
+so the value test concludes "already transformed", skips the `exp`, and leaves `A = −2.7`
+where it should be `−0.067`. That is a ~40× *over*-fast decay: the state collapses toward
+zero **silently**, and the absmax tell that the reference engine documents
+(`0.04, 0.06, 0.40, 2.51, 110, 31680, inf` → NaN) never fires. The dtype heuristic fails too,
+because this checkpoint ships `A_log` as F32. braid keys on the tensor name — unambiguous for
+a safetensors load — and range-checks that the result is finite and strictly negative.
+
+### Deliberate deviations from HF, and their cost
+
+Two places braid is *cleaner* than HF, both measured and both inside the gate:
+
+- `rms_norm_gated` keeps the normalised value in fp32 where HF rounds it to the activation
+  dtype before applying gamma. Worth **3.1e-3 relative** across a whole GDN layer
+  (`scripts/gdn_layer_diag.py`).
+- **`beta`'s sigmoid is taken in the activation dtype and only then widened**, matching HF's
+  asymmetry (`beta = b.sigmoid()` vs `g = −A_log.float().exp() * softplus(...)`). Taking it in
+  fp32 instead moves the whole layer output by **4.8e-3 relative** — one bf16 epsilon, flat
+  across T and across tokens. `beta` is the delta-rule step size, so its rounding lands
+  straight in the output.
+
+> Both are kept, and the full bf16 stack still reaches **100% greedy token identity** with
+> HF, which is the gate that matters. They are recorded here because Phase 3's gate is
+> greedy token identity *across a batch*, where a 3e-3 deviation either does or does not
+> flip an argmax — so they are decisions held on purpose, not inherited by accident.
+
+### Settled layout traps
+
+- conv1d weights are `[C, K]` with `K` contiguous per channel.
+- conv bias is added **after** the dot and **before** SiLU.
+- SiLU is applied to **all** of Q, K and V, not just V.
+- Head→group mapping is `g = h // heads_per_group` — the **grouped** (HF safetensors)
+  layout. GGUF uses tiled `g = h % n_groups`. Both are valid permutations of the same index
+  range, so a mismatch produces plausible garbage, never a crash.
+- Recurrent state is `[B, n_heads, state_size, head_dim]` fp32 with **`head_dim`
+  fastest-varying** — the per-slot slab layout the CUDA kernel already indexes.
+
+### State precision
+
+- **FP8 E4M3 state is refuted.** The 3-bit mantissa amplifies through the delta rule and
+  degenerates after ~50 special tokens in multi-turn chat. Do not attempt it.
+- **FP16 state is NOT refuted** and is a live open question — see [`THESIS.md` §7](THESIS.md).
+
+fp32 is mandatory for the MVP so that parity is unambiguous.
 
 ---
 
-## 3. Components
+## 7. The CUDA kernels
 
-Six. Each separately testable, separately scoreable, and marked MVP or later.
+**Plain version:** almost all of braid is ordinary PyTorch. Two small pieces are hand-written
+in CUDA, because they are the parts no library does the way braid needs. Both exist and are
+tested; **neither is wired into the engine yet** (§9).
 
-### 3.1 `braid/kernels` — the batched scan `[MVP]`
+[`braid/kernels/csrc/`](../braid/kernels/csrc/), JIT-compiled on first use by
+[`braid/kernels/loader.py`](../braid/kernels/loader.py) at `TORCH_CUDA_ARCH_LIST=12.0a` —
+the arch-*conditional* target, which exposes instructions plain `sm_120` does not. No
+`--use_fast_math`: it turns `rsqrtf` into an approximation and breaks fp32 parity at the
+asserted tolerances.
 
-The core IP and the only place custom CUDA is unavoidable.
+### `gdn_decode` — the batched recurrent step
 
-**Decode (`n_tokens == 1`).** Embarrassingly parallel over the batch — each sequence
-applies one rank-1 update to its own state, with no cross-sequence dependency. Grid becomes
-`(batch × n_heads)` instead of `(n_heads)`; on a 170-SM card that absorbs B≈5 essentially
-free in SM terms.
+One block per `(batch row, head)`; one thread per `head_dim` column `d`, holding that state
+column in registers. The batch axis on the grid is the entire point — it is what lets eight
+users' scans run in one launch instead of eight.
 
-State lives in one pool with a **device-resident indirection**:
+**The state pool is indexed indirectly:**
 
 ```
 h_pool    [max_slots, n_heads, state_size, head_dim]  fp32
 slot_idx  [batch]                                     int32   ← read inside the kernel
 ```
 
-Reading `slot_idx` from device memory rather than baking a base pointer is what makes one
-captured CUDA graph valid for every assignment of sequences to slots, forever. The reference
-engine cannot do this: `engine_scheduler.cpp:1968-1981` re-captures whenever the slot
-changes, at a documented ~10–20 ms (`src/runtime/config.h:130-138`).
+Reading `slot_idx` from *device* memory rather than baking a base pointer into the launch is
+what makes **one captured CUDA graph valid for every assignment of users to slots, forever**.
+Measured at 10.3 µs to replay across a slot reassignment, against the 10–20 ms re-capture the
+reference engine pays for the same event.
 
-**Layout decision — layer-major, not sequence-major.** The reference engine indexes
-`pool + seq_id*per_seq_bytes + layer*per_layer_bytes` (`src/memory/ssm_state.cu:76`), which
-puts one layer's state for 16 sequences 63.75 MiB apart. We index layer-major so a batched
-per-layer scan reads contiguously. They are locked out of this change because their snapshot
-store's entry unit is exactly the per-sequence slab.
+The pool is **layer-major, not sequence-major**, so a batched per-layer scan reads
+contiguously.
 
-**Prefill.** Ragged chunkwise scan over packed variable-length sequences with a
-`cu_seqlens` offset array, and — the actual lever — parallelism over *chunks* so the grid is
-not stuck at 32 blocks. Deferred to Phase 5; correctness first.
+### `conv1d_decode` — the batched slotted causal conv
 
-### 3.2 `braid/model` — the runtime `[MVP]`
+One thread per channel: slide the window left by one, append the new value, dot against the
+weight row, add bias, apply SiLU. Same `slot_idx` contract.
 
-Deliberately thin. PyTorch control plane; custom CUDA only for the scan and the decode-step
-graph. GEMM leans on CUTLASS via PyTorch, attention on FlashInfer.
+### sm_120a constraints these kernels are built around
 
-Precedent that thin is enough: `naklecha/simple-llm` reaches 4,041 tok/s at batch 64 on an
-H100 in ~950 lines of Python, ahead of vLLM's 3,846 on the same box. Python overhead
-disappears inside a captured graph, and batch-1 is explicitly not our metric.
+Each cost the reference engine real time; each is absorbed rather than rediscovered.
 
-**Honest sizing: this is not 950 lines.** A working NVFP4 loader + 40-layer hybrid forward +
-MoE + gated attention is ~3,000–4,000 lines of Python and ~800 lines of CUDA before it
-serves anything.
-
-### 3.3 `braid/engine` — scheduler and memory `[MVP for the batching path]`
-
-- Paged KV for the 10 attention layers, per-sequence block tables.
-- Fixed slot pool for recurrent state — O(1) in context length, so no paging needed.
-- Prefill and decode **chunked and interleaved in one step**, not run to completion in phases.
-- Decode graphs captured per batch bucket **(1, 2, 4, 8, 16 — not 32)**, replayed without
-  re-capture.
-- **Exact capacity planning** (§2): charge real bytes, not a 10%+1 GiB margin.
-
-The reference engine's `src/runtime/` is 18,377 lines. We need maybe 1,500 of its equivalent
-for the MVP, because we are not carrying LoRA, vision, constrained decoding, speculation,
-prefix caching, model swap, suspend/resume, or five lifetime tiers.
-
-### 3.4 `braid/bench` — the evidence harness `[MVP]`
-
-The reference engine has no GPU CI *job*. `docs/audit/AUDIT_ARCH_2026_07_29.md:1348`: *"No
-CI job verifies that any kernel produces the right numbers … WON'T FIX (owner decision
-2026-08-03: no GPU runner)."* A one-line RMSNorm bug made the flagship NVFP4 hybrid family
-8.6× worse in perplexity (65.1275 → 7.5302 after the fix), undetected until 2026-08-07.
-
-**State this narrowly or it gets refuted.** It has 172 test files, 8 GTest binaries, 12
-independent-oracle tests with stated tolerances, bit-identical-greedy checks across fresh
-processes, a degeneration battery, and a 3%/5% perf gate medianed over 3 processes — all run
-locally and human-initiated. And their GPU CI pipeline is *written and dormant*, gated on
-one repo variable: `.github/workflows/ci.yml` `if: vars.HAS_GPU_RUNNER == 'true'`. It flips
-on the hour a runner appears.
-
-So this is **hygiene, not a moat**: we get automated per-commit per-layer HF parity from day
-one because we already have the card and the key. We should not claim they are untested.
-
-### 3.5 `braid/quant` — the quantizer `[later]`
-
-Two gaps that survived refutation:
-
-- **MoE experts are never calibrated in the reference engine** — `awq_plan.cpp:460` emits
-  *"MoE experts NOT calibrated … they stay round-to-nearest."* On an A3B model the experts
-  *are* the model.
-- **The shipped calibration default is harmful at wide GQA.** Their own attribution on
-  Qwen3-14B (`n_rep=5`): `--calib-groups ABCD` = **+2.68 PPL**, `BD` = **−0.1330** (their
-  best measured configuration).
-
-  **Caveat that kills the obvious plan:** "default to BD" is *undefined on our target*.
-  Group D matches `mlp.down_proj.weight` by exact name (`awq_plan.cpp:347-349`), which does
-  not exist on a MoE layer; group B is refused by the fold-safety check because the routed
-  experts and the router both read `post_attention_layernorm` and neither is scaled. On
-  Qwen3.6-35B-A3B, `BD` resolves to **nothing**. The MoE-expert calibration work is
-  therefore genuinely new — per-expert group modelling that exists nowhere — not a
-  default-flag change. Sized accordingly in the roadmap.
-
-### 3.6 `braid/serve` — OpenAI-compatible HTTP `[MVP, minimal]`
-
-`POST /v1/chat/completions` with SSE, `GET /v1/models`, `GET /health`. Nothing else. It
-exists so the reference engine's own benchmark harness can drive us unmodified (§7).
-
----
-
-## 4. The decode step, sublayer by sublayer
-
-What braid must implement, per layer, at `n_tokens=1` per sequence. Traced from
-`src/exec/executor_ssm_gdn.cu:260-637` and `executor_forward.cu:171-953`.
-
-**GDN sublayer** (layers where `gdn_gate` exists — 30 of 40):
-
-```
-1. residual  ← hidden
-2. hidden    ← RMSNorm(hidden, attn_norm_w, offset=+1.0)
-3. packed    ← hidden @ gdn_input_packed          [12352, 2048]
-                rows: [ qkv(8192) | gate/z(4096) | alpha(32) | beta(32) ]
-4. conv_f32  ← causal_conv1d(packed[:8192], conv_state, W[8192,4], b) then SiLU
-                conv_f32 per-token layout: [ Q(2048) | K(2048) | V(4096) ]   ← Q FIRST
-5. y         ← gdn_scan(conv_f32, alpha, beta, A, dt_bias, h_state)          ← OUR KERNEL
-6. y         ← RMSNormGated(y, ssm_norm_w[128], gate)      normalise THEN gate
-7. hidden    ← y @ ssm_out                                  [4096, 2048]
-8. hidden    ← hidden + residual
-```
-
-**Gated-attention sublayer** (10 of 40): standard paged decode, with one trap — the output
-gate is **per-head interleaved**, `[Q_h0(256), Gate_h0(256), Q_h1(256), Gate_h1(256), …]`,
-`q_out_dim = 2*nh*hd`. The reference engine records that the feature-concatenated reading
-*"breaks all three staged hybrids"* (`executor_attention.cu:306-368`). Gate applied as
-`ao *= sigmoid(gate)` after attention, before `o_proj`.
-
-**MoE-FFN sublayer** (all 40): router → top-k → per-expert GEMV → weighted sum → shared
-expert with per-token sigmoid gate → residual **last**. At decode the reference engine skips
-the sort/permute entirely and indexes `base + expert_indices[k]*stride` directly
-(`moe_routing.cu:720`). A batched design needs a permute they never launch — that is new
-work, not ported work.
-
----
-
-## 5. Parity contract
-
-These are the things a reimplementation gets wrong silently. Every one is cited; every one
-cost the reference engine a bug.
-
-**The recurrence, exactly** (`src/compute/gdn.cu:148-174`), thread `d` owning column `d`:
-
-```
-kv[d]    = Σ_s H[s,d] · k̂[s]                 ← reduction on the UNDECAYED state
-δ[d]     = (v[d] − g · kv[d]) · β
-H[s,d]   = g · H[s,d] + k̂[s] · δ[d]
-y[d]     = (Σ_s H_new[s,d] · q̂[s]) · rsqrt(head_dim)
-```
-
-The state update and the `y` accumulation **share one loop**. Splitting into
-"update then read" is algebraically identical and not fp32-identical.
-
-**Gates** (`gdn.cu:89-96`):
-
-```
-dt = α_raw + dt_bias
-dt = (dt > 20.0f) ? dt : logf(1.0f + expf(dt))      ← logf(1+expf(·)), not log1pf
-g  = expf(fmaxf(A · dt, −20.0f))                    ← A is ALREADY −exp(A_log_HF)
-β  = 1/(1 + expf(−fmaxf(fminf(β_raw, 20), −20)))
-```
-
-`A = −exp(A_log_HF)` is applied on the **host at load**.
-
-> **Corrected 2026-08-07, measured.** This paragraph previously said the decision to apply it
-> is made from *values* — "any element ≥ 0 ⇒ raw HF" — rather than from dtype, because
-> Qwen3.5-4B ships F32 raw `A_log`. The dtype half is right and **the value half is wrong on
-> that very checkpoint**: every one of layer 0's 32 `A_log` entries is negative
-> (−4.22 … −0.96), so the value test concludes "already transformed", skips the `exp`, and
-> leaves `A = −2.7` where it should be `−0.067`. That is a ~40× *over*-fast decay: the state
-> collapses toward zero silently, and the absmax tell below never fires. The value heuristic
-> belongs to the GGUF path, whose conversion script may have folded the transform already.
-> braid reads HF safetensors and keys the transform on the **source tensor name** (`A_log`),
-> then range-checks that the result is finite and strictly negative.
-> See `braid/model/loader.py` and `tests/test_loader.py`.
-
-Getting the sign wrong in the other direction makes the state grow instead of decay; the
-reference engine logged per-token absmax `0.04, 0.06, 0.40, 2.51, 110, 31680, inf`, then NaN,
-then one token forever (#1282).
-
-**L2 normalisation is clamped-rsqrt, not additive epsilon** (`gdn.cu:129,138`):
-
-```
-k_inv = rsqrtf(fmaxf(Σ k², 1e-12f))
-```
-
-`1e-12` is hardcoded and is *not* `rms_norm_eps`. It clamps the **sum of squares**, so the
-effective floor on the norm is `1e-6`; `torch.nn.functional.normalize` clamps the *norm* at
-`1e-12` — a 10⁶ difference in the degenerate case. The reference engine's comment records
-that the additive form produced a 100–1000× wrong scale and broke Qwen3.6 at layer 1 heads
-19/20/22/25/29.
-
-**Head→group mapping is layout-dependent** (`gdn.cu:55`):
-`g = grouped ? h/(n_heads/n_groups) : h % n_groups`. HF SafeTensors is **grouped** (`g = h/2`
-for 32 heads over 16 groups); GGUF is tiled. Both are valid permutations of the same index
-range, so a mismatch produces plausible-looking garbage, never a crash.
-
-**Gated RMSNorm order — normalise first, then gate** (`gdn.cu:227-236`):
-
-```
-inv_rms = rsqrtf(Σy²/head_dim + eps)     ← eps INSIDE the sqrt, AFTER the mean
-out     = y · inv_rms · γ[d] · silu(gate)
-```
-
-`γ` is `[head_dim] = [128]`, **shared across all 32 heads** — not a `[4096]` per-inner-dim
-gamma. This is the opposite order from the Mamba2 path in the same file.
-
-**The `+1` gamma offset — OPEN, and it is the highest-value open question here.**
-Qwen3.5/3.6 SafeTensors store RMSNorm gammas as deltas (`real γ = 1 + W`), and
-`arch_norm_offset = 1.0f` is threaded into `attn_norm`, `ffn_norm`, `q_norm`, `k_norm` and
-(only since #1289) `out_norm`. `ssm_norm_w`, `ssm_conv1d_w` and `ssm_conv1d_b` go through a
-path that hardcodes `weight_offset = 0.0f` (`weight_upload.cu:1385-1392`) — but **whether
-that is correct or is the next bug is live over there right now.** Their last four commits are
-`#1287`/`#1288`/`#1289`/`#1290`, all about exactly this, and the final-RMSNorm case was
-worth **13.65 → 6.82 PPL**. Getting it wrong on `linear_attn.norm` costs a factor of two in
-perplexity and nothing else visible. **Resolve empirically by single-layer HF parity, not by
-reading their source.**
-
-**`conv_f32` split order — DISPUTED, resolve before writing the loader.** Two independent
-readings of the reference engine disagree: the scan kernel's index math says
-`[Q(2048) | K(2048) | V(4096)]`,
-Q first; another reading of the executor says `[x(4096) | B(2048) | C(2048)]` — but that is
-the **Mamba2** path in the same file, not the GDN path. HF's
-`torch.split(mixed_qkv, [key_dim, key_dim, value_dim])` supports Q-first. Get this wrong and
-the model is **fluent and completely wrong**, with no crash and no obvious tell. It is
-settled in an afternoon by single-layer HF parity with an A/B on the ambiguous axis.
-
-**Other layout traps (these are settled):** conv1d weights are `[C, K]` with `K` contiguous
-per channel; conv bias is added **after** the dot and **before** SiLU; SiLU is applied to
-**all** of Q, K and V, not just V.
-
-**State precision — say this precisely, because the two cases differ.**
-
-- **FP8 E4M3 state is refuted.** From the reference engine: *"FP8 E4M3 (3-bit mantissa)
-  amplifies these through
-  the delta rule scan, causing degenerate output after ~50 special tokens in multi-turn
-  chat"* (`engine_kv_cache_init.cpp:322-326`). Do not attempt it.
-- **FP16 state is NOT refuted.** Their FP16 h_state failure was a **buffer overrun** — an
-  allocation that halved the stride so the next layer read into it (`CHANGELOG.md:2891-2894`)
-  — and they run FP16 h_state on Mamba2 models *today*. It is worth 31.9 MiB/sequence
-  (510 MiB at c=16) and it **halves the DRAM traffic of the term that caps our curve.**
-  This is one of the highest-value open questions in the whole plan (§10).
-
-fp32 is mandatory for the MVP so that parity is unambiguous. Parity against a PyTorch fp32
-oracle at `rtol=2e-5, atol=2e-6`; per-layer parity against HF at every commit.
-
----
-
-## 6. sm_120a constraints
-
-Absorbed from the reference engine's `.claude/skills/sm120-cuda-expert/`. Each cost them real time.
-
-| Constraint | Consequence for braid |
+| Constraint | Consequence |
 |---|---|
-| **`__launch_bounds__(HD, 2)` at HD=128 is a ptxas MISCOMPILE** — garbage output, correct math | Our scan kernel must use `__launch_bounds__(HD, 1)`. Directly on our path. |
+| **`__launch_bounds__(HD, 2)` at HD=128 is a ptxas MISCOMPILE** — garbage output, correct math | `gdn_decode.cu` uses `__launch_bounds__(HD, 1)`, and the min-1 form is also what lets ptxas give each thread the ~128 registers `S_reg` needs without spilling. |
 | Opt-in shared memory is **~99 KB**, not H100's 228 KB | Query `sharedMemPerBlockOptin`; design tiles to ~97 KB. |
-| **No TMA.** `cp.async.bulk` and `st.async .b128` to global are unavailable (re-probed on CUDA 13.3 / PTX ISA 9.3) | Use `cp.async.ca/cg.shared.global` at 16 B. Do not port Hopper pipelines. |
-| `nvcuda::wmma` compiles but lowers to **HMMA**, not the FP8/FP4 pipes | Hand-write `mma.sync` with register-resident fragments, or don't claim tensor cores. |
+| **No TMA** — `cp.async.bulk` and `st.async .b128` to global are unavailable | Use `cp.async.ca/cg.shared.global` at 16 B. Do not port Hopper pipelines. |
+| `nvcuda::wmma` compiles but lowers to **HMMA**, not the FP8/FP4 pipes | Hand-write `mma.sync`, or don't claim tensor cores. |
+| `cudaMallocAsync` inside a captured graph **crashes**; any device→host copy inside capture is an illegal memory access | Pre-allocate every workspace; keep all args device-side. This is exactly why `slot_idx` is a device tensor — and why the kernel's slot validation runs **only when the stream is not capturing**. |
+| CUTLASS NVFP4 on sm_120 is **non-deterministic under `cudaGraphExecUpdate`** | Keep NVFP4 GEMMs out of exec-update if bitwise reproducibility is needed. |
+| WDDM silently spills to host at ~0 MiB free — bandwidth 1,530 → 237 GB/s | Never size a large allocation from an *estimate* of another's future size. Leave ≥1 GiB free. |
+| cuBLASLt returns **zero algorithms** for grouped GEMM on sm_120 | MoE grouped GEMM (Phase 5+) must be CUTLASS block-scaled or hand-rolled. |
 | A 247-instruction survey across CUDA 13.2→13.3 flipped **0 instructions** | The ISA surface is silicon-fixed. Don't re-probe on every toolkit bump. |
-| `cudaMallocAsync` inside a captured graph **crashes**; any D2H inside capture is an **IMA** | Pre-allocate every workspace; keep all args device-side under capture. This is exactly why `slot_idx` must be a device tensor. |
-| CUTLASS NVFP4 on sm_120 is **non-deterministic under `cudaGraphExecUpdate`** | If we need bitwise reproducibility, keep NVFP4 GEMMs out of exec-update. |
-| WDDM silently spills to host at ~0 MiB free — bandwidth 1,530 → 237 GB/s, decode −7× | Never size a large allocation from an *estimate* of another's future size. Leave ≥1 GiB free. |
-| cuBLASLt returns **zero algorithms** for grouped GEMM on sm_120 | MoE grouped GEMM must be CUTLASS block-scaled or hand-rolled. |
 
 ---
 
-## 7. Measurement contract
+## 8. How braid is tested
 
-Adopted wholesale from the reference engine's own `benchmark-cuda` skill and
-`scripts/verify.sh`, so a head-to-head cannot be disputed on methodology.
+**Plain version:** the only thing that distinguishes a correct engine from a subtly broken
+one is a comparison against something known-good, run automatically, on real weights. braid
+has a GPU and runs these on every commit.
 
-- **Precondition:** no other GPU process. `nvidia-smi --query-compute-apps=pid` empty.
-- **Environment:** `CUBLAS_WORKSPACE_CONFIG=:4096:8`, warm clocks >1 s before timing.
-- **Gate measurement:** 3 independent processes × 3 reps, median across processes, and
-  **print the spread** `(max−min)/min×100`.
-- **Host-health classifier**, sampled at 1 Hz concurrently with every timed run, first 2
-  samples dropped: depressed if `mem_med < 13801 MHz` or `pwr_max < 400 W` or
-  `sm_med < 2000 MHz`. Numbers taken on a depressed host are reported as such or discarded.
-- **Use tg256, never pp512, for A/B.** pp512 varies up to **2.6×** across container restarts
-  from cuBLAS autotuning.
-- **Always profile with CUDA graphs ON.** Graphs-OFF kernel-time sums run ~1.8× the real
-  step and produce a systematically wrong lever list.
-- **Correctness gates before any timing is reported.** Per-layer HF parity, plus a
-  degeneration suite: no token run > 6, no 4-gram repeated ≥ 4× consecutively,
-  `unique_ratio > 0.25`, clean stderr.
-- **Concurrency sweeps at c ∈ {1,2,4,8,16,32} report aggregate tok/s *and* per-stream ITL
-  p50/p90/p99.** Aggregate is exactly N ÷ per-stream ITL; quoting them as independent wins
-  is how a 6× error gets made.
-- **The head-to-head runs on the reference engine's own harness**,
-  `tools/agent_bench.py --concurrency 1,4,16`, driving both engines through the same
-  OpenAI-compatible endpoint. It is their scorer.
+Four layers, each catching what the one below cannot:
 
----
+| Layer | Files | Catches |
+|---|---|---|
+| **Oracle agreement** | `test_gdn_ref.py` | The naive and vectorized fp32 recurrences disagreeing — i.e. a bug in the thing everything else is checked against. |
+| **Kernel vs oracle** | `test_gdn_decode_kernel.py`, `test_conv1d_decode.py`, `test_slot_indirection.py` | A CUDA kernel deviating from the fp32 reference; a graph replay breaking when slots are reassigned. The conv is verified over **8 sequential steps with rotating slots** — a single step cannot catch a window-orientation error. |
+| **Sublayer vs HF** | `test_hf_parity.py`, `test_attention_parity.py` | Every layout and numerics trap in §6, on real weights. |
+| **Whole model** | `test_full_forward.py` | A correct sublayer wired to the wrong layer index; a cache that decodes differently from prefill; degenerate generation. |
 
-## 8. Risks
+**69 tests green on the remote 5090** as of the Phase 2 item 3 commit.
 
-**Our c=1 is the whole risk.** Hybrid decode is GPU-busy-bound at 3.06 ms/step, so there is
-no host overhead to reclaim, and their NVFP4 GEMVs are tuned. If braid's c=1 lands near 150
-and we scale 3×, we finish at 450 — a win over their flat 320, but a narrow one that their
-two unbuilt levers (+21.4%, +13.7%) would erase. **Mitigation:** measure c=1 at the end of
-Phase 3 and re-plan if it is below 120.
+`test_full_forward.py` is the load-bearing one, in four escalating groups: one GDN layer vs
+`Qwen3_5GatedDeltaNet`; the full 32-layer stack vs `Qwen3_5TextModel` in **both** fp32 (strict
+gate) and bf16 (greedy token identity); **decode == prefill** per sublayer in fp32, so the
+blame for any mismatch is unambiguous; and proof of life — `"The capital of France is"` →
+`" Paris."`, then 128 greedy tokens with no repeated 8-gram.
 
-**The L2 cliff at B≥2.** 63.8 MiB of state per sequence against 96 MB of L2 means B=1 may be
-fully cache-resident and B=2 may not. Measure the full curve; do not extrapolate.
+**Ablations prove the gate discriminates** rather than passing everything
+(`scripts/parity_report.py`): flat-halves `[q|gate]` split reads **1.12**; rope over all 256
+dims **0.37**; q/k norm missing the `1+W` offset **0.78** — against a 5e-3 gate.
 
-**The reference engine closing it is the DOMINANT risk, and it is a schedule risk, not a
-technical one.**
-Three independent adversarial verifiers sized their fix at 1–2 weeks, 2–4 weeks and 3–6
-weeks. The decode half is: add `const int* ssm_seq_slots` to `InferenceState`, give
-`gdn_scan_fused_kernel` a `dim3(n_heads, n_seqs)` grid and a slot-indexed `h_state` offset,
-re-key the graph pool. **Their data layout is already pre-shaped for it** —
-`ssm_state_->init(n_ssm, config_.max_batch_size, …)` (`engine_kv_cache_init.cpp:565`), a
-uniform `per_seq_bytes_` stride, and a live `recurrent_slot_of_` map. **They merge ~73
-PRs/week.** Braid Phase 0→4 is 3–6 months.
+### Two traps that live in the harness, not the engine
 
-**The only moat is doctrinal, and it is explicit in their own docs.** `docs/GOAL.md:31`
-declares concurrency *"a secondary metric: it may never be bought by regressing
-single-stream decode"*, and `docs/roadmap.md:104` lists continuous batching as
-explicitly-not-a-gap. They are not blocked; they have decided this is not the race.
+1. **`module.to(bf16)` then `load_state_dict` truncates.** The copy goes *into* the
+   already-bf16 parameter, so every tensor this checkpoint stores as F32 gets rounded —
+   `linear_attn.norm` moves 2.4e-3 and the "reference" becomes a **worse model than braid**.
+   That accounted for nearly all of one GDN layer's apparent parity gap. Reference modules
+   are built on `meta` and loaded with `assign=True`.
+2. **Two copies of a 4B model do not fit comfortably on a 32 GB card**, and an fp32 arm that
+   holds a bf16 copy *and* an fp32 copy is what pushes it over. `load_checkpoint(dtype=…)`
+   recasts on the host before transfer so only one copy is ever resident.
 
-The strategic consequence has to be stated plainly: **publishing braid's curve is
-simultaneously our strongest asset and the trigger that removes the moat.** When to publish
-is a real decision with a real cost, and it belongs to whoever owns the project, not to this
-document. The engineering answer is the only one available to us — be fast, and pick targets
-(prefill, quantizer) whose fixes are *not* pre-shaped in their tree.
+Measurement infrastructure lives in `braid/bench/`, and the measurement *rules* — host-health
+classifier, 3 processes × 3 reps, print the spread — are in
+[`THESIS.md` §4](THESIS.md). Recorded results are in [`docs/runbooks/`](runbooks/).
 
-**The expensive parts for them, which is where our durable lead lives:** the prefill scan
-(§1), the MoE combine kernel (`moe_weighted_sum_residual` has *no token dimension at all*,
-`moe_routing_permute.cu:224-241`), and the batch-1-gated spec-verify path.
-
-**Silent correctness hazards we inherit if we copy carelessly.** The reference engine's
-L2-norm block
-reduction has a **data race** — after the k-reduction's `__syncthreads()`, every thread reads
-`s_reduce[0]` and immediately writes `s_reduce[d]` with no barrier between
-(`gdn.cu:129-131` and three sibling sites). Their recurrent-slot allocator has an aliasing
-fallback that silently puts two live sequences on the same 63.8 MiB slab
-(`engine_sampling_stop.cpp:256-262`). Ours must not.
+`tests/test_env.py` and `tests/test_noise_floor.py` gate the environment itself, because a
+2% performance gate against a 10% noise floor is a coin flip.
 
 ---
 
-## 9. Non-goals
+## 9. You are here
 
-Each excluded because the reference engine measured it and the ground is taken.
+What exists on disk today, honestly.
 
-- **Single-stream batch-1 decode tok/s.** They are at ~80% of the weight-bandwidth wall.
-- **A hand-written sm_120a SASS stack.** They surveyed and refuted, with measurements,
-  NVFP4 GEMV tuning (6 approaches), FMHA rewrites, cuTile, ptxas autotuning, BitDecoding
-  and FFN contextual sparsity. See §9.1.
-
-  > **Correction to the original spec.** It claimed *"2:4 sparse FP4 does not exist on
-  > consumer Blackwell — `ptxas` refuses `kind::mxf4nvf4` with `.sp`."* **This is false.**
-  > `tools/analysis/ptx_mma_survey.sh:198-199` tests
-  > `kind::f8f6f4.sp::ordered_metadata.m16n8k64.row.col.f32.e2m1.e2m1.f32` — FP4 2:4
-  > sparse — and their archived survey records that *and* `sparse mxf4nvf4 4X K=128 ue4m3`
-  > as ptxas-**accepted** on `sm_120a`. The spec conflated block-scaled `mxf4nvf4` with
-  > plain `f8f6f4`. Do not repeat the claim in public. It remains out of scope for us, but
-  > on effort grounds, not availability grounds.
-- **Speculative decoding as the headline.** Four drafters already ship, including a trained
-  MTP head at 85%+ accept. Re-measured 2026-07-27 as still net-negative (−7% on reasoning).
-- **Beating NVIDIA ModelOpt at general-purpose quantization.** Their in-tree quantizer
-  already does (9.9252 vs 10.0301 PPL on Qwen3-14B).
-- **Multi-GPU, tensor parallelism, CPU offload.** One card is the whole premise.
-- **Prefix caching, vision, LoRA, constrained decoding, model swap.** All shipped in the
-  reference engine, none on the critical path to the number we are chasing.
-
-### 9.1 Dead ground — measured and refuted, do not re-attempt
-
-Each of these is something a reasonable person would try. The reference engine tried it and
-published the number. Re-attempting any of them is pure schedule loss.
-
-| Refuted | Measurement |
+| Component | Status |
 |---|---|
-| **Making the single-sequence scan faster** | +16.7% kernel microbench → **−0.18% / −0.11% / −0.35% end-to-end**. Any milestone that measures scan kernel time without measuring end-to-end is measuring nothing. |
-| WY-representation and Tensor-Core chunkwise scan (Phase 2a/2b/2c) | Every TC variant **loses** to a plain chunk-cached scalar loop: sequential 1.567 µs/tok, chunk-cached 1.343 (the winner). The original spec's "keep WY/SSD as a later optimization" is dead ground. |
-| Split-K / cross-block parallel scan **at decode** | Cross-block sync 4 × 7 µs = 28 µs against a 5.9 µs decode kernel = **475% overhead**. |
-| NVFP4 on GDN `in_proj`/`out_proj` | **−9% (Nemotron) to −20% (Qwen3.6)** decode. Tuned FP16 GEMV hits 70–81% of HBM on wide GDN-output shapes and beats the NVFP4 one. |
-| One per-tensor FP8 scale over the fused GDN input pack | **+4% PPL** — the pack is heterogeneous (q/k/v/gate/beta row groups) and one amax is dominated by the largest. Per-**row** scales are PPL-flat (8.021 → 8.012). |
-| FP4/NVFP4 inside attention math (QK^T or PV) | Format-intrinsic, refuted 4×: e4m3-QK PPL **5722** vs 6.12; MXFP4 blockscale 5.0× slower than FA2. |
-| NVFP4 decode GEMV micro-optimization | 6 approaches; runs at 64–73% of HBM peak. One attempt caused **−41%** decode (157.71 → 92.28 tok/s) by blowing L1. |
-| Launch-latency / kernel-fusion levers under graphs+PDL | Refuted **by class**: a bit-identical fusion removing a 6.9%-share launch measured **0%** e2e. |
-| cuTile / CUDA Tile for attention | Correct autotuned cuTile FA2 = 26.5 eff-TFLOPS = **3.2% of roofline**. |
-| ptxas / compiler autotuning | Search space is flat on these hotspots; all sweep points within **±0.4%**. |
-| Tensor-core KV decode attention (BitDecoding-class) | WMMA 118.4 µs vs scalar 119.0 µs at 16k ctx — identical. Decode is weight-bound. |
-| FFN contextual sparsity | Real sparsity 25–52%, **+0–1% e2e** — wallclock is set by the slowest warp. |
-| Host-RAM / KV spill tier | Scoped 2026-08-01, verdict "do not build it": no reproducible trigger, **6.5× bandwidth cliff** (1,531 → 237 GB/s). |
+| Config parsing, `GDNConfig` + `ModelConfig` | **Done**, validated |
+| Checkpoint loader with the four transforms | **Done**, 12 tests |
+| fp32 oracle for the recurrence | **Done** |
+| Batched CUDA `gdn_decode` + `conv1d_decode`, slot indirection, graph replay | **Done and measured** — Phase 1 gate passed on all four conditions: 2.58× aggregate at B=8, 104% of HBM, no L2 cliff, 10.3 µs graph replay across slot reassignment |
+| Single-layer HF parity: GDN, attention, MLP, norms, rope | **Done** |
+| B=1 eager engine — 32 layers, caches, greedy + top-p sampling | **Done 2026-08-07.** `"The capital of France is"` → `" Paris."`, 128 greedy tokens clean, 100% greedy token identity with HF, fp32 stack at 6.4e-7. 69 tests green. |
+| Perplexity gate | **In progress** — Phase 2 item 4. `Engine.hidden_states` was split out of `forward` for it; the gate is PPL within 20% of an HF bf16 CPU reference over a pinned ≥10k-token corpus, absolute value recorded. |
+| Batch axis through the whole forward | **Not started** — Phase 3 |
+| Graph buckets {1,2,4,8,16}, paged KV, chunked prefill | **Not started** — Phase 3 |
+| Scheduler, slot lifecycle, SSE server | **Not started** — Phase 4 |
+| Ragged chunkwise prefill scan | **Not started** — Phase 5 |
+| MoE, NVFP4, the 35B target | **Not started** — Phase 5+ |
+
+**Two gaps worth stating out loud**, because they are invisible from the file listing:
+
+1. **The engine does not call the CUDA kernels.** `braid/model/gdn.py` imports
+   `gdn_decode_vectorized` from `braid/reference/` and runs it in a Python loop. The kernels
+   are Phase 1 evidence, verified standalone; wiring them into the forward pass is Phase 3
+   work, and doing it before the B=1 forward is proven correct would mean debugging two
+   things at once.
+2. **There is no batch axis anywhere above the kernels.** `Cache` takes a `batch` argument
+   and `Engine.generate` raises on `batch != 1`. The kernels have the axis; the runtime does
+   not yet.
+
+Neither is a defect. Both are the Phase 2 → Phase 3 seam, and crossing it before the B=1
+forward was proven correct would have meant debugging two things at once.
+
+[`ROADMAP.md`](ROADMAP.md) has the gates and the build order.
 
 ---
 
-## 10. Open questions that gate work
+## Glossary
 
-Ranked by how much they move the plan. Each names the cheapest experiment.
+**Token** — roughly a word, sometimes a word fragment. Models read and write tokens, not
+characters. "tok/s" is tokens per second, the throughput number everything is judged on.
 
-1. ~~**What is the batched scan's achieved DRAM bandwidth at B = 1…32?**~~ **ANSWERED
-   2026-08-07.** The scan reaches
-   **40% of HBM at B=1 and 104% at B=8**, saturating the roofline at B≈4. Aggregate rows/s
-   peaks at B=8 (2.58× B=1) and eases ~9% by B=32. **The linear term is now measured, not
-   assumed: 83 µs per sequence per decode step** (30 layers × 2 MiB × 2 ÷ 1,528 GB/s),
-   i.e. 665 µs at B=8 — which independently reproduces the 667 µs estimated from their data.
-   Consequence: **the scan is at the wall and cannot be made faster, only smaller.** That
-   promotes question 5 to the top of the list.
-2. ~~**Does the L2 cliff bite between B=1 and B=2?**~~ **ANSWERED — no.** Per-row cost
-   *improves* 6.78 → 3.97 µs. The premise was wrong: a sequence's *per-layer* slab is 2 MiB,
-   not 63.8 MiB. The 63.8 MiB figure is all 30 layers, which are never live in one scan call.
-   The real L2 effect is a 2.4× gap between an L2-resident microbenchmark and a
-   production-realistic one — which is a *measurement* trap, not a hardware cliff, and is
-   now controlled for.
-3. **Does a PyTorch runtime fit?** The c=16 target has ~114 MiB of slack; PyTorch's context,
-   caching-allocator fragmentation and FlashInfer/cuBLAS workspaces plausibly cost 1–2 GiB
-   more resident than their bare C++. **Experiment:** load the weights into torch with
-   CUTLASS/FlashInfer imported, run one warm forward, read `torch.cuda.memory_reserved()`.
-   Half a day. **If this fails, the language choice is wrong and we need to know in week 1.**
-4. **What is the reference engine's *actual* hybrid aggregate at c=8 and c=16?** The ~317
-   figure is derived (single-stream minus rotation tax); they have never published it.
-   **Experiment:** run their server on the 35B with a **GIL-free multi-process** client at
-   c=1..16, sweeping
-   `hybrid_decode_quantum` ∈ {8, 32, 128}. One day. Yields the exact number we must beat
-   *and* the fairness/throughput tradeoff curve.
-5. **Does FP16 h_state hold quality on the delta rule?** **Promoted to the top open question
-   by the Phase 1 result.** The scan is bandwidth-saturated, so the only remaining lever on
-   the linear term is halving its bytes: FP16 state is worth **~332 µs/step at B=8** and
-   510 MiB at c=16. Not refuted (§5) — the reference engine's FP16-state failure was a
-   buffer overrun and they run FP16 state on Mamba2 today.
-6. **Does FP8 KV hold on Qwen3.5/3.6?** Worth 640 MiB at c=16 — the difference between a
-   razor-thin c=16 and a comfortable one. They ship it default-on for four other families at
-   +0.83–1.07% PPL and blocked this one only because the family declares no FP8 hint and the
-   per-family gate is **unrun**. **Experiment:** run *the reference engine itself* with
-   `--kv-fp8` on the 35B.
-7. **How does the market score entries — aggregate, per-stream ITL, or batch-1?** Unresolved,
-   and it is the largest non-technical risk. If batch-1 is the axis, the reference engine is
-   at ~89–94% of the real bandwidth wall and this is the wrong race entirely.
-   **Resolve before Phase 4.**
+**Prefill** — processing the user's prompt, all at once, before any answer is produced.
+Determines time-to-first-token.
+
+**Decode** — producing the answer one token at a time. Each step depends on the previous
+one, so it cannot be parallelised over time — only over *users*.
+
+**Batch / concurrency (B, c)** — how many users' requests are being advanced in the same
+step. The whole point of braid.
+
+**Aggregate vs per-stream** — aggregate tok/s is the total across all users; per-stream ITL
+(inter-token latency) is how long one user waits between words. Batching improves the first
+and slightly worsens the second. Quoting them as independent wins is how a 6× error gets
+made.
+
+**KV cache** — the stored history an attention layer re-reads. Grows one entry per token per
+user.
+
+**Recurrent state** — the fixed-size scratchpad a Gated DeltaNet layer maintains. 51 MiB per
+user here, and it does not grow.
+
+**Slot** — a numbered place in the pre-allocated pool where one user's recurrent state lives.
+Users come and go; slots get reused.
+
+**Roofline / the memory wall** — the hard ceiling set by how fast the card can read its own
+memory. If a workload is at the wall, no code change makes it faster; only moving fewer bytes
+does.
+
+**Bandwidth-bound / weight-bound** — the workload is limited by reading bytes, not by
+arithmetic. Language model decoding is almost always this.
+
+**RMSNorm** — a rescaling step between layers. Cheap, and getting its details wrong is worth
+a factor of two in quality.
+
+**Parity** — how closely braid's output matches a known-good reference on identical input.
+Measured as relative L2 (how far off, as a fraction) and cosine similarity (how well the
+shape matches).
+
+**Perplexity (PPL)** — a quality score for a language model. Lower is better. Doubling it
+means something is broken.
+
+**CUDA graph** — a recording of a sequence of GPU operations that can be replayed without
+the CPU re-issuing each one. Removes launch overhead, but bakes in memory addresses — which
+is why the state pool is indexed through a device-side `slot_idx` rather than a raw pointer.
+
+**Kernel** — one program that runs on the GPU. "Launching" one has fixed overhead, which is
+why fusing several into one, or replaying them from a graph, can matter.
+
+**bf16 / fp32** — 16-bit and 32-bit floating point. bf16 halves memory traffic and loses
+precision; braid runs weights and activations in bf16 and the recurrent state in fp32.
+
+**sm_120a** — the RTX 5090's GPU architecture target. The trailing `a` is the
+*arch-conditional* variant, which exposes instructions plain `sm_120` does not.
+
+**GDN (Gated DeltaNet)** — the recurrent layer type; see §5.1.
+
+**GQA** — grouped-query attention: several query heads share one key/value head, shrinking
+the KV cache. 4:1 here.
+
+**SwiGLU** — the feed-forward block used by essentially every modern model.
+
+**MoE (mixture of experts)** — a model whose feed-forward layer routes each token to a few
+of many sub-networks. Not on the 4B target; arrives with the 35B in Phase 5+.

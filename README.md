@@ -150,7 +150,8 @@ Each excluded on someone's published measurement, not on taste:
 
 | Doc | Contents |
 |---|---|
-| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | Components, the decode step sublayer by sublayer, the parity contract, sm_120a landmines, dead ground |
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | **Start here.** What braid is, where the code lives, the four phases, the layers sublayer by sublayer, the numerics contract, sm_120a landmines, and what is / isn't built yet |
+| [`docs/THESIS.md`](docs/THESIS.md) | Why braid exists: the competitive case, the throughput arithmetic, the measurement contract, risks, and the dead-ground ledger of what has been measured and refuted |
 | [`docs/ROADMAP.md`](docs/ROADMAP.md) | Phases, gates, kill criteria |
 
 ## Hardware

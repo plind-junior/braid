@@ -104,7 +104,7 @@ def test_checkpoint_config_matches_the_pinned_gdn_shapes():
     )
     assert cfg.num_hidden_layers == 32
     assert len(cfg.gdn_layers) == 24 and len(cfg.attention_layers) == 8
-    assert cfg.num_key_value_heads == 4, "ARCHITECTURE.md's 2 is the 35B, not this one"
+    assert cfg.num_key_value_heads == 4, "the 2 in THESIS.md is the 35B, not this one"
 
 
 @needs_ckpt
@@ -127,8 +127,9 @@ def test_a_log_transform_is_keyed_on_name_not_dtype_or_value():
     """Both published detection heuristics are unsound on this checkpoint.
 
     `A_log` ships as F32 (so "fp32 means already transformed" is wrong) AND
-    entirely negative (so ARCHITECTURE.md:409's "any element >= 0 => raw" is
+    entirely negative (so the original spec's "any element >= 0 => raw" is
     also wrong — it would skip the exp and leave the decay ~40x too fast).
+    See ARCHITECTURE.md §6.
     """
     from safetensors import safe_open
 

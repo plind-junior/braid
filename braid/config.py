@@ -37,9 +37,9 @@ class GDNConfig:
         The buffer is named `xBC` in the reference engine's shared Mamba2 code
         and its header comment mentions the order only in passing; reading it
         as [K|Q|V] swaps the delta-rule key with the readout query and produces
-        fluent garbage. See ARCHITECTURE.md §5 — this order is DISPUTED between
-        two readings of that code and is settled empirically at Phase 2, not
-        here.
+        fluent garbage. See ARCHITECTURE.md §6 — the order was DISPUTED between
+        two readings of that code and is now settled empirically by
+        tests/test_hf_parity.py, not asserted here.
         """
         return 2 * self.n_groups * self.state_size + self.inner_size
 

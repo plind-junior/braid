@@ -21,7 +21,8 @@ Three things about this checkpoint that a generic parser gets wrong:
      whose widths divided would reshape cleanly into fluent garbage. `from_dict`
      refuses to guess rather than relying on the accident.
 
-  3. **`num_key_value_heads` is 4, not 2.** ARCHITECTURE.md's table is the 35B.
+  3. **`num_key_value_heads` is 4, not 2.** The 2 belongs to the 35B, whose
+     shapes are in docs/THESIS.md §3.
 """
 from __future__ import annotations
 
