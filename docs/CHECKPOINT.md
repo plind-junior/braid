@@ -2,8 +2,8 @@
 
 Where braid is, what changed, and what to pick up next. Written to be read cold.
 
-**HEAD:** `f2876da` · **branch:** `main` · **tests:** 132 green on the remote 5090
-**GPU:** vast.ai instance `47055458`, **stopped** (`status=exited`). 10.4 h rented.
+**HEAD:** `c54429b` · **branch:** `main` · **tests:** 157 green on the remote 5090
+**GPU:** vast.ai instance `47055458`, **stopped** (`status=exited`). 11.2 h rented.
 
 ---
 
@@ -12,7 +12,8 @@ Where braid is, what changed, and what to pick up next. Written to be read cold.
 Phase 2 complete, Phase 3 items 1–2 complete. Item 3: profiling done, **chunked
 prefill done (it was silently wrong, not missing)**, `kv_len` bucketing done, the
 paged block manager deliberately deferred with arithmetic, ragged batched prefill
-still refused.
+still refused. **Phase 4 items 1–2 done** (scheduler, SSE server, serving bench);
+items 3–4 (the head-to-head) are **blocked on prefill**, see §5.
 
 | | |
 |---|---|
@@ -20,7 +21,8 @@ still refused.
 | runs | `forward` (prefill), `decode_step` (sync-free, graph-capturable), `hidden_states` |
 | generates | `generate`, `generate_batch` — slot-pooled, per-row sampling |
 | accelerates | CUDA GDN/conv kernels (`use_kernels=True`), CUDA-graph buckets, FP8 MLP (`quant_mlp=True`) |
-| does **not** have | scheduler, continuous batching, SSE server (Phase 4); paged KV blocks and ragged batched prefill (Phase 3 item 3, both deferred with reasons) |
+| serves | `braid/serve/` — continuous batching, chunked prefill, per-row sampling, SSE, slot release on disconnect |
+| does **not** have | paged KV blocks, ragged batched prefill (deferred with reasons); prefix caching; preemption (deliberate) |
 
 **Correctness, all measured:** perplexity 8.2361 vs HF 8.2393 (0.021%); fp32
 end-to-end 6.4e-7; bf16 greedy token identity with HF; fp32 token identity at
@@ -58,6 +60,8 @@ Six commits.
 - `f2876da` — **chunked prefill was silently wrong** (1.6e-1 in fp32, greedy token
   still agreeing; the GDN conv ignored the cached window for T>1). Fixed to
   5.9e-7. Plus `kv_len` bucketing, +2.3% at B=16.
+- `c54429b` — **continuous-batching scheduler + SSE server**, 157 tests. And the
+  measurement that blocks the head-to-head (§5).
 
 New tooling worth knowing about:
 
@@ -97,9 +101,19 @@ driver flag and reboot that vast.ai does not give us. The roadmap named "ncu wit
 graphs on" as item 3's first task; torch.profiler over graph replays replaced it,
 reconciled to 96% of the wall clock.
 
-## 5. Two open problems in the plan itself
+## 5. Three open problems in the plan itself
 
-Neither is a code bug. Both need a decision.
+None is a code bug. All need a decision.
+
+**Serving is prefill-bound, and it blocks Phase 4's head-to-head.** At 128-token
+prompts, c=16: decode alone is 1,592 tok/s, served is **120**. Prefill is **91%
+of the wall clock and a flat 262 tok/s at every concurrency** — flat because it
+does not batch: `gdn.py` runs the decode recurrence in a Python loop over T, one
+sequence per forward, deliberately, so prefill and decode are the same
+arithmetic by construction. Running the GO/NO-GO now would compare braid's
+placeholder prefill against a mature engine and call it a verdict on batched
+decode. **Phase 5 item 5 (ragged batched prefill over the recurrent scan) is now
+blocking**, which is where that item already said it belonged.
 
 **Quantization is not on the critical path but the target depends on it.** It is
 Phase 5+ **item 9**, in a section explicitly "not started before Phase 4 clears",
@@ -114,11 +128,10 @@ target. One of the two has to move.
 
 ## 6. Next steps, in the order I would take them
 
-1. **Phase 4 — scheduler, slot lifecycle, SSE server.** Item 3's remaining pieces
-   (paged KV, ragged batched prefill) are both blocked on decisions Phase 4 makes,
-   so building them first would be building against a guess. Note the item 3
-   runbook's arithmetic: paging is affordable to ~786,000 token-slots and the MVP
-   uses 8,192.
+1. **Phase 5 item 5 — ragged batched prefill over the recurrent scan.** Now the
+   single blocking item: it is 91% of served wall clock and nothing downstream can
+   be measured honestly until it batches. Note it also unblocks Phase 3 item 3's
+   ragged batched prefill, which is the same capability seen from the other side.
 2. **`lm_head` FP8** (~0.38 ms, 15% of weights) with its own perplexity gate —
    its error lands directly on the greedy argmax, so gate on token identity.
 3. **Attention/GDN-out projections FP8** (~0.5 ms) — feed state that compounds
