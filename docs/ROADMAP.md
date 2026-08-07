@@ -308,9 +308,27 @@ NVFP4 35B was budgeted at, so KV headroom is not a constraint at B=1 on this tar
    is item 3's problem.
 
 2. **Graph buckets** {1, 2, 4, 8, 16} with padding, and a no-sync audit.
+   ✅ **DONE 2026-08-08** — `braid/model/graph.py`, `Engine.decode_step`,
+   11 tests in `tests/test_graph_decode.py`, numbers in the decode-speed runbook.
+   All four secondary gates met:
+
+   | gate | result |
+   |---|---|
+   | replay bit-identical to eager, every bucket | **PASS** (`rtol=0, atol=0`) |
+   | a deliberate `.item()` makes capture fail | **PASS** |
+   | slot reassignment needs no re-capture | **PASS**, 3 assignments |
+   | `graphs_on / graphs_off ≥ 1.3` | **2.24 / 1.69 / 1.52** at B=1/8/16 |
+
+   The Phase 1 CUDA kernels are wired in (`Engine(use_kernels=True)`), worth 21%
+   at B=1 eager and ~0 at B=16 — what they remove is a fixed per-layer cost.
+   `decode_step` is the sync-free, shape-static path; `hidden_states` cannot be
+   captured because it reads `positions.max().item()`.
+
 3. **KV block manager + chunked prefill**, single sequence per forward.
    Also removes the two 2 MiB-per-row-per-layer gather/scatter copies the eager
-   torch path currently pays for the recurrent slab, and the KV `index_select`.
+   torch path currently pays for the recurrent slab, and the KV `index_select`
+   — and should **bucket `kv_len`**, which `decode_step` currently pins to
+   `max_len` so the shape is capturable.
 
 **Gate — greedy token identity.** 8 prompts run as one B=8 batch produce **token-for-token
 the same 256 outputs** as 8 sequential B=1 runs.
@@ -352,6 +370,39 @@ Secondary gates: graph replay **bit-identical** to eager for every bucket;
 
 **Re-plan trigger:** measure c=1 here. If it is below 120 tok/s, the fixed term is worse than
 modelled and Phase 4's gate needs revisiting before it is run.
+
+> ### ⚠ FIRED, 2026-08-08. **c=1 measured at 113.5 tok/s.**
+>
+> Below the 120 threshold, so by this roadmap's own instruction **Phase 4's gate
+> (≥800 tok/s aggregate at c=8) must be revisited before it is run.** Full data in the
+> decode-speed runbook.
+>
+> | batch | graphed tok/s | ms/step |
+> |---|---:|---:|
+> | 1 | **113.5** | 8.81 |
+> | 8 | 606.4 | 13.19 |
+> | 16 | 956.6 | 16.73 |
+>
+> **Two things to weigh before re-planning, and they point opposite ways.**
+>
+> **The 0.51× against llama.cpp is exactly the weight-byte ratio.** ARCHITECTURE §0's
+> target is 1,880 tok/s at B=16; braid is at 956.6. BF16 weights are precisely 2× the
+> bytes of llama.cpp's Q8_0 and decode is weight-bandwidth bound, so this is the
+> predicted result rather than a surprise — and it converts §0's *"the MVP needs
+> INT8/Q8_0-class weight-only quantization or the claim is dismissible"* from a
+> prediction into a measurement. **Weight quantization is now the single gating
+> decision for Phase 4**, ahead of everything in Phase 5+.
+>
+> **But roughly 8 ms per step at B=16 is unaccounted for.** The weight sweep is
+> 5.58 ms; recurrent state and KV traffic add ~1.3 ms; the step is 16.73 ms. That gap
+> is 3× the memory wall and **has not been profiled**. It could be most of the deficit
+> or none of it. No lever may be chosen from it by argument — it needs `ncu` with
+> graphs on, and that is the first thing Phase 3 item 3 should do, before the block
+> manager is designed around a guess.
+>
+> Both readings survive c=1 being low: 113.5 is graphed but unquantised, unprofiled,
+> and running with `kv_len` pinned to `max_len`. It is a floor on today's engine, not
+> a limit.
 
 ---
 
