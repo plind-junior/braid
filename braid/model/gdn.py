@@ -39,6 +39,17 @@ class GatedDeltaNet:
         w = weights
         self.in_proj_qkv = w["linear_attn.in_proj_qkv"]
         self.in_proj_z = w["linear_attn.in_proj_z"]
+        # `a` and `b` are two `[n_heads, hidden]` projections of the same x, and
+        # the profile says they are expensive for their size: `[16, 2560] x
+        # [2560, 32]` is two 16-wide tiles, i.e. **two CTAs on a 170-SM card**,
+        # 15 us of device time apiece for 164 KiB of weights, 48 launches per
+        # step across 24 layers. Concatenating them into one `[2560, 64]` GEMM
+        # was tried and **rejected**: it is worth 0.35 ms/step at B=16 (2.7%,
+        # barely over the 1.65% noise floor) and it moves bf16 prefill from
+        # 8.3e-3 to 9.4e-3 against HF and flips a greedy token, because N=32 ->
+        # N=64 changes cuBLAS's tile choice and so the reduction order. The
+        # 0.35 ms is real and the way to collect it is a fused kernel that keeps
+        # the arithmetic fixed, not a reshaped cuBLAS call.
         self.in_proj_a = w["linear_attn.in_proj_a"]
         self.in_proj_b = w["linear_attn.in_proj_b"]
         self.out_proj = w["linear_attn.out_proj"]

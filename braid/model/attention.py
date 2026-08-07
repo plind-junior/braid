@@ -71,6 +71,54 @@ def apply_rotary_pos_emb(
     return q_out, k_out
 
 
+def grouped_decode_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    attn_mask: torch.Tensor | None,
+    scale: float,
+    groups: int,
+) -> torch.Tensor:
+    """T=1 GQA attention that never materialises the replicated K and V.
+
+    `F.scaled_dot_product_attention(..., enable_gqa=True)` is correct and, at
+    `head_dim = 256`, expensive in a specific way. Every fused backend on this
+    box declines that head width ("head_dim should be no more than 128"), so
+    SDPA falls to the **math** backend, which `repeat_interleave`s K and V up to
+    the full head count and then scales the *transposed key*. Profiled at B=16,
+    `kv_len=512`, per step across the 8 attention layers:
+
+        1.70 ms   aten::copy_  [16, 4, 4, 512, 256]   the 4x replication of K,V
+        1.38 ms   aten::mul    [16, 16, 256, 512]     scaling the expanded key
+        1.30 ms   aten::bmm                           the arithmetic itself
+
+    So two thirds of decode attention was spent making copies to feed a matmul
+    that did not need them. Grouping the *query* instead is free: head `h`
+    attends kv head `h // groups`, which is exactly what a `[B, KVH, G, D]`
+    reshape of a `[B, H, 1, D]` query already says, and it leaves K and V read
+    once at their stored width.
+
+    The scale moves onto `q` rather than `k`. That is not a numerics
+    concession here: `head_dim ** -0.5` is `2**-4`, exactly representable, so
+    the multiply is lossless — and `q` is 4 KiB against the key's 64 MiB.
+    """
+    B, H, T, D = q.shape
+    if T != 1:
+        raise ValueError(f"grouped_decode_attention is the T=1 path, got T={T}")
+    KVH = k.shape[1]
+
+    qg = q.reshape(B, KVH, groups, D) * scale          # [B, KVH, G, D]
+    scores = qg @ k.transpose(-1, -2)                  # [B, KVH, G, kv_len]
+    if attn_mask is not None:
+        # `[B, 1, 1, kv_len]` broadcasts over both kv-head and group.
+        scores = scores + attn_mask
+    # Softmax in the activation dtype, matching the math backend: PyTorch
+    # accumulates in fp32 internally and returns bf16 either way, so this is
+    # the same arithmetic, not a cheaper one.
+    probs = torch.softmax(scores, dim=-1)
+    return (probs @ v).reshape(B, H, T, D)
+
+
 class Attention:
     """One `full_attention` layer's self-attention. Weights are `[out, in]`."""
 
@@ -126,13 +174,17 @@ class Attention:
             cache.write(k, v, slots, positions)
             k, v = cache.read(slots, kv_len)
 
-        o = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            is_causal=attn_mask is None and T > 1,
-            scale=cfg.attention_scaling,
-            enable_gqa=cfg.num_key_value_groups > 1,
-        )
+        if T == 1 and cfg.num_key_value_groups > 1:
+            o = grouped_decode_attention(q, k, v, attn_mask, cfg.attention_scaling,
+                                         cfg.num_key_value_groups)
+        else:
+            o = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                is_causal=attn_mask is None and T > 1,
+                scale=cfg.attention_scaling,
+                enable_gqa=cfg.num_key_value_groups > 1,
+            )
         o = o.transpose(1, 2).reshape(B, T, H * D)
         # Gate AFTER attention, BEFORE o_proj.
         o = o * torch.sigmoid(gate)
