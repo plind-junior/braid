@@ -433,6 +433,29 @@ modelled and Phase 4's gate needs revisiting before it is run.
 > **Weight quantization remains the single gating decision for Phase 4**, now with a
 > working kernel behind it.
 >
+> #### ✅ Done, 2026-08-08: FP8 W8A8 on the MLP, opt-in
+>
+> `Engine(quant_mlp=True)`. B=16: **11.363 → 10.266 ms, 1,408.0 → 1,558.5 tok/s,
+> +10.7%**, for **+0.50% perplexity** (8.2361 → 8.2772, 32/32 layers). Against
+> llama.cpp, 0.749× → **0.829×**. B=1 does not move — activation quantization is a fixed
+> ~16 µs while the GEMM saving scales with M, so this is a concurrency lever, which is
+> the axis braid is about.
+>
+> Two design constraints were forced by measurement rather than chosen. Rowwise scaling —
+> per-token activations, per-channel weights, which is what THESIS's +4% figure argues
+> for — is a **slower** cuBLAS path on sm_120 and loses to bf16 outright on `mlp.down`,
+> `out_proj` and `in_proj_z`. And **mixed scale modes raise `RuntimeError`**, so the
+> accurate-and-fast combination does not exist here. Per-tensor was the only
+> configuration with a win in it — and THESIS's +4% turned out not to apply to it: that
+> figure is one amax over a heterogeneous *fused pack*, where a single MLP projection is
+> homogeneous. Measured rather than assumed, in both directions.
+>
+> **The default stays bf16.** Every parity gate braid has is written against the bf16
+> arm; Phase 4 should publish both arms, labelled. Next candidates, both with their own
+> perplexity gate: `lm_head` (~0.38 ms, but its error lands on the argmax) and the
+> attention projections (~0.5 ms, but they feed state that compounds across steps).
+> Details in the fp8-quantization runbook.
+>
 > Read the cleared margin honestly: 130.5 is 8.8% over the line against a 1.65% box
 > noise floor. Clear, and c=1 is still the number most exposed to the fixed per-step
 > term — re-check it whenever the step changes shape.

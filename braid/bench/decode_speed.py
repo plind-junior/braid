@@ -77,14 +77,15 @@ def _time(fn, steps: int, reset) -> float:
     return start.elapsed_time(end) / 1e3 / steps
 
 
-def measure(batch: int, steps: int, max_len: int, ckpt) -> list[Arm]:
+def measure(batch: int, steps: int, max_len: int, ckpt,
+            quant_mlp: bool = False) -> list[Arm]:
     arms: list[Arm] = []
     tokens = torch.full((batch, 1), 42, dtype=torch.long, device="cuda")
     slots = torch.arange(batch, device="cuda")
 
     for name, use_kernels in (("eager-torch", False), ("eager-kernels", True)):
         eng = Engine.from_checkpoint(ckpt, device="cuda", dtype=torch.bfloat16,
-                                     use_kernels=use_kernels)
+                                     use_kernels=use_kernels, quant_mlp=quant_mlp)
         cache = eng.allocate_cache(max_len, max_slots=batch)
         view = cache.select(list(range(batch)))
         _seed(eng, cache, batch)
@@ -95,7 +96,7 @@ def measure(batch: int, steps: int, max_len: int, ckpt) -> list[Arm]:
         del eng, cache, view, snap
 
     eng = Engine.from_checkpoint(ckpt, device="cuda", dtype=torch.bfloat16,
-                                 use_kernels=True)
+                                 use_kernels=True, quant_mlp=quant_mlp)
     cache = eng.allocate_cache(max_len, max_slots=batch)
     _seed(eng, cache, batch)
     snap = cache.snapshot()
@@ -114,13 +115,16 @@ def main() -> None:
     p.add_argument("--steps", type=int, default=192)
     p.add_argument("--max-len", type=int, default=512)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--quant-mlp", action="store_true",
+                   help="FP8 W8A8 on the MLP projections")
     args = p.parse_args()
 
     ckpt = load_checkpoint(MODEL_DIR, device="cuda")
     out: list[Arm] = []
     with HostHealthSampler() as health:
         for b in args.batches:
-            out.extend(measure(b, args.steps, args.max_len, ckpt))
+            out.extend(measure(b, args.steps, args.max_len, ckpt,
+                               quant_mlp=args.quant_mlp))
     report = health.report()
 
     if args.json:

@@ -150,8 +150,14 @@ Each excluded on someone's published measurement, not on taste:
 > (torch 2.11.0+cu128, CUDA 12.8.61): `_scaled_mm` runs, and at the MLP decode shape from an
 > HBM-resident working set it is **1.95× bf16** (1.81× including the activation cast). It is
 > W8A8, not weight-only, so the open question is accuracy rather than availability — see
-> `braid/bench/gemm_paths.py`. This is currently the only reduced-byte weight path on this
-> card that works at all, which makes it the Phase 4 quantization candidate.
+> `braid/bench/gemm_paths.py`. **Now implemented** for the MLP projections
+> (`Engine(quant_mlp=True)`, opt-in): +10.7% throughput at B=16 for +0.50% perplexity.
+>
+> Two things did fall out of it as refuted. **Rowwise `_scaled_mm` is a slower cuBLAS path
+> on sm_120** — on `mlp.down`, `out_proj` and `gdn.in_proj_z` it is slower than not
+> quantizing at all — and **mixed scale modes raise `RuntimeError`**, so per-tensor
+> activations with per-channel weights, the accurate-and-fast combination, does not exist
+> here.
 - **Multi-GPU, tensor parallelism, CPU offload.** One card is the premise.
 
 ## Documentation

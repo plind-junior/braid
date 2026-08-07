@@ -40,15 +40,18 @@ class Engine:
     dtype: torch.dtype
     checkpoint: Checkpoint
     use_kernels: bool = False
+    quant_mlp: bool = False
 
     # --- construction --------------------------------------------------------
 
     @classmethod
     def from_checkpoint(cls, ckpt: Checkpoint, device: str | torch.device = "cuda",
                         dtype: torch.dtype = torch.bfloat16,
-                        use_kernels: bool = False) -> "Engine":
+                        use_kernels: bool = False,
+                        quant_mlp: bool = False) -> "Engine":
         cfg = ckpt.config
-        layers = [DecoderLayer(cfg, i, ckpt.layer(i), use_kernels=use_kernels)
+        layers = [DecoderLayer(cfg, i, ckpt.layer(i), use_kernels=use_kernels,
+                               quant_mlp=quant_mlp)
                   for i in range(cfg.num_hidden_layers)]
         return cls(
             config=cfg,
@@ -61,14 +64,16 @@ class Engine:
             dtype=dtype,
             checkpoint=ckpt,
             use_kernels=use_kernels,
+            quant_mlp=quant_mlp,
         )
 
     @classmethod
     def from_pretrained(cls, path: str | Path, device: str | torch.device = "cuda",
                         dtype: torch.dtype = torch.bfloat16,
-                        use_kernels: bool = False) -> "Engine":
+                        use_kernels: bool = False,
+                        quant_mlp: bool = False) -> "Engine":
         return cls.from_checkpoint(load_checkpoint(path, device=device, dtype=dtype),
-                                   device, dtype, use_kernels)
+                                   device, dtype, use_kernels, quant_mlp)
 
     def allocate_cache(self, max_len: int, max_slots: int = 1) -> Cache:
         # The conv kernel requires an fp32 window; the torch path keeps the
