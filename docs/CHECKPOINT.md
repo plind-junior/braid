@@ -20,7 +20,7 @@ still refused.
 | runs | `forward` (prefill), `decode_step` (sync-free, graph-capturable), `hidden_states` |
 | generates | `generate`, `generate_batch` — slot-pooled, per-row sampling |
 | accelerates | CUDA GDN/conv kernels (`use_kernels=True`), CUDA-graph buckets, FP8 MLP (`quant_mlp=True`) |
-| does **not** have | scheduler, continuous batching, SSE server (Phase 4); KV block manager, chunked prefill (Phase 3 item 3) |
+| does **not** have | scheduler, continuous batching, SSE server (Phase 4); paged KV blocks and ragged batched prefill (Phase 3 item 3, both deferred with reasons) |
 
 **Correctness, all measured:** perplexity 8.2361 vs HF 8.2393 (0.021%); fp32
 end-to-end 6.4e-7; bf16 greedy token identity with HF; fp32 token identity at
@@ -47,7 +47,7 @@ written does not obviously get there, and one part of it is self-contradictory.
 
 ## 3. What changed this session
 
-Four commits.
+Six commits.
 
 - `d9ef187` — docs: THESIS split out of ARCHITECTURE, section references fixed.
 - `d7ee96d` — **grouped T=1 GQA decode attention**, +38.6% at B=16. SDPA fell to
@@ -77,8 +77,10 @@ Kept visible because they change what to do next.
    from one error message. Flash accepts head_dim 256 for every shape braid
    issues and the dispatcher picks `flash_fwd_splitkv_kernel` for T=1. What
    forces the math backend is the **explicit additive mask** `decode_step` must
-   pass because `kv_len` is pinned to `max_len`. *Consequence: flash-decoding is
-   reachable, and the block manager is what unlocks it.*
+   pass because rows sit at different lengths. *Consequence: flash-decoding is
+   reachable — but note `kv_len` bucketing alone does **not** unlock it, since
+   rows still differ inside a bucket. It needs per-row KV lengths: varlen
+   (`seqused_k`) or FlashInfer.*
 2. **"GEMMs are at 68% of roofline, so 68→90% is available."** Wrong — that
    divided weight bytes by a *copy* benchmark; a weight GEMM only reads. Against
    a same-tensor read the GEMMs are at **86% aggregate, 99–105% on the dominant
