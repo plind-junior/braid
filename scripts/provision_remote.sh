@@ -8,7 +8,10 @@ python3 -c "import torch" 2>/dev/null \
   || pip3 install torch --index-url https://download.pytorch.org/whl/cu128
 # numpy is required: torch 2.11 emits "Failed to initialize NumPy" without it
 # and some tensor conversions fail outright.
-pip3 install -q pytest numpy
+# pyarrow reads the pinned perplexity corpus, which HF publishes only as parquet.
+# `datasets` would pull it in too, but it also drags ~20 transitive packages for
+# one file read.
+pip3 install -q pytest numpy pyarrow
 echo "provisioned"
 python3 - <<'PY'
 import torch

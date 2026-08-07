@@ -70,17 +70,18 @@ class Engine:
     # --- forward -------------------------------------------------------------
 
     @torch.no_grad()
-    def forward(
+    def hidden_states(
         self,
         input_ids: torch.Tensor,
         cache: Cache | None = None,
         last_only: bool = True,
     ) -> torch.Tensor:
-        """`input_ids` is `[B, T]` -> logits `[B, T_out, vocab]`.
+        """`input_ids` `[B, T]` -> post-final-norm hidden states `[B, T_out, hidden]`.
 
-        `last_only` keeps just the final position before the LM head. The vocab
-        is 248,320 wide, so materialising logits for a whole prefill costs ~1 MB
-        per token in bf16 and buys nothing for greedy decode.
+        Separate from `forward` because the LM head is the expensive part to
+        materialise: the vocab is 248,320 wide, so logits cost ~1 MB per token in
+        bf16 and 2 GB for a 2,048-token window in fp32. Perplexity applies the
+        head in slices over *these*; generation only ever needs the last row.
         """
         B, T = input_ids.shape
         past = cache.seq_len if cache is not None else 0
@@ -97,8 +98,17 @@ class Engine:
 
         if last_only:
             h = h[:, -1:]
-        h = rms_norm(h, self.final_norm, self.config.rms_norm_eps)
-        return F.linear(h, self.lm_head)
+        return rms_norm(h, self.final_norm, self.config.rms_norm_eps)
+
+    @torch.no_grad()
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        cache: Cache | None = None,
+        last_only: bool = True,
+    ) -> torch.Tensor:
+        """`input_ids` is `[B, T]` -> logits `[B, T_out, vocab]`."""
+        return F.linear(self.hidden_states(input_ids, cache, last_only), self.lm_head)
 
     # --- generation ----------------------------------------------------------
 

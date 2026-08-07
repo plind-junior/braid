@@ -1,7 +1,8 @@
 # braid — roadmap
 
 **Date:** 2026-08-07
-**Companion to:** [`ARCHITECTURE.md`](ARCHITECTURE.md)
+**Companion to:** [`ARCHITECTURE.md`](ARCHITECTURE.md) (what braid is) and
+[`THESIS.md`](THESIS.md) (why, and what is ruled out)
 **Goal:** beat the reference engine on aggregate throughput serving a Gated-DeltaNet hybrid
 at concurrency, on one RTX 5090.
 
@@ -163,8 +164,8 @@ Correctness only. **No speed claim is made or measured in this phase.**
      256 ≠ 2560/16. `from_dict` refuses to infer it. On *this* checkpoint the
      inferred 160 happens to raise (8192 % 320 ≠ 0), but that is a divisibility
      accident, not a safety property.
-   - **`A = −exp(A_log)` cannot be decided by value.** §5 of ARCHITECTURE.md
-     prescribes "any element ≥ 0 ⇒ raw HF". **Measured: every one of layer 0's 32
+   - **`A = −exp(A_log)` cannot be decided by value.** The original spec
+     prescribed "any element ≥ 0 ⇒ raw HF". **Measured: every one of layer 0's 32
      `A_log` entries is negative (−4.22 … −0.96)**, so that test reads
      "already transformed", skips the exp, and leaves the decay ~40× too fast. It
      collapses the state silently rather than diverging to the NaN the doc describes
@@ -255,15 +256,40 @@ Correctness only. **No speed claim is made or measured in this phase.**
    `linear_attn.norm` moves 2.4e-3 and the "reference" becomes a worse model than
    braid. That artefact accounted for nearly all of the GDN layer's apparent
    parity gap. Reference models are built on `meta` and loaded with `assign=True`.
-4. **Perplexity gate** against an HF bf16 CPU reference over a pinned ≥10k-token
-   corpus (the box has 251 GB RAM — this is an overnight one-off). **Measure the
-   absolute value; do not expect 6.8, which is the 35B's.** The diagnostic ratio
-   still holds: **≈2× the reference PPL means the `1+W` offset is missing on the
-   final norm.**
+4. **Perplexity gate.** ✅ **DONE 2026-08-07** — `braid/bench/perplexity.py`, 5 tests
+   in `tests/test_perplexity.py`, full method in the perplexity runbook.
 
-**Gate:** PPL within 20% of the reference, absolute value recorded. **Peak VRAM under
-12 GB** — 8.8 GB of BF16 weights plus the recurrent pool — not the 30 GB the NVFP4 35B
-was budgeted at, so KV headroom is not a constraint at B=1 on this target.
+   | arm | perplexity |
+   |---|---:|
+   | **braid** (bf16) | **8.2376** |
+   | HF `Qwen3_5TextModel` (bf16) | 8.2393 |
+   | **delta** | **0.0209%** |
+
+   16,384 tokens of wikitext-2-raw-v1 test, pinned by SHA-256, in 8 non-overlapping
+   2,048-token windows. Peak VRAM **8.54 GiB** (weights 7.83).
+
+   **Not an overnight CPU job.** That framing assumed the reference could not share
+   the card. Built and freed in sequence, both models fit on the 5090 and the whole
+   run is ~2 minutes.
+
+   **The gate is shown to discriminate.** Removing the `1+W` offset from the final
+   norm degrades perplexity to 11.8429 — but that is **1.44×**, not the ≈2× this
+   item predicted. The 2× came from the 35B's 13.65 → 6.82; the direction survived
+   the rescope and the magnitude did not. 1.44× is still far outside the 20% gate,
+   so the check holds.
+
+**Gate: MET on all three clauses.** PPL within 20% (measured 0.0209%), absolute value
+recorded (8.2376), peak VRAM 8.54 GiB against a 12 GB budget — not the 30 GB the
+NVFP4 35B was budgeted at, so KV headroom is not a constraint at B=1 on this target.
+
+> **Phase 2 complete, 2026-08-07.** 74 tests green on the remote 5090. Braid loads
+> the checkpoint, matches HF to fp32 machine precision over all 32 layers, generates
+> coherent text, and is within 0.03% of the reference on perplexity.
+>
+> **No speed claim is made or measured anywhere in Phase 2**, by design. GDN prefill
+> is a per-token Python loop, attention runs on the SDPA math backend because
+> `head_dim=256` disqualifies every fused kernel on this box, and nothing is
+> CUDA-graphed. Phase 3 is where those become numbers.
 
 ---
 
@@ -356,7 +382,7 @@ That fork is spike 0.2 and it is worth resolving on day one.
 
 ## What must not be attempted
 
-See [`ARCHITECTURE.md` §9.1](ARCHITECTURE.md) for the full refutation ledger with
+See [`THESIS.md` §6.1](THESIS.md) for the full refutation ledger with
 measurements. The three most likely to tempt us:
 
 - **Making the single-sequence scan faster.** The reference engine's +16.7% kernel win
