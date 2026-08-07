@@ -134,25 +134,97 @@ Phase 2 does not start.
 
 Correctness only. **No speed claim is made or measured in this phase.**
 
-1. **Checkpoint loader.** Four load-time transforms, each silently wrong if missed:
-   llm-compressor suffix renames; `tensor_scale = 1/weight_global_scale` (llm-compressor
-   **divides**, Modelopt **multiplies** — detect by sidecar file); `A = −exp(A_log)` decided
-   **by value**, not dtype; the RMSNorm `γ = 1 + W` offset.
-2. **Single-layer HF parity** — one GDN layer and one attention layer against HF's modules on
-   identically-dequantized weights. Gate: rel L2 ≤ 5e-3, cosine ≥ 0.99999.
-   **This one step settles four open questions cheaply:** the `[Q|K|V]` split order (disputed
-   — two readings of the reference engine disagree), whether `linear_attn.norm` takes the
-   `1+W` offset (live over there *right now*, worth 13.65 → 6.82 PPL), the
-   per-head-interleaved Q/gate layout, and the `weight_scale_2` reciprocal direction.
-3. **Full forward, B=1, eager, greedy.** 40 layers, MoE, LM head, sampler.
-   Proof of life: `"The capital of France is"` → `" Paris"`, 128 coherent tokens, degeneration
-   battery clean at temp 0.7.
-4. **Perplexity gate** against an HF bf16 CPU reference over a pinned ≥10k-token corpus (the
-   box has 251 GB RAM — this is an overnight one-off). Expect ~6.8; **~13.6 means the `1+W`
-   offset is missing on the final norm.**
+> **Rescoped 2026-08-07 to the 4B.** This phase was written against
+> `Qwen3.6-35B-A3B-NVFP4` — 40 layers, MoE, NVFP4, PPL ~6.8. The MVP target is
+> `Qwen3.5-4B`: **32 layers (24 GDN + 8 gated attention), dense MLP, BF16, tied
+> embeddings.** That deletes roughly half of item 1 (the whole NVFP4 quantiser
+> contract) and all of the MoE work in item 3, and it makes the PPL figure in item 4
+> a number to *measure*, not to expect. The 35B figures are retained in Phase 5+ where
+> that checkpoint returns.
 
-**Gate:** PPL within 20% of the reference, absolute value recorded, peak VRAM under 30 GB
-with headroom for the KV pool.
+1. **Checkpoint loader.** ✅ **DONE 2026-08-07** — `braid/model/{config,loader}.py`,
+   12 tests in `tests/test_loader.py`.
+
+   The NVFP4 transforms this item was written around **do not exist on a BF16
+   checkpoint**: no llm-compressor suffix renames, and no
+   `tensor_scale = 1/weight_global_scale` reciprocal-direction trap (llm-compressor
+   divides, Modelopt multiplies). They return with the 35B in Phase 5+.
+
+   What replaced them, all specific to this checkpoint:
+
+   - **It is a vision-language checkpoint. 738 tensors, of which braid runs 426** —
+     the rest are a 24-block visual tower (297) and an MTP head (15), neither of
+     which is in llama.cpp's GGUF. A loader that walks the index naively does not
+     just waste VRAM, it makes the head-to-head compare two different models. The
+     loader filters by prefix and *reports* what it dropped.
+   - **`text_config` is nested.** Every shape lives under it; the top level carries
+     the visual tower's `hidden_size: 1024`.
+   - **`head_dim` is 256 with 16 heads over `hidden_size` 2560.** 4096 ≠ 2560 and
+     256 ≠ 2560/16. `from_dict` refuses to infer it. On *this* checkpoint the
+     inferred 160 happens to raise (8192 % 320 ≠ 0), but that is a divisibility
+     accident, not a safety property.
+   - **`A = −exp(A_log)` cannot be decided by value.** §5 of ARCHITECTURE.md
+     prescribes "any element ≥ 0 ⇒ raw HF". **Measured: every one of layer 0's 32
+     `A_log` entries is negative (−4.22 … −0.96)**, so that test reads
+     "already transformed", skips the exp, and leaves the decay ~40× too fast. It
+     collapses the state silently rather than diverging to the NaN the doc describes
+     as the tell. braid keys the transform on the **source tensor name**, which is
+     unambiguous for a safetensors load, and range-checks the result.
+   - The `γ = 1 + W` offset survives unchanged, folded in fp32 at load, on the plain
+     norms only — not on the gated `linear_attn.norm`.
+
+2. **Single-layer HF parity.** ✅ **DONE 2026-08-07** for attention and MLP —
+   `braid/model/{attention,mlp,norm}.py`, 10 tests in `tests/test_attention_parity.py`.
+   The GDN layer was already closed by `tests/test_hf_parity.py`.
+
+   Gate held at **rel L2 ≤ 5e-3, cosine ≥ 0.99999**. Measured, on real weights:
+
+   | arm | rel L2 | cosine |
+   |---|---:|---:|
+   | attention, fp32 vs HF eager | **0.0** (bit-exact) | 1.0 |
+   | attention, bf16 vs HF sdpa | 1.23e-4 | 0.999999992 |
+   | MLP, both arms | **0.0** | 1.0 |
+
+   Compare each dtype against the HF implementation that shares its numerics.
+   braid-bf16 vs HF-*eager* reads 4.4e-3 / 0.999990 — inside the gate, but with 4e-7
+   of margin — and that gap is HF eager taking its softmax in fp32 where SDPA does
+   not. Gating on it would be gating on a schedule mismatch and would flake.
+
+   Ablations confirming the gate discriminates (`scripts/parity_report.py`):
+   flat-halves `[q|gate]` split **1.12**; rope over all 256 dims instead of 64
+   **0.37**; q/k norm missing the `1+W` offset **0.78**.
+
+   **The four open questions this item was to settle are closed**, three of them by
+   the earlier GDN parity work: `[Q|K|V]` order (Q first), the `1+W` offset on
+   `linear_attn.norm` (**no** offset — it is the gated form), the l2norm form
+   (additive 1e-6). The `weight_scale_2` direction is NVFP4-only and moot here. The
+   per-head-interleaved Q/gate layout is settled above.
+
+   **New, not in the original plan:** `attn_output_gate: true` means `q_proj` emits
+   `2 × n_heads × head_dim` split **per head**, and `partial_rotary_factor: 0.25`
+   means only 64 of each 256-wide head rotates. Both are silent if missed.
+
+   **Carried into Phase 3:** at `head_dim = 256` **every fused SDPA backend on this
+   box declines** — flash, mem-efficient and cuDNN all report *"head_dim should be no
+   more than 128"* and PyTorch falls back to the math backend, which materialises the
+   full `[B, H, T, T]` score matrix. This is Phase 0 spike 0.5's question answered
+   from the other side: the gather+SDPA shim exists but is not a fused path, so
+   FlashInfer at `head_dim=256` is now load-bearing for Phase 3, not optional.
+
+3. **Full forward, B=1, eager, greedy.** **32 layers** on the 24-GDN/8-attention
+   period-4 schedule, dense SwiGLU MLP (`mlp_only_layers: []` — no MoE on this
+   target), **tied** LM head, sampler.
+   Proof of life: `"The capital of France is"` → `" Paris"`, 128 coherent tokens,
+   degeneration battery clean at temp 0.7.
+4. **Perplexity gate** against an HF bf16 CPU reference over a pinned ≥10k-token
+   corpus (the box has 251 GB RAM — this is an overnight one-off). **Measure the
+   absolute value; do not expect 6.8, which is the 35B's.** The diagnostic ratio
+   still holds: **≈2× the reference PPL means the `1+W` offset is missing on the
+   final norm.**
+
+**Gate:** PPL within 20% of the reference, absolute value recorded. **Peak VRAM under
+12 GB** — 8.8 GB of BF16 weights plus the recurrent pool — not the 30 GB the NVFP4 35B
+was budgeted at, so KV headroom is not a constraint at B=1 on this target.
 
 ---
 

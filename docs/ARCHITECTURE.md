@@ -405,11 +405,23 @@ g  = expf(fmaxf(A · dt, −20.0f))                    ← A is ALREADY −exp(A
 β  = 1/(1 + expf(−fmaxf(fminf(β_raw, 20), −20)))
 ```
 
-`A = −exp(A_log_HF)` is applied on the **host at load**, and the decision to apply it is made
-from *values* (any element ≥ 0 ⇒ raw HF), not from dtype, because Qwen3.5-4B ships F32 raw
-`A_log`. Getting the sign wrong makes the state grow instead of decay; the reference engine
-logged per-token absmax `0.04, 0.06, 0.40, 2.51, 110, 31680, inf`, then NaN, then one token
-forever (#1282).
+`A = −exp(A_log_HF)` is applied on the **host at load**.
+
+> **Corrected 2026-08-07, measured.** This paragraph previously said the decision to apply it
+> is made from *values* — "any element ≥ 0 ⇒ raw HF" — rather than from dtype, because
+> Qwen3.5-4B ships F32 raw `A_log`. The dtype half is right and **the value half is wrong on
+> that very checkpoint**: every one of layer 0's 32 `A_log` entries is negative
+> (−4.22 … −0.96), so the value test concludes "already transformed", skips the `exp`, and
+> leaves `A = −2.7` where it should be `−0.067`. That is a ~40× *over*-fast decay: the state
+> collapses toward zero silently, and the absmax tell below never fires. The value heuristic
+> belongs to the GGUF path, whose conversion script may have folded the transform already.
+> braid reads HF safetensors and keys the transform on the **source tensor name** (`A_log`),
+> then range-checks that the result is finite and strictly negative.
+> See `braid/model/loader.py` and `tests/test_loader.py`.
+
+Getting the sign wrong in the other direction makes the state grow instead of decay; the
+reference engine logged per-token absmax `0.04, 0.06, 0.40, 2.51, 110, 31680, inf`, then NaN,
+then one token forever (#1282).
 
 **L2 normalisation is clamped-rsqrt, not additive epsilon** (`gdn.cu:129,138`):
 
