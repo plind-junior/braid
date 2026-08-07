@@ -38,6 +38,7 @@ from braid.model.graph import GraphedDecoder
 from braid.model.loader import load_checkpoint
 
 MODEL_DIR = Path(os.environ.get("BRAID_MODEL_DIR", "/root/models/Qwen3.5-4B"))
+PROMPT_LEN = 8
 
 
 @dataclass
@@ -49,7 +50,7 @@ class Arm:
     steps: int
 
 
-def _seed(engine: Engine, cache, batch: int, prompt_len: int = 8) -> None:
+def _seed(engine: Engine, cache, batch: int, prompt_len: int = PROMPT_LEN) -> None:
     g = torch.Generator(device="cuda").manual_seed(11)
     for slot in range(cache.max_slots):
         cache.reset_slot(slot)
@@ -104,6 +105,24 @@ def measure(batch: int, steps: int, max_len: int, ckpt,
     cache.restore(snap)
     s = _time(lambda: dec.step(tokens, slots), steps, lambda: cache.restore(snap))
     arms.append(Arm("graphed-kernels", batch, s * 1e3, batch / s, steps))
+
+    # Same graphs, but selecting the KV bucket from the live length the way a
+    # scheduler would -- it tracks sequence lengths on the host already, so the
+    # choice costs nothing. Lengths grow across the run (prompt + step index),
+    # so this crosses bucket boundaries exactly as serving does; it is not a
+    # fixed short kv_len chosen to flatter the number.
+    n = [0]
+
+    def kv_step():
+        n[0] += 1
+        return dec.step(tokens, slots, live_len=PROMPT_LEN + n[0])
+
+    def kv_reset():
+        n[0] = 0
+        cache.restore(snap)
+
+    s = _time(kv_step, steps, kv_reset)
+    arms.append(Arm("graphed-kvbucket", batch, s * 1e3, batch / s, steps))
     del eng, cache, dec
     torch.cuda.empty_cache()
     return arms

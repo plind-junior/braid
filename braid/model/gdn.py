@@ -126,22 +126,28 @@ class GatedDeltaNet:
         # The pool may be fp32 (the CUDA conv kernel requires it) while the
         # activations are bf16, so every crossing is cast explicitly. Prefill
         # runs this path even under `use_kernels`, since the kernels decode only.
-        if cache is not None and T == 1:
-            # Decode: splice each row's own window, then one dot per channel.
+        if cache is not None:
+            # Splice each row's own window in front — for T > 1 exactly as for
+            # T == 1. The cached window holds the last K **pre-conv** inputs, so
+            # `joined` is the true history and `conv1d` needs no padding at all:
+            # output index i covers `joined[i : i+K-1]`, so outputs 1..T are
+            # precisely x's tokens 0..T-1 and `[-T:]` selects them.
+            #
+            # The T > 1 branch used to left-pad with **zeros** (`padding=K-1`)
+            # and ignore the window. For a fresh sequence that is the same thing
+            # — the window is zeros — which is why every prefill test passed.
+            # For a chunk landing on a *non-empty* cache it silently convolved
+            # the first K-1 tokens as if the sequence started there: measured at
+            # 1.6e-1 relative on the logits, in fp32, with the greedy token
+            # still agreeing (`scripts/item3_gap_diag.py`). Fluent, not fatal,
+            # which is the failure mode this codebase keeps having to catch.
             window = cache.conv.index_select(0, slots).to(x.dtype)   # [B, C, K]
-            joined = torch.cat([window, x], dim=-1)
+            joined = torch.cat([window, x], dim=-1)                  # [B, C, K+T]
             cache.conv.index_copy_(0, slots, joined[:, :, -K:].to(cache.conv.dtype))
             out = F.conv1d(joined, w, self.conv_bias, padding=0, groups=C)
-            return F.silu(out[:, :, -1:])
+            return F.silu(out[:, :, -T:])
 
-        if cache is not None:
-            if B != 1:
-                raise NotImplementedError(
-                    f"multi-token GDN at B={B}; batched prefill is Phase 3 item 3")
-            # The cached window is the last K PRE-conv inputs. For T >= K this
-            # pad is negative, i.e. a left truncation — HF's own trick.
-            new = F.pad(x, (K - T, 0)) if T < K else x[:, :, -K:]
-            cache.conv.index_copy_(0, slots, new.to(cache.conv.dtype))
+        # No cache: the sequence starts here, so zeros ARE its history.
         out = F.conv1d(x, w, self.conv_bias, padding=K - 1, groups=C)
         return F.silu(out[:, :, :T])
 
@@ -155,6 +161,13 @@ class GatedDeltaNet:
         dtype = x.dtype
         if cache is not None and slots is None:
             raise ValueError("a pooled cache needs a slot assignment")
+        if cache is not None and T > 1 and B != 1:
+            # The conv and the scan are both general in B. What is not general
+            # is running one T for every row: rows in a pooled batch sit at
+            # different lengths, so a rectangular [B, T] prefill would advance
+            # them all by T from wherever each happens to be.
+            raise NotImplementedError(
+                f"multi-token GDN at B={B}; ragged batched prefill is Phase 3 item 3")
 
         if self.use_kernels and cache is not None and T == 1:
             y = self._decode_kernels(x, cache, slots_i32)

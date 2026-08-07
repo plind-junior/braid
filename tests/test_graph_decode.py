@@ -85,8 +85,54 @@ def test_replay_is_bit_identical_to_eager(engine, graphed, size):
 
 def test_every_bucket_was_captured(graphed):
     dec, _ = graphed
-    assert sorted(dec.buckets) == sorted(BUCKETS)
+    assert sorted(dec.sizes) == sorted(BUCKETS)
     assert dec.bucket_for(3) == 4 and dec.bucket_for(5) == 8 and dec.bucket_for(8) == 8
+    # One graph per (batch, kv_len) pair.
+    assert sorted(dec.buckets) == sorted((b, k) for b in BUCKETS
+                                         for k in dec.kv_buckets)
+
+
+def test_kv_buckets_always_have_a_rung_that_covers_max_len(graphed):
+    """`kv_bucket_for` must never fail for a length the cache can hold, or a
+    scheduler hits a cliff at exactly the moment a sequence gets long."""
+    dec, cache = graphed
+    assert cache.max_len in dec.kv_buckets
+    assert dec.kv_bucket_for(1) == min(dec.kv_buckets)
+    assert dec.kv_bucket_for(cache.max_len) == cache.max_len
+    with pytest.raises(ValueError, match="exceeds max_len"):
+        dec.kv_bucket_for(cache.max_len + 1)
+
+
+def test_a_short_kv_bucket_gives_the_same_logits_as_the_full_one(engine):
+    """The bandwidth claim rests on this: reading fewer keys is only free
+    because every key past a row's length is masked to exp(-inf)=0. If that is
+    wrong, a short bucket drops real keys and the output moves."""
+    cache = engine.allocate_cache(MAX_LEN, max_slots=4)
+    for s in range(4):
+        cache.reset_slot(s)
+    g = torch.Generator(device="cuda").manual_seed(31)
+    for row in range(2):
+        engine.forward(torch.randint(0, 1000, (1, 9), generator=g, device="cuda"),
+                       cache.select([row]))
+    tokens = torch.tensor([[5], [6]], device="cuda")
+    view = cache.select([0, 1])
+
+    snap = cache.snapshot()
+    full = engine.decode_step(tokens, view)
+    cache.restore(snap)
+    # Every row is at length 9, so 16 keys is more than enough.
+    short = engine.decode_step(tokens, view, kv_len=16)
+    cache.restore(snap)
+    torch.testing.assert_close(short, full, rtol=2e-2, atol=2e-2)
+    assert torch.equal(short.argmax(-1), full.argmax(-1))
+
+
+def test_a_kv_len_the_cache_cannot_hold_is_refused(engine):
+    cache = engine.allocate_cache(MAX_LEN, max_slots=2)
+    cache.reset_slot(0)
+    with pytest.raises(ValueError, match="outside"):
+        engine.decode_step(torch.zeros(1, 1, dtype=torch.long, device="cuda"),
+                           cache.select([0]), kv_len=MAX_LEN + 1)
 
 
 def test_padding_uses_scratch_slots_and_leaves_live_ones_alone(engine, graphed):
@@ -149,8 +195,8 @@ def test_a_host_sync_makes_capture_fail_loudly(engine):
 
     original = engine.decode_step
 
-    def sync_step(tokens, c):
-        out = original(tokens, c)
+    def sync_step(tokens, c, kv_len=None):
+        out = original(tokens, c, kv_len=kv_len)
         # The exact thing hidden_states does and decode_step avoids.
         if int(c.lengths.max().item()) >= 0:
             pass

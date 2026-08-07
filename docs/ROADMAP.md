@@ -336,6 +336,37 @@ NVFP4 35B was budgeted at, so KV headroom is not a constraint at B=1 on this tar
    > `braid/bench/decode_profile.py` is the tool; `docs/runbooks/decode-profile.md`
    > is the record.
    >
+   > ### Partly done, 2026-08-08
+   >
+   > **Chunked prefill ✅ — and it was silently wrong, not missing.** Feeding a
+   > prompt in chunks did not raise; it returned logits **1.6e-1 relative from the
+   > whole-prompt answer in fp32**, with the greedy token still agreeing. The GDN
+   > conv's T>1 path left-padded with zeros and ignored the cached window, so every
+   > chunk after the first convolved its leading `conv_kernel-1` tokens as if the
+   > sequence started there. For a *fresh* sequence the window is zeros and that is
+   > correct, which is why every prefill test was green. Fixed by applying the decode
+   > path's own splice at every T: **1.6e-1 → 5.9e-7**, pinned in fp32 by
+   > `tests/test_chunked_prefill.py`.
+   >
+   > **`kv_len` bucketing ✅ +2.3% at B=16.** `decode_step` took a caller-supplied
+   > `kv_len` and `GraphedDecoder` now captures on `(batch, kv_len)`. It had been
+   > reading **64x** the KV it needed at MVP lengths. +2.3% is small and that is the
+   > honest number — KV traffic is only ~0.6 ms of a 10.3 ms step, so it could never
+   > have been worth more.
+   >
+   > **Paged block manager — deferred, with arithmetic.** It is a capacity lever, not
+   > a throughput one. KV costs 32 KiB/token, ~24 GB is free after FP8 weights and
+   > state, so contiguous per-slot allocation is affordable to ~786,000 token-slots
+   > (`max_len x max_slots`). The MVP runs 512x16 = 8,192 — **two orders below the
+   > threshold**. Paging becomes necessary above ~32k context or beyond 16 slots at
+   > long context, and its real value is a packing property that Phase 4's scheduler
+   > has not defined yet. Details in the chunked-prefill-kv runbook.
+   >
+   > Still open: ragged batched prefill (B>1, T>1) — out of scope by this item's own
+   > "single sequence per forward", but Phase 4's scheduler will want it — and the KV
+   > `index_select` (0.43 ms), which needs attention to address the pool through
+   > `slot_idx` the way the GDN kernels do. That is a kernel, not a refactor.
+   >
    > It also re-ranks the rest of this item, and raises its value. The two remaining
    > pieces are worth **0.43 ms** directly (the KV `index_select`, which exists only
    > because attention cannot address the pool through `slot_idx` the way the GDN

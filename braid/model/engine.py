@@ -169,7 +169,8 @@ class Engine:
     # --- the graph-safe decode step ------------------------------------------
 
     @torch.no_grad()
-    def decode_step(self, tokens: torch.Tensor, cache: Cache) -> torch.Tensor:
+    def decode_step(self, tokens: torch.Tensor, cache: Cache,
+                    kv_len: int | None = None) -> torch.Tensor:
         """One token per row -> logits `[B, vocab]`. **No host sync, static shapes.**
 
         `hidden_states` is the general path and cannot be captured: it reads
@@ -179,19 +180,26 @@ class Engine:
 
         Two things are traded away to remove them:
 
-        * **`kv_len` is fixed at `cache.max_len`** rather than the live maximum,
-          because a shape that depends on device state cannot be a captured
-          shape. Masked keys contribute `exp(-inf) = 0`, so the result is
-          unchanged; the cost is reading the whole KV buffer every step. That is
-          the argument for bucketing `kv_len` as well as batch, which item 3's
-          block manager makes natural.
+        * **`kv_len` is a caller-supplied constant**, defaulting to
+          `cache.max_len`. It cannot be read from the cache here: a shape that
+          depends on device state is a host sync, and a host sync during capture
+          is a capture failure. Masked keys contribute `exp(-inf) = 0`, so any
+          `kv_len` at or above every live row's length gives the same answer —
+          the cost of overshooting is pure bandwidth. Measured at `max_len=512`
+          with 8-token prompts, the default reads **64x** the KV it needs, which
+          is what `GraphedDecoder`'s `kv_buckets` exists to cut. A scheduler
+          tracks lengths on the host anyway, so picking the bucket is free
+          there; it is only inside the graph that it would cost a sync.
         * **The mask is always built**, never skipped by a data-dependent branch.
         """
         B = tokens.shape[0]
         if cache.slots.numel() < B:
             raise ValueError(f"cache assigns {cache.slots.numel()} slots for B={B}")
         slots, slots_i32 = cache.slots[:B], cache.slots_i32[:B]
-        kv_len = cache.max_len
+        if kv_len is None:
+            kv_len = cache.max_len
+        elif not 0 < kv_len <= cache.max_len:
+            raise ValueError(f"kv_len {kv_len} outside (0, max_len={cache.max_len}]")
 
         positions = cache.lengths.index_select(0, slots)          # [B]
         key = torch.arange(kv_len, device=self.device)

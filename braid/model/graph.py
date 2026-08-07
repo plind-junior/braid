@@ -28,6 +28,13 @@ from braid.model.cache import Cache
 from braid.model.engine import Engine
 
 DEFAULT_BUCKETS = (1, 2, 4, 8, 16)
+# `kv_len` is the second capture axis. A graph's shapes are fixed, so the KV
+# extent attention reads has to be a constant -- and pinning it to `max_len`
+# means every step reads the whole buffer however short the live sequences are:
+# measured at 64x the needed traffic for 8-token prompts in a 512 pool. Any
+# `kv_len` at or above every live row's length is *correct* (masked keys
+# contribute exp(-inf)=0), so these are a bandwidth ladder, not a semantics one.
+DEFAULT_KV_BUCKETS = (128, 256, 512)
 
 
 @dataclass
@@ -38,6 +45,7 @@ class _Bucket:
     slots_i32: torch.Tensor   # [B]    int32 — static input, same values
     logits: torch.Tensor      # [B, vocab] — static output
     size: int
+    kv_len: int
 
 
 class GraphedDecoder:
@@ -45,21 +53,31 @@ class GraphedDecoder:
 
     def __init__(self, engine: Engine, cache: Cache,
                  buckets: tuple[int, ...] = DEFAULT_BUCKETS,
+                 kv_buckets: tuple[int, ...] | None = None,
                  warmup: int = 3):
         usable = [b for b in sorted(buckets) if b <= cache.max_slots]
         if not usable:
             raise ValueError(
                 f"no bucket fits: buckets={buckets}, cache has {cache.max_slots} slots")
+        if kv_buckets is None:
+            kv_buckets = tuple(k for k in DEFAULT_KV_BUCKETS if k < cache.max_len)
+        # `max_len` is always capturable, so the ladder always has a top rung
+        # that can serve any live length -- `kv_bucket_for` can never fail.
+        self.kv_buckets = tuple(sorted({*(k for k in kv_buckets
+                                          if 0 < k <= cache.max_len),
+                                        cache.max_len}))
         self.engine = engine
         self.cache = cache
         self.warmup = warmup
-        self.buckets: dict[int, _Bucket] = {}
+        self.buckets: dict[tuple[int, int], _Bucket] = {}
         for b in usable:
-            self.buckets[b] = self._capture(b)
+            for kv in self.kv_buckets:
+                self.buckets[(b, kv)] = self._capture(b, kv)
+        self.sizes = tuple(usable)
 
     # --- capture --------------------------------------------------------------
 
-    def _capture(self, size: int) -> _Bucket:
+    def _capture(self, size: int, kv_len: int) -> _Bucket:
         eng, cache = self.engine, self.cache
         dev = eng.device
 
@@ -83,37 +101,60 @@ class GraphedDecoder:
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
             for _ in range(self.warmup):
-                eng.decode_step(tokens, view)
+                eng.decode_step(tokens, view, kv_len=kv_len)
         torch.cuda.current_stream().wait_stream(side)
         cache.restore(saved)
 
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
-            logits = eng.decode_step(tokens, view)
+            logits = eng.decode_step(tokens, view, kv_len=kv_len)
         cache.restore(saved)
         return _Bucket(graph=graph, tokens=tokens, slots=slots, slots_i32=slots_i32,
-                       logits=logits, size=size)
+                       logits=logits, size=size, kv_len=kv_len)
 
     # --- replay ---------------------------------------------------------------
 
     def bucket_for(self, batch: int) -> int:
-        for b in sorted(self.buckets):
+        for b in self.sizes:
             if b >= batch:
                 return b
         raise ValueError(f"batch {batch} exceeds the largest bucket "
-                         f"{max(self.buckets)}")
+                         f"{max(self.sizes)}")
+
+    def kv_bucket_for(self, live_len: int) -> int:
+        """Smallest captured `kv_len` that covers every live row.
+
+        `live_len` is the largest committed length in the batch **plus the token
+        about to be written** — a row at length L writes at index L and then
+        attends keys 0..L, so it needs kv_len >= L + 1. Undershooting does not
+        degrade quality, it silently drops the newest key.
+        """
+        for k in self.kv_buckets:
+            if k >= live_len:
+                return k
+        raise ValueError(f"live length {live_len} exceeds max_len "
+                         f"{max(self.kv_buckets)}")
 
     def step(self, tokens: torch.Tensor, slots: torch.Tensor,
-             pad_slots: torch.Tensor | None = None) -> torch.Tensor:
+             pad_slots: torch.Tensor | None = None,
+             live_len: int | None = None) -> torch.Tensor:
         """`tokens[B,1]`, `slots[B]` -> logits `[B, vocab]`.
 
         `pad_slots` supplies scratch slots for the padded rows of the bucket. A
         padded row still advances whatever slot it names, so pointing it at a
         live sequence would corrupt that sequence.
+
+        `live_len` is the largest committed length in the batch **plus one**;
+        it selects the KV bucket. Omitting it uses the full `max_len` graph,
+        which is always correct and reads the whole buffer. The caller supplies
+        it because reading it from the cache here would be a device->host sync,
+        and a scheduler knows its own sequence lengths already.
         """
         B = tokens.shape[0]
         size = self.bucket_for(B)
-        buck = self.buckets[size]
+        kv = (self.kv_buckets[-1] if live_len is None
+              else self.kv_bucket_for(live_len))
+        buck = self.buckets[(size, kv)]
 
         buck.tokens[:B].copy_(tokens)
         buck.slots[:B].copy_(slots)
