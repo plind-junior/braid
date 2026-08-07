@@ -128,9 +128,19 @@ def test_prefill_then_decode_continues_the_same_sequence(engine):
 
 # --- what is still refused, and refused loudly --------------------------------
 
-def test_ragged_batched_prefill_is_refused_not_silently_wrong(engine):
-    """B>1 with T>1 would advance every row by T from wherever it sits."""
+def test_a_ragged_batch_without_lengths_is_refused(engine):
+    """`seq_lens` is how a caller says the rows are ragged. Without it a `[B, T]`
+    forward is a genuine rectangle and every row advances by T — correct, but
+    only if that is what the caller meant. It is `seq_lens` describing a batch
+    with no cache to address that is meaningless, and refused."""
+    ids = torch.randint(0, 1000, (2, 8), device="cuda")
+    lens = torch.tensor([8, 5], device="cuda")
+    with pytest.raises(ValueError, match="needs a cache"):
+        engine.forward(ids, None, seq_lens=lens)
+
+
+def test_seq_lens_must_match_the_batch(engine):
     c = _fresh(engine)
     ids = torch.randint(0, 1000, (2, 8), device="cuda")
-    with pytest.raises(NotImplementedError, match="ragged batched prefill"):
-        engine.forward(ids, c.select([0, 1]))
+    with pytest.raises(ValueError, match="seq_lens must be"):
+        engine.forward(ids, c.select([0, 1]), seq_lens=torch.tensor([8], device="cuda"))

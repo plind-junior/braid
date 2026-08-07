@@ -28,10 +28,19 @@ names by hand:
 
 **Chunked prefill is what keeps admission from stalling decode.** A 2,000-token
 prompt admitted in one forward is ~2,000 tokens of work while every live stream
-waits. Each tick spends at most `prefill_chunk` tokens on one sequence, so a
+waits. Each tick spends at most `prefill_chunk` tokens on any one sequence, so a
 long prompt costs the pool a bounded slice per step instead of all of it. That
 path was measurably broken until 2026-08-08 (`docs/runbooks/chunked-prefill-kv.md`);
 it is load-bearing here.
+
+**Prefill is batched across sequences, not just chunked.** Until 2026-08-08 a
+tick prefilled exactly one row, and at c=16 with 128-token prompts that made
+prefill 91% of the served wall clock at a flat 262 tok/s — flat at every
+concurrency, which is the tell that it was not batching. The GDN scan's Python
+loop costs one iteration per *column*, so a `[16, T]` batch and a `[1, T]` batch
+run the same number of iterations; charging that loop to sixteen rows instead of
+one is where the win is. Ragged rows are what makes it legal: see
+`Engine.hidden_states`.
 """
 from __future__ import annotations
 
@@ -42,7 +51,6 @@ from dataclasses import dataclass, field
 
 import torch
 
-from braid.model.cache import Cache
 from braid.model.engine import Engine
 from braid.model.graph import GraphedDecoder
 
@@ -107,13 +115,37 @@ class Scheduler:
 
     def __init__(self, engine: Engine, capacity: int = 8, max_len: int = 2048,
                  graphed: bool = True, buckets: tuple[int, ...] | None = None,
-                 prefill_chunk: int = 256):
+                 prefill_chunk: int = 256, prefill_budget: int | None = None):
         if capacity < 1:
             raise ValueError("capacity must be >= 1")
         self.engine = engine
         self.capacity = capacity
         self.max_len = max_len
         self.prefill_chunk = prefill_chunk
+        # Two bounds, because prefill has two costs that scale differently.
+        # `prefill_chunk` caps T, the padded width of the batch, and T is what
+        # the GDN scan's Python loop is proportional to — it runs one iteration
+        # per column regardless of how many rows sit in it. `prefill_budget`
+        # caps B*T, which is what the GEMMs cost.
+        #
+        # **The default is deliberately non-binding**: every resident row may
+        # take a full chunk in the same forward. An earlier default of
+        # `4 * prefill_chunk` was chosen on the assumption that a wider prefill
+        # tick would cost inter-token latency for the streams already decoding.
+        # Measured at c=16 with 128-token prompts, it does the opposite — 8 rows
+        # per tick against 16:
+        #
+        #     rows/tick   aggregate   prefill    ITL p99
+        #             1     121.8       269       489 ms
+        #             8     614.5      2190       479 ms
+        #            16     852.4      4307      15.3 ms
+        #
+        # because the tail never came from one wide tick. It came from *many
+        # narrow ones*, each blocking decode for the same fixed loop. Prefilling
+        # sixteen rows costs what prefilling one costs, so decode waits once
+        # instead of sixteen times. The knob stays for callers who want a
+        # smaller tick; `prefill_chunk` is the one that actually bounds latency.
+        self.prefill_budget = prefill_budget or capacity * prefill_chunk
         self.cache = engine.allocate_cache(max_len, max_slots=capacity + 1)
         self.scratch = capacity                      # never admitted into
         for s in range(capacity + 1):
@@ -123,12 +155,12 @@ class Scheduler:
         # vacuous: if only one row ever decodes at a time, "concurrent streams
         # match solo runs" is a tautology.
         self.max_decode_batch = 0
+        self.max_prefill_batch = 0
         self.decode_ticks = 0
-        # Prefill runs the decode recurrence in a Python loop over T
-        # (`gdn.py`: "slow and deliberate", Phase 5 replaces it), so at realistic
-        # prompt lengths it can dominate a serving run outright. Accounted here
-        # rather than inferred, because "aggregate tok/s is low" does not say
-        # which half is slow.
+        # Prefill still runs the decode recurrence in a Python loop over T
+        # (`gdn.py`), so at realistic prompt lengths it can dominate a serving
+        # run outright. Accounted here rather than inferred, because "aggregate
+        # tok/s is low" does not say which half is slow.
         self.prefill_s = 0.0
         self.decode_s = 0.0
         self.prefill_tokens = 0
@@ -150,6 +182,7 @@ class Scheduler:
         must call this, or prefill time from the discarded run is charged to the
         timed one -- which reads as a prefill share above 100%."""
         self.max_decode_batch = 0
+        self.max_prefill_batch = 0
         self.decode_ticks = 0
         self.prefill_s = 0.0
         self.decode_s = 0.0
@@ -216,15 +249,12 @@ class Scheduler:
                 gen.manual_seed(req.seed)
             self._live[req.id] = _Live(req=req, slot=slot, gen=gen)
 
-        # One sequence per forward, a bounded number of tokens per tick.
-        for live in list(self._live.values()):
-            if live.prefilling:
-                t0 = time.perf_counter()
-                n = live.fed
-                self._prefill_chunk(live, updates)
-                self.prefill_s += time.perf_counter() - t0
-                self.prefill_tokens += live.fed - n
-                break
+        # Every prefilling row in one ragged forward, bounded on both axes.
+        waiting = [live for live in self._live.values() if live.prefilling]
+        if waiting:
+            t0 = time.perf_counter()
+            self.prefill_tokens += self._prefill(waiting, updates)
+            self.prefill_s += time.perf_counter() - t0
 
         ready = [l for l in self._live.values() if not l.prefilling and l.last is not None]
         if ready:
@@ -235,17 +265,43 @@ class Scheduler:
             self.decode_s += time.perf_counter() - t0
         return list(updates.values())
 
-    def _prefill_chunk(self, live: _Live, updates: dict[str, Update]) -> None:
-        prompt = live.req.prompt
-        hi = min(live.fed + self.prefill_chunk, len(prompt))
-        ids = torch.tensor([prompt[live.fed:hi]], dtype=torch.long,
-                           device=self.engine.device)
-        logits = self.engine.forward(ids, self.cache.select([live.slot]))
-        live.fed = hi
-        if not live.prefilling:
-            # The last chunk's final logits are the first generated token.
-            tok = self._sample_one(logits[0, -1], live)
-            self._emit(live, tok, updates)
+    def _prefill(self, waiting: list[_Live], updates: dict[str, Update]) -> int:
+        """One ragged forward over every row that still has prompt left.
+
+        Returns the number of prompt tokens committed. Rows are taken in
+        admission order until `prefill_budget` is spent; the first row is always
+        admitted, truncated to the budget if it alone exceeds it, so a long
+        prompt cannot deadlock behind its own size.
+        """
+        picked: list[tuple[_Live, int]] = []
+        total = 0
+        for live in waiting:
+            n = min(self.prefill_chunk, len(live.req.prompt) - live.fed)
+            if not picked:
+                n = min(n, self.prefill_budget)
+            elif total + n > self.prefill_budget:
+                break
+            picked.append((live, n))
+            total += n
+
+        # Observed co-prefill width, so a test can prove the batching is real
+        # rather than a one-row loop wearing a batched interface.
+        self.max_prefill_batch = max(self.max_prefill_batch, len(picked))
+        width = max(n for _, n in picked)
+        rows = [live.req.prompt[live.fed:live.fed + n] + [0] * (width - n)
+                for live, n in picked]
+        dev = self.engine.device
+        ids = torch.tensor(rows, dtype=torch.long, device=dev)
+        lens = torch.tensor([n for _, n in picked], device=dev)
+        view = self.cache.select([live.slot for live, _ in picked])
+        logits = self.engine.forward(ids, view, seq_lens=lens)
+
+        for i, (live, n) in enumerate(picked):
+            live.fed += n
+            if not live.prefilling:
+                # The last chunk's final logits are the first generated token.
+                self._emit(live, self._sample_one(logits[i, -1], live), updates)
+        return total
 
     def _decode(self, ready: list[_Live], updates: dict[str, Update]) -> None:
         eng = self.engine

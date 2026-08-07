@@ -2,10 +2,17 @@
 
 The recurrence itself is `braid.reference.gdn_ref.gdn_decode_vectorized`, the
 same fp32 oracle the CUDA decode kernel is checked against. **Prefill runs that
-one-token step in a loop.** That is slow and deliberate: it makes prefill and
-decode the same arithmetic by construction rather than by test, so the classic
-"generation drifts after the first token" bug cannot exist here. Phase 5's
-ragged chunkwise scan replaces the loop; this phase makes no speed claim.
+one-token step in a loop.** That is deliberate: it makes prefill and decode the
+same arithmetic by construction rather than by test, so the classic "generation
+drifts after the first token" bug cannot exist here.
+
+The loop costs one iteration per **column**, not per token, and each iteration
+is a handful of small kernels — so it is launch-bound, and a `[B, T]` batch
+costs what a `[1, T]` batch costs. That is why ragged batched prefill
+(`seq_lens`, below) is the lever and not a faster single-sequence scan: it
+divides the same fixed loop across B rows. Cutting the iteration *count* — a
+chunkwise scan that keeps the state resident across C tokens — is the next lever
+and a separate one.
 
 Gate arithmetic follows **HF, not the reference engine**:
 
@@ -114,10 +121,17 @@ class GatedDeltaNet:
     # --- convolution ---------------------------------------------------------
 
     def _conv(self, x: torch.Tensor, cache: RecurrentCache | None,
-              slots: torch.Tensor | None) -> torch.Tensor:
+              slots: torch.Tensor | None,
+              seq_lens: torch.Tensor | None = None) -> torch.Tensor:
         """Depthwise causal conv + SiLU. `x` is `[B, C, T]`.
 
         SiLU is applied to **all** of Q, K and V, not just V.
+
+        With `seq_lens`, `x` is right-padded: row b owns columns
+        `0 .. seq_lens[b]-1`. The conv *outputs* need no masking — a causal conv
+        reads only backwards, so a real output never sees a pad column — but the
+        **cached window must not**, or the next chunk splices pad tokens in as
+        history and the sequence quietly convolves against tokens it never saw.
         """
         B, C, T = x.shape
         K = self.g.conv_kernel
@@ -143,7 +157,17 @@ class GatedDeltaNet:
             # which is the failure mode this codebase keeps having to catch.
             window = cache.conv.index_select(0, slots).to(x.dtype)   # [B, C, K]
             joined = torch.cat([window, x], dim=-1)                  # [B, C, K+T]
-            cache.conv.index_copy_(0, slots, joined[:, :, -K:].to(cache.conv.dtype))
+            if seq_lens is None:
+                keep = joined[:, :, -K:]
+            else:
+                # Row b's real inputs are joined[K : K+seq_lens[b]], so its last
+                # K entries of true history end there: joined[len : len+K].
+                # `-K:` would take the pad columns instead. At seq_lens == T the
+                # two expressions are the same slice, which is what makes the
+                # rectangular path a special case rather than a separate one.
+                idx = seq_lens[:, None] + torch.arange(K, device=x.device)[None]
+                keep = joined.gather(2, idx[:, None].expand(B, C, K))
+            cache.conv.index_copy_(0, slots, keep.to(cache.conv.dtype))
             out = F.conv1d(joined, w, self.conv_bias, padding=0, groups=C)
             return F.silu(out[:, :, -T:])
 
@@ -155,26 +179,30 @@ class GatedDeltaNet:
 
     def forward(self, x: torch.Tensor, cache: RecurrentCache | None = None,
                 slots: torch.Tensor | None = None,
-                slots_i32: torch.Tensor | None = None) -> torch.Tensor:
-        cfg, g = self.cfg, self.g
+                slots_i32: torch.Tensor | None = None,
+                seq_lens: torch.Tensor | None = None) -> torch.Tensor:
+        """`x` is `[B, T, hidden]`.
+
+        `seq_lens[b] <= T` is how many leading columns of row b are real; `None`
+        means all T. Rows advance from their **own** `positions[b]` by their own
+        `seq_lens[b]`, which is what makes a ragged batch legal here at all — a
+        padded rectangle with no length vector would run pad tokens through the
+        recurrence and leave every short row's state advanced past its prompt.
+        """
+        g = self.g
         B, T, _ = x.shape
         dtype = x.dtype
         if cache is not None and slots is None:
             raise ValueError("a pooled cache needs a slot assignment")
-        if cache is not None and T > 1 and B != 1:
-            # The conv and the scan are both general in B. What is not general
-            # is running one T for every row: rows in a pooled batch sit at
-            # different lengths, so a rectangular [B, T] prefill would advance
-            # them all by T from wherever each happens to be.
-            raise NotImplementedError(
-                f"multi-token GDN at B={B}; ragged batched prefill is Phase 3 item 3")
+        if seq_lens is not None and cache is None:
+            raise ValueError("seq_lens describes a pooled batch; it needs a cache")
 
         if self.use_kernels and cache is not None and T == 1:
             y = self._decode_kernels(x, cache, slots_i32)
             return self._readout(x, y, B, T, dtype)
 
-        qkv = F.linear(x, self.in_proj_qkv).transpose(1, 2)   # [B, C, T]
-        qkv = self._conv(qkv, cache, slots).transpose(1, 2)   # [B, T, C]
+        qkv = F.linear(x, self.in_proj_qkv).transpose(1, 2)              # [B, C, T]
+        qkv = self._conv(qkv, cache, slots, seq_lens).transpose(1, 2)    # [B, T, C]
 
         # [Q | K | V], Q FIRST. Settled empirically by tests/test_hf_parity.py,
         # not read off the reference engine — the two readings of it disagree and
@@ -197,6 +225,22 @@ class GatedDeltaNet:
         # the delta-rule step size, so its rounding lands straight in the output.
         beta = torch.sigmoid(b_raw).float()                                  # [B,T,H]
         alpha = torch.exp(self.A * F.softplus(a_raw.float() + self.dt_bias))  # [B,T,H]
+
+        if seq_lens is not None:
+            # A pad step must be an exact identity on the state, not merely a
+            # small one. `alpha = 1, beta = 0` gives
+            #     delta = (v - 1*kv) * 0 = 0        (v and kv are finite, so
+            #                                        this is a true zero, not a
+            #                                        0 * NaN)
+            #     S'    = 1*S + k (x) 0 = S         bit-identically.
+            # So a padded row's state is the same object it would have been had
+            # the row not been in the batch at all. y is garbage on those steps
+            # and is never read. Masking the *output* instead would be wrong:
+            # the state is what carries across chunks.
+            live = (torch.arange(T, device=x.device)[None]
+                    < seq_lens[:, None])[:, :, None]                # [B, T, 1]
+            alpha = torch.where(live, alpha, 1.0)
+            beta = torch.where(live, beta, 0.0)
 
         # l2norm in the ACTIVATION dtype, then cast — HF's order. Normalising
         # after the cast changes the last bits and compounds over 24 layers.

@@ -88,6 +88,28 @@ def test_the_identity_gate_is_not_vacuous(engine_f32):
         f"so the concurrency tests are not testing concurrency")
 
 
+def test_prefill_actually_batches(engine_f32):
+    """Same argument as above, for the other half of the tick. Prefill used to
+    run one row per forward at a flat 262 tok/s; if it still did, the identity
+    gate would be passing over a loop rather than over a ragged batch."""
+    sched = Scheduler(engine_f32, capacity=4, max_len=MAX_LEN, graphed=False)
+    sched.run([Request(prompt=p, max_new_tokens=4) for p in _prompts(8, seed=41)])
+    assert sched.max_prefill_batch >= 4, (
+        f"peak prefill batch was {sched.max_prefill_batch}; rows are still being "
+        f"prefilled one at a time")
+
+
+def test_a_long_prompt_is_still_chunked(engine_f32):
+    """`prefill_budget` caps total tokens per tick, but the first row is always
+    admitted — otherwise a prompt longer than the budget would never start."""
+    sched = Scheduler(engine_f32, capacity=2, max_len=MAX_LEN, graphed=False,
+                      prefill_chunk=8, prefill_budget=8)
+    long_prompt = _prompts(1, lo=40, hi=41, seed=2)[0]
+    out = sched.run([Request(prompt=long_prompt, max_new_tokens=3)])
+    assert len(next(iter(out.values()))) == 3
+    assert sched.prefill_tokens == len(long_prompt)
+
+
 def test_streams_joining_midflight_are_unaffected(engine_f32):
     """The continuous part: admit late, into a pool that is already busy."""
     n_new = 6

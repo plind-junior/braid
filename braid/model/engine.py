@@ -48,7 +48,7 @@ class Engine:
     def from_checkpoint(cls, ckpt: Checkpoint, device: str | torch.device = "cuda",
                         dtype: torch.dtype = torch.bfloat16,
                         use_kernels: bool = False,
-                        quant_mlp: bool = False) -> "Engine":
+                        quant_mlp: bool = False) -> Engine:
         cfg = ckpt.config
         layers = [DecoderLayer(cfg, i, ckpt.layer(i), use_kernels=use_kernels,
                                quant_mlp=quant_mlp)
@@ -71,7 +71,7 @@ class Engine:
     def from_pretrained(cls, path: str | Path, device: str | torch.device = "cuda",
                         dtype: torch.dtype = torch.bfloat16,
                         use_kernels: bool = False,
-                        quant_mlp: bool = False) -> "Engine":
+                        quant_mlp: bool = False) -> Engine:
         return cls.from_checkpoint(load_checkpoint(path, device=device, dtype=dtype),
                                    device, dtype, use_kernels, quant_mlp)
 
@@ -89,6 +89,7 @@ class Engine:
         input_ids: torch.Tensor,
         cache: Cache | None = None,
         last_only: bool = True,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """`input_ids` `[B, T]` -> post-final-norm hidden states `[B, T_out, hidden]`.
 
@@ -100,10 +101,28 @@ class Engine:
         With a cache, rows may be at **different lengths** — the batch is a set
         of independent sequences, not a padded rectangle. `positions` is
         therefore per row, and so is rope.
+
+        **Ragged batched prefill.** `seq_lens[b] <= T` says how many leading
+        columns of row b are real; the rest are padding and may hold any valid
+        token id. Every row still advances from its own `positions[b]`, now by
+        its own `seq_lens[b]`. `None` means the rectangular case, every row
+        owning all T columns.
+
+        Padding is on the **right**, and that choice is load-bearing rather than
+        conventional: a causal model never lets a real token at index t read
+        index > t, so right-padding is invisible to the arithmetic. Left-padding
+        would put pad tokens inside every real token's receptive field and would
+        have to be masked in the conv, the scan and attention separately.
         """
         B, T = input_ids.shape
         slots = positions = attn_mask = slots_i32 = None
         kv_len = None
+
+        if seq_lens is not None:
+            if cache is None:
+                raise ValueError("seq_lens describes a pooled batch; it needs a cache")
+            if seq_lens.shape != (B,):
+                raise ValueError(f"seq_lens must be [{B}], got {tuple(seq_lens.shape)}")
 
         if cache is not None:
             if cache.slots.numel() < B:
@@ -111,9 +130,12 @@ class Engine:
             slots = cache.slots[:B]
             slots_i32 = cache.slots_i32[:B]
             positions = cache.lengths.index_select(0, slots)
-            kv_len = int(positions.max().item()) + T
-            if kv_len > cache.max_len:
-                raise ValueError(f"KV overflow: {kv_len} > max_len {cache.max_len}")
+            ends = positions + T if seq_lens is None else positions + seq_lens
+            # One host sync, here, for the whole forward. `KVCache.write` trusts
+            # it rather than repeating the check per attention layer.
+            kv_len = int(ends.max().item())
+            if not 0 < kv_len <= cache.max_len:
+                raise ValueError(f"KV span {kv_len} outside (0, max_len={cache.max_len}]")
             attn_mask = self._decode_mask(positions, T, kv_len)
             pos = positions[:, None] + torch.arange(T, device=self.device)[None]
         else:
@@ -126,13 +148,18 @@ class Engine:
             h = layer(h, cos, sin,
                       cache=cache.layers[i] if cache is not None else None,
                       slots=slots, positions=positions, kv_len=kv_len,
-                      attn_mask=attn_mask, slots_i32=slots_i32)
+                      attn_mask=attn_mask, slots_i32=slots_i32, seq_lens=seq_lens)
 
         if cache is not None:
-            cache.lengths.index_copy_(0, slots, positions + T)
+            cache.lengths.index_copy_(0, slots, ends)
 
         if last_only:
-            h = h[:, -1:]
+            if seq_lens is None:
+                h = h[:, -1:]
+            else:
+                # Row b's last real token sits at seq_lens[b] - 1, not at T - 1.
+                idx = (seq_lens - 1).clamp_(min=0)[:, None, None]
+                h = h.gather(1, idx.expand(B, 1, h.shape[-1]))
         return rms_norm(h, self.final_norm, self.config.rms_norm_eps)
 
     def _decode_mask(self, positions: torch.Tensor, T: int,
@@ -162,9 +189,11 @@ class Engine:
         input_ids: torch.Tensor,
         cache: Cache | None = None,
         last_only: bool = True,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """`input_ids` is `[B, T]` -> logits `[B, T_out, vocab]`."""
-        return F.linear(self.hidden_states(input_ids, cache, last_only), self.lm_head)
+        return F.linear(self.hidden_states(input_ids, cache, last_only, seq_lens),
+                        self.lm_head)
 
     # --- the graph-safe decode step ------------------------------------------
 
@@ -251,14 +280,14 @@ class Engine:
         max_len: int | None = None,
         slots: list[int] | None = None,
     ) -> list[list[int]]:
-        """Prefill each prompt on its own, then decode all of them together.
+        """Prefill every prompt as one ragged batch, then decode them together.
 
-        **Prefill is per sequence, decode is batched**, which is what a real
-        continuous-batching engine does and is also what the two halves of this
-        model can each support today: the GDN scan carries a per-sequence
-        recurrence, so a padded rectangle would feed pad tokens through it and
-        corrupt the state unless separately masked. Ragged batched prefill is
-        Phase 3 item 3.
+        Prompts of different lengths are right-padded to the longest and the
+        real lengths handed down as `seq_lens`; pad steps are an exact identity
+        on the recurrent state, so a short row's state is what it would have
+        been prefilled alone. The padding is wasted work, and how much depends
+        entirely on the spread of prompt lengths — a scheduler that wants a
+        bound on that chunks instead (`braid/serve/scheduler.py`).
 
         `slots` assigns pool entries explicitly. Passing a non-identity
         permutation is the test that the indirection is real rather than an
@@ -276,17 +305,19 @@ class Engine:
         gen = (torch.Generator(device=self.device).manual_seed(seed)
                if seed is not None else None)
 
-        # --- prefill, one sequence at a time into its own slot ---------------
-        last_logits = torch.empty(B, self.config.vocab_size,
-                                  device=self.device, dtype=self.dtype)
-        for row, (prompt, slot) in enumerate(zip(prompts, assign)):
+        # --- prefill, all prompts as one ragged batch -------------------------
+        for slot in assign:
             cache.reset_slot(slot)
-            one = cache.select([slot])
-            ids = torch.tensor([prompt], device=self.device, dtype=torch.long)
-            last_logits[row] = self.forward(ids, one)[0, -1]
+        batch = cache.select(assign)
+        # Pad with 0 rather than leaving the buffer uninitialised: pad columns
+        # are embedded and convolved like any other token, and a garbage id
+        # would index outside the embedding table.
+        ids = torch.tensor([p + [0] * (longest - len(p)) for p in prompts],
+                           device=self.device, dtype=torch.long)
+        lens = torch.tensor([len(p) for p in prompts], device=self.device)
+        last_logits = self.forward(ids, batch, seq_lens=lens)[:, -1]
 
         # --- decode, all rows together ---------------------------------------
-        batch = cache.select(assign)
         out: list[list[int]] = [[] for _ in range(B)]
         done = [False] * B
         for _ in range(max_new_tokens):

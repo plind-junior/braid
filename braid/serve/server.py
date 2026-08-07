@@ -35,7 +35,7 @@ _DONE = object()
 
 @dataclass
 class _Stream:
-    q: "queue.Queue"
+    q: queue.Queue
     req: Request
 
 
@@ -47,7 +47,7 @@ class EngineService:
         self.scheduler = Scheduler(engine, capacity=capacity, max_len=max_len,
                                    graphed=graphed)
         self.idle_sleep = idle_sleep
-        self._inbox: "queue.Queue" = queue.Queue()
+        self._inbox: queue.Queue = queue.Queue()
         self._streams: dict[str, _Stream] = {}
         self._lock = threading.Lock()
         self._stop = threading.Event()
@@ -57,9 +57,9 @@ class EngineService:
 
     # --- client side ----------------------------------------------------------
 
-    def submit(self, req: Request) -> "queue.Queue":
+    def submit(self, req: Request) -> queue.Queue:
         """Returns a queue yielding token ids, then `None` at end of stream."""
-        q: "queue.Queue" = queue.Queue()
+        q: queue.Queue = queue.Queue()
         with self._lock:
             self._streams[req.id] = _Stream(q=q, req=req)
         self._inbox.put(("submit", req))

@@ -120,9 +120,10 @@ def _prompts(n: int, length: int, seed: int) -> list[list[int]]:
 
 def measure(engine: Engine, concurrency: int, n_requests: int, prompt_len: int,
             max_new_tokens: int, max_len: int, graphed: bool, seed: int,
-            prefill_chunk: int = 256) -> Point:
+            prefill_chunk: int = 256, prefill_budget: int | None = None) -> Point:
     sched = Scheduler(engine, capacity=concurrency, max_len=max_len,
-                      graphed=graphed, prefill_chunk=prefill_chunk)
+                      graphed=graphed, prefill_chunk=prefill_chunk,
+                      prefill_budget=prefill_budget)
 
     # Warmup: clocks need ~1 s to ramp, and the first replay of every bucket
     # allocates. Discarded.
@@ -188,7 +189,12 @@ def main() -> None:
     p.add_argument("--max-len", type=int, default=1024)
     p.add_argument("--quant-mlp", action="store_true")
     p.add_argument("--no-graphs", action="store_true")
-    p.add_argument("--prefill-chunk", type=int, default=256)
+    p.add_argument("--prefill-chunk", type=int, default=256,
+                   help="per-row prompt tokens per tick; bounds the scan loop's T")
+    p.add_argument("--prefill-budget", type=int, default=None,
+                   help="total prompt tokens per tick across rows; bounds B*T. "
+                        "Setting it to the prompt length forces one row per "
+                        "forward, which is the pre-batching baseline.")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--json", action="store_true")
     args = p.parse_args()
@@ -203,7 +209,7 @@ def main() -> None:
             eng, concurrency=c, n_requests=c * args.requests_per_stream,
             prompt_len=args.prompt_len, max_new_tokens=args.max_new_tokens,
             max_len=args.max_len, graphed=not args.no_graphs, seed=args.seed + c,
-            prefill_chunk=args.prefill_chunk))
+            prefill_chunk=args.prefill_chunk, prefill_budget=args.prefill_budget))
 
     if args.json:
         print(json.dumps({"points": [asdict(x) for x in rep.points],
@@ -214,7 +220,9 @@ def main() -> None:
     print(f"prompt {args.prompt_len} tok, {args.max_new_tokens} new, "
           f"{args.requests_per_stream} requests per slot, "
           f"graphs {'off' if args.no_graphs else 'on'}, "
-          f"MLP {'fp8' if args.quant_mlp else 'bf16'}\n")
+          f"MLP {'fp8' if args.quant_mlp else 'bf16'}, "
+          f"prefill chunk {args.prefill_chunk} budget "
+          f"{args.prefill_budget or 'capacity*chunk'}\n")
     print(f"{'c':>3}{'tok/s':>9}{'TTFT p50':>10}{'p90':>8}"
           f"{'ITL p50':>9}{'p90':>8}{'p99':>8}{'VRAM GB':>9}{'c/ITL':>8}"
           f"{'prefill%':>9}{'pf tok/s':>10}")

@@ -149,10 +149,11 @@ class Attention:
         cos: torch.Tensor,
         sin: torch.Tensor,
         attn_mask: torch.Tensor | None = None,
-        cache: "KVCache | None" = None,
+        cache: KVCache | None = None,
         slots: torch.Tensor | None = None,
         positions: torch.Tensor | None = None,
         kv_len: int | None = None,
+        seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         cfg = self.cfg
         B, T, _ = x.shape
@@ -183,7 +184,7 @@ class Attention:
                     "explicit attn_mask; is_causal would align the mask top-left. "
                     "Phase 3 item 3."
                 )
-            cache.write(k, v, slots, positions)
+            cache.write(k, v, slots, positions, seq_lens)
             k, v = cache.read(slots, kv_len)
 
         if T == 1 and cfg.num_key_value_groups > 1:

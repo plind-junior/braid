@@ -31,20 +31,40 @@ from braid.model.config import ModelConfig
 
 
 class KVCache:
-    """One attention layer's K/V pool, `[max_slots, kv_heads, max_len, head_dim]`."""
+    """One attention layer's K/V pool, `[max_slots, kv_heads, max_len + 1, head_dim]`.
+
+    **The `+ 1` is a sink.** Ragged batched prefill hands every layer a padded
+    `[B, T]` rectangle in which row b carries only `seq_lens[b] <= T` real
+    tokens, and the padded columns have to be written *somewhere*: routing them
+    to a reserved position that `read` never returns is branch-free and costs
+    one token-slot per row. Clamping them onto a live position instead would
+    stamp garbage over real keys, and dropping them would need a data-dependent
+    shape.
+    """
 
     def __init__(self, cfg: ModelConfig, max_slots: int, max_len: int,
                  device: str | torch.device, dtype: torch.dtype):
-        shape = (max_slots, cfg.num_key_value_heads, max_len, cfg.head_dim)
+        shape = (max_slots, cfg.num_key_value_heads, max_len + 1, cfg.head_dim)
         # Zeroed, not empty: masked-out positions are still *read* by SDPA, and
         # uninitialised memory can hold inf/NaN that survives a -inf mask as NaN.
         self.k = torch.zeros(shape, device=device, dtype=dtype)
         self.v = torch.zeros(shape, device=device, dtype=dtype)
         self.max_len = max_len
+        self.sink = max_len
 
-    def write(self, k: torch.Tensor, v: torch.Tensor,
-              slots: torch.Tensor, positions: torch.Tensor) -> None:
-        """`k, v` are `[B, kv_heads, T, head_dim]`; `positions[b]` is row b's start."""
+    def write(self, k: torch.Tensor, v: torch.Tensor, slots: torch.Tensor,
+              positions: torch.Tensor, seq_lens: torch.Tensor | None = None) -> None:
+        """`k, v` are `[B, kv_heads, T, head_dim]`; `positions[b]` is row b's start.
+
+        `seq_lens[b]` is how many of the T columns row b actually owns; `None`
+        means all T, which is the rectangular case. Columns past a row's own
+        length go to the sink.
+
+        Callers are responsible for the overflow check — `Engine.hidden_states`
+        already reads `positions.max()` on the host and raises there, so
+        repeating it here would buy a second sync per attention layer and no
+        extra safety.
+        """
         B, _, T, _ = k.shape
         if T == 1:
             # Scatter: both index tensors are [B], so this picks one (slot, pos)
@@ -52,20 +72,23 @@ class KVCache:
             self.k[slots, :, positions] = k[:, :, 0]
             self.v[slots, :, positions] = v[:, :, 0]
             return
-        if B != 1:
-            raise NotImplementedError(
-                f"multi-token write at B={B}; ragged batched prefill is Phase 3 item 3")
-        s, p = int(slots[0]), int(positions[0])
-        if p + T > self.max_len:
-            raise ValueError(f"KV overflow: {p} + {T} > {self.max_len}")
-        self.k[s, :, p:p + T] = k[0]
-        self.v[s, :, p:p + T] = v[0]
+
+        col = torch.arange(T, device=k.device)
+        pos = positions[:, None] + col                          # [B, T]
+        if seq_lens is not None:
+            pos = torch.where(col[None] < seq_lens[:, None], pos, self.sink)
+        rows = slots[:, None].expand(B, T)
+        # Two advanced indices with a slice between them: the indexed axes move
+        # to the front, so the right-hand side is [B, T, kv_heads, head_dim].
+        self.k[rows, :, pos] = k.transpose(1, 2)
+        self.v[rows, :, pos] = v.transpose(1, 2)
 
     def read(self, slots: torch.Tensor, length: int) -> tuple[torch.Tensor, torch.Tensor]:
         """`[B, kv_heads, length, head_dim]` for the rows named by `slots`.
 
         Slicing before gathering matters: `index_select` on the full pool would
-        copy `max_len` per row regardless of how much of it is live.
+        copy `max_len` per row regardless of how much of it is live. `length` is
+        bounded by `max_len`, so the slice can never reach the sink.
         """
         return (self.k[:, :, :length].index_select(0, slots),
                 self.v[:, :, :length].index_select(0, slots))
@@ -120,7 +143,7 @@ class Cache:
     @classmethod
     def allocate(cls, cfg: ModelConfig, max_slots: int, max_len: int,
                  device: str | torch.device, dtype: torch.dtype,
-                 conv_dtype: torch.dtype | None = None) -> "Cache":
+                 conv_dtype: torch.dtype | None = None) -> Cache:
         return cls(
             layers=[
                 RecurrentCache(cfg, max_slots, device, conv_dtype or dtype)
@@ -140,7 +163,7 @@ class Cache:
                 lyr.reset(slot)
         self.lengths[slot] = 0
 
-    def select(self, slots: list[int] | torch.Tensor) -> "Cache":
+    def select(self, slots: list[int] | torch.Tensor) -> Cache:
         """A view of this cache addressing `slots` as batch rows 0..B-1.
 
         Shares every pool tensor — only the assignment changes. This is what a
