@@ -82,6 +82,8 @@ class RecurrentCache:
     def __init__(self, cfg: ModelConfig, max_slots: int,
                  device: str | torch.device, dtype: torch.dtype):
         g = cfg.gdn
+        # The CUDA conv kernel requires fp32; the torch path uses the activation
+        # dtype so its numerics stay exactly what Phase 2 measured.
         self.conv = torch.zeros(max_slots, g.conv_channels, g.conv_kernel,
                                 device=device, dtype=dtype)
         # fp32 regardless of the activation dtype: `mamba_ssm_dtype` is float32,
@@ -103,16 +105,26 @@ class Cache:
 
     layers: list[KVCache | RecurrentCache]
     slots: torch.Tensor      # int64 [B] — pool entry owned by each batch row
-    lengths: torch.Tensor    # int64 [B] — tokens already committed per row
+    lengths: torch.Tensor    # int64 [max_slots] — tokens committed, indexed by SLOT
     max_slots: int
     max_len: int
+    # The CUDA kernels take `slot_idx` as int32. Held alongside rather than cast
+    # per call: a cast allocates, and an allocation inside a captured graph is a
+    # capture failure.
+    slots_i32: torch.Tensor | None = None
+
+    def __post_init__(self) -> None:
+        if self.slots_i32 is None:
+            self.slots_i32 = self.slots.to(torch.int32)
 
     @classmethod
     def allocate(cls, cfg: ModelConfig, max_slots: int, max_len: int,
-                 device: str | torch.device, dtype: torch.dtype) -> "Cache":
+                 device: str | torch.device, dtype: torch.dtype,
+                 conv_dtype: torch.dtype | None = None) -> "Cache":
         return cls(
             layers=[
-                RecurrentCache(cfg, max_slots, device, dtype) if cfg.is_gdn(i)
+                RecurrentCache(cfg, max_slots, device, conv_dtype or dtype)
+                if cfg.is_gdn(i)
                 else KVCache(cfg, max_slots, max_len, device, dtype)
                 for i in range(cfg.num_hidden_layers)
             ],
@@ -137,8 +149,10 @@ class Cache:
         """
         idx = (slots if isinstance(slots, torch.Tensor)
                else torch.tensor(slots, dtype=torch.int64, device=self.slots.device))
-        return Cache(layers=self.layers, slots=idx.to(self.slots.device),
-                     lengths=self.lengths, max_slots=self.max_slots, max_len=self.max_len)
+        idx = idx.to(self.slots.device)
+        return Cache(layers=self.layers, slots=idx, lengths=self.lengths,
+                     max_slots=self.max_slots, max_len=self.max_len,
+                     slots_i32=idx.to(torch.int32))
 
     @property
     def batch_lengths(self) -> torch.Tensor:

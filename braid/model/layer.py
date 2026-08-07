@@ -18,11 +18,13 @@ from braid.model.norm import rms_norm
 
 
 class DecoderLayer:
-    def __init__(self, cfg: ModelConfig, layer_idx: int, weights: dict[str, torch.Tensor]):
+    def __init__(self, cfg: ModelConfig, layer_idx: int, weights: dict[str, torch.Tensor],
+                 use_kernels: bool = False):
         self.cfg = cfg
         self.layer_idx = layer_idx
         self.is_gdn = cfg.is_gdn(layer_idx)
-        self.mixer = GatedDeltaNet(cfg, weights) if self.is_gdn else Attention(cfg, weights)
+        self.mixer = (GatedDeltaNet(cfg, weights, use_kernels=use_kernels)
+                      if self.is_gdn else Attention(cfg, weights))
         self.mlp = MLP(cfg, weights)
         self.input_layernorm = weights["input_layernorm"]
         self.post_attention_layernorm = weights["post_attention_layernorm"]
@@ -37,10 +39,11 @@ class DecoderLayer:
         positions: torch.Tensor | None = None,
         kv_len: int | None = None,
         attn_mask: torch.Tensor | None = None,
+        slots_i32: torch.Tensor | None = None,
     ) -> torch.Tensor:
         h = rms_norm(x, self.input_layernorm, self.cfg.rms_norm_eps)
         if self.is_gdn:
-            h = self.mixer(h, cache=cache, slots=slots)
+            h = self.mixer(h, cache=cache, slots=slots, slots_i32=slots_i32)
         else:
             h = self.mixer(h, cos, sin, attn_mask=attn_mask, cache=cache,
                            slots=slots, positions=positions, kv_len=kv_len)

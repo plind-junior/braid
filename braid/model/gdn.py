@@ -31,9 +31,11 @@ from braid.reference.gdn_ref import _l2norm, gdn_decode_vectorized
 class GatedDeltaNet:
     """One `linear_attention` layer. Weights are `[out, in]`."""
 
-    def __init__(self, cfg: ModelConfig, weights: dict[str, torch.Tensor]):
+    def __init__(self, cfg: ModelConfig, weights: dict[str, torch.Tensor],
+                 use_kernels: bool = False):
         self.cfg = cfg
         self.g = cfg.gdn
+        self.use_kernels = use_kernels
         w = weights
         self.in_proj_qkv = w["linear_attn.in_proj_qkv"]
         self.in_proj_z = w["linear_attn.in_proj_z"]
@@ -45,6 +47,58 @@ class GatedDeltaNet:
         self.A = w["linear_attn.A"]                    # fp32, already -exp(A_log)
         self.dt_bias = w["linear_attn.dt_bias"]        # fp32
         self.norm = w["linear_attn.norm"]              # fp32, gated -> NO 1+W
+
+        if use_kernels:
+            # The kernels are fp32 throughout. Keep the fp32 copies rather than
+            # casting per step: a cast allocates, and allocating inside a
+            # captured graph is a capture failure.
+            self.conv1d_f32 = self.conv1d.float().contiguous()
+            self.conv_bias_f32 = (self.conv_bias.float().contiguous()
+                                  if self.conv_bias is not None
+                                  else torch.empty(0, device=self.conv1d.device))
+            from braid.kernels.loader import load_gdn
+
+            self._mod = load_gdn()
+
+    # --- the CUDA decode step ------------------------------------------------
+
+    def _decode_kernels(self, x: torch.Tensor, cache: RecurrentCache,
+                        slots_i32: torch.Tensor) -> torch.Tensor:
+        """One token, all rows, through `conv1d_decode` + `gdn_decode`.
+
+        The kernels read `slot_idx` on the device, so there is no gather and no
+        scatter — the torch path's two 2 MiB-per-row-per-layer copies disappear.
+        They also l2-normalise q and k internally, so raw q/k go in.
+
+        Numerics differ from the torch path by design, and the difference is
+        measured rather than assumed (`scripts/kernel_path_diag.py`): the conv
+        runs in fp32 against the torch path's bf16, and the l2-norm follows it in
+        fp32 rather than HF's bf16-then-widen. Both are *more* precise than the
+        reference; neither is bit-identical to it.
+        """
+        g = self.g
+        B = x.shape[0]
+        mod = self._mod
+
+        qkv = F.linear(x, self.in_proj_qkv)[:, 0].float().contiguous()   # [B, C]
+        conv_out = torch.empty_like(qkv)
+        mod.conv1d_decode(cache.conv, slots_i32, qkv,
+                          self.conv1d_f32, self.conv_bias_f32, conv_out)
+
+        key_dim = g.n_groups * g.state_size
+        q, k, v = torch.split(conv_out, [key_dim, key_dim, g.inner_size], dim=-1)
+        q = q.reshape(B, g.n_groups, g.state_size).contiguous()
+        k = k.reshape(B, g.n_groups, g.state_size).contiguous()
+        v = v.reshape(B, g.n_heads, g.head_dim).contiguous()
+
+        a_raw = F.linear(x, self.in_proj_a)[:, 0]
+        b_raw = F.linear(x, self.in_proj_b)[:, 0]
+        beta = torch.sigmoid(b_raw).float().contiguous()
+        alpha = torch.exp(self.A * F.softplus(a_raw.float() + self.dt_bias)).contiguous()
+
+        y = torch.empty(B, g.n_heads, g.head_dim, device=x.device, dtype=torch.float32)
+        mod.gdn_decode(cache.state, slots_i32, q, k, v, alpha, beta, y)
+        return y[:, None]     # [B, 1, H, HD]
 
     # --- convolution ---------------------------------------------------------
 
@@ -58,11 +112,14 @@ class GatedDeltaNet:
         K = self.g.conv_kernel
         w = self.conv1d.unsqueeze(1)  # [C, 1, K]
 
+        # The pool may be fp32 (the CUDA conv kernel requires it) while the
+        # activations are bf16, so every crossing is cast explicitly. Prefill
+        # runs this path even under `use_kernels`, since the kernels decode only.
         if cache is not None and T == 1:
             # Decode: splice each row's own window, then one dot per channel.
-            window = cache.conv.index_select(0, slots)          # [B, C, K]
+            window = cache.conv.index_select(0, slots).to(x.dtype)   # [B, C, K]
             joined = torch.cat([window, x], dim=-1)
-            cache.conv.index_copy_(0, slots, joined[:, :, -K:])
+            cache.conv.index_copy_(0, slots, joined[:, :, -K:].to(cache.conv.dtype))
             out = F.conv1d(joined, w, self.conv_bias, padding=0, groups=C)
             return F.silu(out[:, :, -1:])
 
@@ -73,19 +130,24 @@ class GatedDeltaNet:
             # The cached window is the last K PRE-conv inputs. For T >= K this
             # pad is negative, i.e. a left truncation — HF's own trick.
             new = F.pad(x, (K - T, 0)) if T < K else x[:, :, -K:]
-            cache.conv.index_copy_(0, slots, new)
+            cache.conv.index_copy_(0, slots, new.to(cache.conv.dtype))
         out = F.conv1d(x, w, self.conv_bias, padding=K - 1, groups=C)
         return F.silu(out[:, :, :T])
 
     # --- forward -------------------------------------------------------------
 
     def forward(self, x: torch.Tensor, cache: RecurrentCache | None = None,
-                slots: torch.Tensor | None = None) -> torch.Tensor:
+                slots: torch.Tensor | None = None,
+                slots_i32: torch.Tensor | None = None) -> torch.Tensor:
         cfg, g = self.cfg, self.g
         B, T, _ = x.shape
         dtype = x.dtype
         if cache is not None and slots is None:
             raise ValueError("a pooled cache needs a slot assignment")
+
+        if self.use_kernels and cache is not None and T == 1:
+            y = self._decode_kernels(x, cache, slots_i32)
+            return self._readout(x, y, B, T, dtype)
 
         qkv = F.linear(x, self.in_proj_qkv).transpose(1, 2)   # [B, C, T]
         qkv = self._conv(qkv, cache, slots).transpose(1, 2)   # [B, T, C]
@@ -137,10 +199,19 @@ class GatedDeltaNet:
         if cache is not None:
             cache.state.index_copy_(0, slots, state)
 
-        # HF casts the scan output back to the activation dtype BEFORE gating.
+        return self._readout(x, y, B, T, dtype)
+
+    def _readout(self, x: torch.Tensor, y: torch.Tensor, B: int, T: int,
+                 dtype: torch.dtype) -> torch.Tensor:
+        """Gated norm then out_proj. Shared by both scan paths.
+
+        HF casts the scan output back to the activation dtype BEFORE gating, so
+        this cast is part of the reference and not a rounding convenience.
+        """
+        g = self.g
         core = y.to(dtype).reshape(-1, g.head_dim)
         z = F.linear(x, self.in_proj_z).reshape(-1, g.head_dim)
-        core = rms_norm_gated(core, z, self.norm, cfg.rms_norm_eps)
+        core = rms_norm_gated(core, z, self.norm, self.cfg.rms_norm_eps)
         return F.linear(core.reshape(B, T, g.inner_size), self.out_proj)
 
     __call__ = forward

@@ -39,14 +39,17 @@ class Engine:
     device: torch.device
     dtype: torch.dtype
     checkpoint: Checkpoint
+    use_kernels: bool = False
 
     # --- construction --------------------------------------------------------
 
     @classmethod
     def from_checkpoint(cls, ckpt: Checkpoint, device: str | torch.device = "cuda",
-                        dtype: torch.dtype = torch.bfloat16) -> "Engine":
+                        dtype: torch.dtype = torch.bfloat16,
+                        use_kernels: bool = False) -> "Engine":
         cfg = ckpt.config
-        layers = [DecoderLayer(cfg, i, ckpt.layer(i)) for i in range(cfg.num_hidden_layers)]
+        layers = [DecoderLayer(cfg, i, ckpt.layer(i), use_kernels=use_kernels)
+                  for i in range(cfg.num_hidden_layers)]
         return cls(
             config=cfg,
             layers=layers,
@@ -57,15 +60,21 @@ class Engine:
             device=torch.device(device),
             dtype=dtype,
             checkpoint=ckpt,
+            use_kernels=use_kernels,
         )
 
     @classmethod
     def from_pretrained(cls, path: str | Path, device: str | torch.device = "cuda",
-                        dtype: torch.dtype = torch.bfloat16) -> "Engine":
-        return cls.from_checkpoint(load_checkpoint(path, device=device), device, dtype)
+                        dtype: torch.dtype = torch.bfloat16,
+                        use_kernels: bool = False) -> "Engine":
+        return cls.from_checkpoint(load_checkpoint(path, device=device, dtype=dtype),
+                                   device, dtype, use_kernels)
 
     def allocate_cache(self, max_len: int, max_slots: int = 1) -> Cache:
-        return Cache.allocate(self.config, max_slots, max_len, self.device, self.dtype)
+        # The conv kernel requires an fp32 window; the torch path keeps the
+        # activation dtype so its numerics stay what Phase 2 measured.
+        return Cache.allocate(self.config, max_slots, max_len, self.device, self.dtype,
+                              conv_dtype=torch.float32 if self.use_kernels else None)
 
     # --- forward -------------------------------------------------------------
 
@@ -88,13 +97,14 @@ class Engine:
         therefore per row, and so is rope.
         """
         B, T = input_ids.shape
-        slots = positions = attn_mask = None
+        slots = positions = attn_mask = slots_i32 = None
         kv_len = None
 
         if cache is not None:
             if cache.slots.numel() < B:
                 raise ValueError(f"cache assigns {cache.slots.numel()} slots for B={B}")
             slots = cache.slots[:B]
+            slots_i32 = cache.slots_i32[:B]
             positions = cache.lengths.index_select(0, slots)
             kv_len = int(positions.max().item()) + T
             if kv_len > cache.max_len:
@@ -111,7 +121,7 @@ class Engine:
             h = layer(h, cos, sin,
                       cache=cache.layers[i] if cache is not None else None,
                       slots=slots, positions=positions, kv_len=kv_len,
-                      attn_mask=attn_mask)
+                      attn_mask=attn_mask, slots_i32=slots_i32)
 
         if cache is not None:
             cache.lengths.index_copy_(0, slots, positions + T)

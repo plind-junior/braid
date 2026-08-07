@@ -255,3 +255,77 @@ def test_rows_are_independent(engine, tokens):
 def test_batch_rejects_a_repeated_slot(engine, tokens):
     with pytest.raises(ValueError, match="reuses a slot"):
         engine.generate_batch(tokens[:3], max_new_tokens=4, slots=[1, 1, 2])
+
+
+# --- the CUDA decode path -----------------------------------------------------
+
+@pytest.mark.parametrize("dtype,tol", [(torch.float32, 1e-5), (torch.bfloat16, 1e-2)],
+                         ids=["fp32", "bf16"])
+def test_kernel_decode_matches_torch_decode(dtype, tol):
+    """One GDN layer, both scan paths, from an identical non-zero state.
+
+    fp32 is the real check — it lands at 2.7e-7, which says the kernel computes
+    the same function. The bf16 arm is looser on purpose: the kernel runs the
+    conv and the l2-norm in fp32 where the torch path follows HF's
+    bf16-then-widen order, so it is *more* precise than the reference rather
+    than equal to it, and 4.9e-3 is that difference, not an error.
+    """
+    from braid.model.cache import RecurrentCache
+    from braid.model.config import ModelConfig
+    from braid.model.gdn import GatedDeltaNet
+
+    cfg = ModelConfig.from_pretrained(MODEL_DIR)
+    ck = load_checkpoint(MODEL_DIR, device="cuda", layers=(0,),
+                         include_embeddings=False, dtype=dtype)
+    w, B = ck.layer(0), 8
+    g = torch.Generator(device="cuda").manual_seed(31)
+    x = torch.randn(B, 1, cfg.hidden_size, generator=g, device="cuda", dtype=dtype)
+    slots = torch.arange(B, device="cuda")
+
+    c_t = RecurrentCache(cfg, B, "cuda", dtype)
+    c_k = RecurrentCache(cfg, B, "cuda", torch.float32)
+    st = torch.randn(B, cfg.gdn.n_heads, cfg.gdn.state_size, cfg.gdn.head_dim,
+                     generator=g, device="cuda")
+    c_t.state.copy_(st)
+    c_k.state.copy_(st)
+
+    with torch.no_grad():
+        y_t = GatedDeltaNet(cfg, w, use_kernels=False)(x, cache=c_t, slots=slots)
+        y_k = GatedDeltaNet(cfg, w, use_kernels=True)(
+            x, cache=c_k, slots=slots, slots_i32=slots.to(torch.int32))
+
+    r, c = _metrics(y_k, y_t)
+    rs, _ = _metrics(c_k.state, c_t.state)
+    print(f"\n  kernel vs torch [{dtype}]: out rel_l2={r:.3e} cos={c:.9f} "
+          f"state rel_l2={rs:.3e}")
+    assert r <= tol, f"kernel decode differs from torch by {r:.3e}"
+
+
+# Kernel engines are built over the SAME checkpoint tensors as the fixtures --
+# `from_checkpoint` only wraps them -- so this costs no extra weight memory. Two
+# 4B copies plus a third would not fit.
+
+def test_kernel_path_holds_the_batch_identity_gate(engine_fp32, tokens):
+    """The gate again, with the kernels doing the scan. fp32, B=2/4/8."""
+    eng = Engine.from_checkpoint(engine_fp32.checkpoint, device="cuda",
+                                 dtype=torch.float32, use_kernels=True)
+    for batch in (2, 4, 8):
+        n, sub = 24, tokens[:batch]
+        batched = eng.generate_batch(sub, max_new_tokens=n, temperature=0.0)
+        sequential = [eng.generate_batch([p], max_new_tokens=n, temperature=0.0)[0]
+                      for p in sub]
+        assert batched == sequential, (
+            f"kernels, B={batch}: {_report(batched, sequential, n)}")
+    print("\n  kernel path: fp32 token identity holds at B=2, 4, 8")
+
+
+def test_kernel_path_still_generates_coherently(engine, tokens):
+    """A kernel that is numerically close but wired wrong still produces text."""
+    tok = pytest.importorskip("tokenizers")
+    tk = tok.Tokenizer.from_file(str(MODEL_DIR / "tokenizer.json"))
+    eng = Engine.from_checkpoint(engine.checkpoint, device="cuda", dtype=DTYPE,
+                                 use_kernels=True)
+    out = eng.generate_batch([tokens[0]], max_new_tokens=6, temperature=0.0)[0]
+    text = tk.decode(out, skip_special_tokens=False)
+    print(f"\n  kernel path: 'The capital of France is' -> {text!r}")
+    assert "Paris" in text
