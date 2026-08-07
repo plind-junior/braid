@@ -2,15 +2,17 @@
 
 Where braid is, what changed, and what to pick up next. Written to be read cold.
 
-**HEAD:** `479c034` · **branch:** `main` · **tests:** 119 green on the remote 5090
-**GPU:** vast.ai instance `47055458`, **stopped** (`status=exited`). 10.0 h rented.
+**HEAD:** `f2876da` · **branch:** `main` · **tests:** 132 green on the remote 5090
+**GPU:** vast.ai instance `47055458`, **stopped** (`status=exited`). 10.4 h rented.
 
 ---
 
 ## 1. State of the engine
 
-Phase 2 complete, Phase 3 items 1–2 complete, item 3 partially done (its profiling
-task is finished; the block manager is not started).
+Phase 2 complete, Phase 3 items 1–2 complete. Item 3: profiling done, **chunked
+prefill done (it was silently wrong, not missing)**, `kv_len` bucketing done, the
+paged block manager deliberately deferred with arithmetic, ragged batched prefill
+still refused.
 
 | | |
 |---|---|
@@ -33,9 +35,10 @@ B=16 decode, median of 3 processes, graphs on, CUDA kernels:
 | session start (2026-08-07) | 16.727 | 956.6 | 0.51× |
 | + grouped decode attention | 12.065 | 1,326.2 | 0.71× |
 | + fused RMSNorm | 11.363 | 1,408.0 | 0.75× |
-| + FP8 MLP (opt-in) | **10.266** | **1,558.5** | **0.83×** |
+| + FP8 MLP (opt-in) | 10.266 | 1,558.5 | 0.83× |
+| + `kv_len` bucketing | **10.044** | **1,592.9** | **0.85×** |
 
-**+62.9% this session.** c=1 is 131.2 tok/s; the Phase 3 re-plan trigger fired at
+**+66.5% this session.** c=1 is 131.2 tok/s; the Phase 3 re-plan trigger fired at
 113.5 and is now cleared, at 8.8% over its 120 threshold.
 
 **braid is still slower than llama.cpp** (1,879.68 at B=16 on this box). The MVP
@@ -52,6 +55,9 @@ Four commits.
 - `561593a` — **RMSNorm as one bit-exact kernel** (`F.rms_norm` over fp32 input),
   +6% everywhere. Plus three published-claim corrections (§4).
 - `479c034` — **FP8 W8A8 on the MLP**, opt-in, +10.7% at B=16 for +0.50% PPL.
+- `f2876da` — **chunked prefill was silently wrong** (1.6e-1 in fp32, greedy token
+  still agreeing; the GDN conv ignored the cached window for T>1). Fixed to
+  5.9e-7. Plus `kv_len` bucketing, +2.3% at B=16.
 
 New tooling worth knowing about:
 
@@ -106,17 +112,23 @@ target. One of the two has to move.
 
 ## 6. Next steps, in the order I would take them
 
-1. **Phase 3 item 3 — KV block manager + chunked prefill.** Now worth more than
-   its direct 0.43 ms: bucketing `kv_len` removes the mask, which unlocks
-   flash-decoding. This is the last structural item before Phase 4.
+1. **Phase 4 — scheduler, slot lifecycle, SSE server.** Item 3's remaining pieces
+   (paged KV, ragged batched prefill) are both blocked on decisions Phase 4 makes,
+   so building them first would be building against a guess. Note the item 3
+   runbook's arithmetic: paging is affordable to ~786,000 token-slots and the MVP
+   uses 8,192.
 2. **`lm_head` FP8** (~0.38 ms, 15% of weights) with its own perplexity gate —
    its error lands directly on the greedy argmax, so gate on token identity.
 3. **Attention/GDN-out projections FP8** (~0.5 ms) — feed state that compounds
    across steps, so gate on perplexity *and* a long-generation drift check.
-4. **Re-run the llama.cpp head-to-head in one session.** The baseline and
+4. **Flash-decoding.** Flash accepts head_dim 256 here; the blocker is the
+   additive mask, which needs per-row KV lengths (`_flash_attention_forward` with
+   `seqused_k`, or FlashInfer). `kv_len` bucketing alone does **not** unlock it —
+   rows still differ in length inside a bucket.
+5. **Re-run the llama.cpp head-to-head in one session.** The baseline and
    braid's numbers are from different days; a publishable comparison needs both
    arms with concurrent health sampling.
-5. Phase 4 — scheduler, slot lifecycle, SSE server.
+6. Ragged batched prefill (B>1, T>1), once Phase 4 fixes the admission shape.
 
 ## 7. Working notes
 
