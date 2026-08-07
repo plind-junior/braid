@@ -26,7 +26,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import statistics
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -38,6 +37,15 @@ from braid.model.graph import GraphedDecoder
 from braid.model.loader import load_checkpoint
 
 MODEL_DIR = Path(os.environ.get("BRAID_MODEL_DIR", "/root/models/Qwen3.5-4B"))
+
+# How much KV each row sits on before the timed steps begin. **This is a
+# comparison-critical parameter, not a detail.** Decode attention reads the whole
+# live KV every step, so a run seeded with 8 tokens is measuring a cheaper step
+# than one seeded with 128 — and `llama-batched-bench -npp 128 -ntg 128`, which
+# is braid's published denominator, decodes at KV 128..256. Timing braid at 8
+# against that is a shape mismatch that flatters braid. The default stays 8 for
+# continuity with the graphs-on/off gate this module was written for; the
+# head-to-head passes `--prompt-len 128`.
 PROMPT_LEN = 8
 
 
@@ -51,12 +59,17 @@ class Arm:
 
 
 def _seed(engine: Engine, cache, batch: int, prompt_len: int = PROMPT_LEN) -> None:
+    """Put `prompt_len` tokens of KV under every row before timing starts.
+
+    One ragged batched forward rather than `batch` sequential ones. The rows are
+    a true rectangle here (same length, all fresh), so this is the `seq_lens=None`
+    path; it is seeding, not the measurement, and is untimed either way.
+    """
     g = torch.Generator(device="cuda").manual_seed(11)
     for slot in range(cache.max_slots):
         cache.reset_slot(slot)
-    for row in range(batch):
-        ids = torch.randint(0, 1000, (1, prompt_len), generator=g, device="cuda")
-        engine.forward(ids, cache.select([row]))
+    ids = torch.randint(0, 1000, (batch, prompt_len), generator=g, device="cuda")
+    engine.forward(ids, cache.select(list(range(batch))))
 
 
 def _time(fn, steps: int, reset) -> float:
@@ -79,7 +92,7 @@ def _time(fn, steps: int, reset) -> float:
 
 
 def measure(batch: int, steps: int, max_len: int, ckpt,
-            quant_mlp: bool = False) -> list[Arm]:
+            quant_mlp: bool = False, prompt_len: int = PROMPT_LEN) -> list[Arm]:
     arms: list[Arm] = []
     tokens = torch.full((batch, 1), 42, dtype=torch.long, device="cuda")
     slots = torch.arange(batch, device="cuda")
@@ -89,7 +102,7 @@ def measure(batch: int, steps: int, max_len: int, ckpt,
                                      use_kernels=use_kernels, quant_mlp=quant_mlp)
         cache = eng.allocate_cache(max_len, max_slots=batch)
         view = cache.select(list(range(batch)))
-        _seed(eng, cache, batch)
+        _seed(eng, cache, batch, prompt_len)
         snap = cache.snapshot()
         s = _time(lambda: eng.decode_step(tokens, view), steps,
                   lambda: cache.restore(snap))
@@ -99,7 +112,7 @@ def measure(batch: int, steps: int, max_len: int, ckpt,
     eng = Engine.from_checkpoint(ckpt, device="cuda", dtype=torch.bfloat16,
                                  use_kernels=True, quant_mlp=quant_mlp)
     cache = eng.allocate_cache(max_len, max_slots=batch)
-    _seed(eng, cache, batch)
+    _seed(eng, cache, batch, prompt_len)
     snap = cache.snapshot()
     dec = GraphedDecoder(eng, cache, buckets=(batch,))
     cache.restore(snap)
@@ -115,7 +128,7 @@ def measure(batch: int, steps: int, max_len: int, ckpt,
 
     def kv_step():
         n[0] += 1
-        return dec.step(tokens, slots, live_len=PROMPT_LEN + n[0])
+        return dec.step(tokens, slots, live_len=prompt_len + n[0])
 
     def kv_reset():
         n[0] = 0
@@ -136,6 +149,9 @@ def main() -> None:
     p.add_argument("--json", action="store_true")
     p.add_argument("--quant-mlp", action="store_true",
                    help="FP8 W8A8 on the MLP projections")
+    p.add_argument("--prompt-len", type=int, default=PROMPT_LEN,
+                   help="KV under each row before timing; match the competitor's "
+                        "shape when producing a head-to-head number")
     args = p.parse_args()
 
     ckpt = load_checkpoint(MODEL_DIR, device="cuda")
@@ -143,7 +159,8 @@ def main() -> None:
     with HostHealthSampler() as health:
         for b in args.batches:
             out.extend(measure(b, args.steps, args.max_len, ckpt,
-                               quant_mlp=args.quant_mlp))
+                               quant_mlp=args.quant_mlp,
+                               prompt_len=args.prompt_len))
     report = health.report()
 
     if args.json:
@@ -151,7 +168,10 @@ def main() -> None:
                           "health": str(report)}))
         return
 
-    print(f"\nhost health: {report}\n")
+    print(f"\nhost health: {report}")
+    print(f"seeded with {args.prompt_len} tokens of KV per row; "
+          f"{args.steps} timed steps -> KV {args.prompt_len}.."
+          f"{args.prompt_len + args.steps}\n")
     print(f"{'batch':>5} {'arm':<18} {'ms/step':>9} {'tok/s':>10}")
     for a in out:
         print(f"{a.batch:>5} {a.name:<18} {a.ms_per_step:>9.3f} {a.tok_per_s:>10.1f}")

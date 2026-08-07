@@ -4,12 +4,18 @@ A single-GPU inference engine for **hybrid** language models — attention inter
 linear-recurrent mixer (Gated DeltaNet) — built to serve them **at concurrency** on one
 RTX 5090.
 
-> **Status: the engine runs, serves, and is slower than llama.cpp on decode.**
-> braid loads `Qwen3.5-4B`, matches HuggingFace to fp32 machine precision over all 32
-> layers, and serves concurrent streams over SSE with continuous batching. **170 tests
-> green** on a remote RTX 5090. The head-to-head that decides whether the thesis holds
-> has **not** been run — see [Where braid actually is](#where-braid-actually-is).
-> Every number below is labelled **measured** or **projected**.
+> **Status: braid beats llama.cpp above batch 16, and loses below it.**
+> Measured head-to-head on one card in one session, 5 processes per arm:
+> **+23.7% at B=32 and +48.6% at B=64**, against −16.1% at B=16 and −47.3% at B=1.
+> From B=1 to B=64 braid scales **32.9×** where llama.cpp scales **11.7×**, which is
+> the thesis. braid loads `Qwen3.5-4B`, matches HuggingFace to fp32 machine precision
+> over all 32 layers, and serves concurrent streams over SSE with continuous batching.
+> **170 tests green** on a remote RTX 5090.
+>
+> The locked MVP target — ≥+25% at B=16 and ≥+100% at B=64 — is **not met**, so this is
+> a NO-GO against the target despite the wins. See
+> [The head-to-head](#the-head-to-head). Every number is labelled **measured** or
+> **projected**.
 
 ---
 
@@ -39,26 +45,86 @@ efficient at batch 1, 13% at batch 64.
 > braid targets the wall.
 
 That is the whole idea. It is a reproducible number, not a claim about anyone's code.
+## The head-to-head
 
-## Where braid actually is
+**Measured 2026-08-08, both arms in one session, ABBA order, 5 processes per arm per
+point, medians across processes.** Decode-only aggregate throughput, KV 128..256 on
+both arms (`llama-batched-bench -npp 128 -ntg 128` against braid's graphed decode
+seeded to the same depth). Box noise floor 1.66%; host healthy throughout
+(2,820–2,865 MHz SM, 13,801 MHz mem, 474–515 W).
 
-Three different measurements that are easy to conflate. **Decode** is the step with no
-prefill in it. **Served** is the whole service, prefill included. llama.cpp's column is its
-own serving benchmark. They are not a head-to-head and are not presented as one.
+| batch | llama.cpp Q8_0 | braid BF16 | braid FP8-MLP | delta | |
+|---:|---:|---:|---:|---:|:--|
+| 1 | 250.0 | 131.3 (0.53×) | 131.7 (0.53×) | −47.3% | lose |
+| 2 | 452.2 | 221.7 (0.49×) | 232.2 (0.51×) | −48.7% | lose |
+| 4 | 810.7 | 433.0 (0.53×) | 451.8 (0.56×) | −44.3% | lose |
+| 8 | 1,399.8 | 765.2 (0.55×) | 840.9 (0.60×) | −39.9% | lose |
+| 16 | 1,874.8 | 1,425.2 (0.76×) | 1,573.7 (0.84×) | −16.1% | lose |
+| 32 | 2,454.2 | 2,994.5 (1.22×) | **3,035.9 (1.24×)** | **+23.7%** | **win** |
+| 64 | 2,915.9 | 4,169.9 (1.43×) | **4,333.4 (1.49×)** | **+48.6%** | **win** |
 
-**Decode** — bf16, graphs on, CUDA kernels, median of 3 processes:
+Per-arm spreads are 0.0–0.4%, so every verdict sits far outside noise. **braid crosses
+llama.cpp between B=16 and B=32** and the losing rows are published unchanged.
 
-| batch | braid measured | llama.cpp measured | ratio |
+The thesis is about the *shape* of the curve, and the shape holds. From B=1 to B=64
+braid scales **32.9×** where llama.cpp scales **11.7×** — a dense model reads its
+weights once per step, and braid keeps converting batch into throughput after
+llama.cpp has stopped. That is the whole claim, and it is now a measurement.
+
+**The locked MVP target is still not met.** It asks for ≥+25% at B=16 and ≥+100% at
+B=64; braid delivers −16.1% and +48.6%. So this is a **NO-GO against the target** even
+though braid wins the two largest batches, and the design's falsification clause
+applies: re-plan rather than iterate. What the re-plan has to work with is that the
+gap at low batch is weight bytes — braid serves **BF16 (8.44 GB)** against llama.cpp's
+**Q8_0 (4.47 GB)**, and quantizing the MLP alone (54% of weights) already moves B=16
+from 0.76× to 0.84×.
+
+### Measured against projected
+
+The projections that motivated the build, with what braid actually does beside them:
+
+| batch | projected | measured (FP8-MLP) | of projection |
 |---:|---:|---:|---:|
-| 1 | 131.2 tok/s | 250.11 | **0.52×** |
-| 16 | **1,592.9** tok/s (10.044 ms/step) | 1,879.68 | **0.85×** |
+| 8 | ~1,300 | 840.9 | 65% |
+| 16 | ~2,390 | 1,573.7 | 66% |
+| 32 | ~4,110 | 3,035.9 | 74% |
+| 64 | ~6,440 | 4,333.4 | 67% |
 
-**braid loses both rows, and they are published unchanged.** The c=1 loss is expected and
-by design — batch-1 decode is not braid's axis, and braid serves BF16 against llama.cpp's
-Q8_0, twice the weight bytes. The B=16 loss is not by design; closing it is the work.
+braid lands at a consistent **~2/3 of its own roofline projection**. The projections
+assumed end-to-end the bandwidth efficiency the scan kernel reaches in isolation; the
+step is GEMM-dominated and does not get there. They were optimistic by a stable factor
+rather than wrong in shape, which is why the crossover still happened — just later and
+smaller than predicted.
 
-**Served** — c=16, 128-token prompts, 64 new tokens, medians of 3 processes, spread ≤ 0.8%
-against a 1.70% box noise floor:
+### Two things this measurement corrected
+
+**The previously published 0.85× at B=16 was not shape-matched.** braid's decode bench
+seeded rows with an 8-token prompt and timed at KV 8..256 while llama.cpp decoded at
+KV 128..256. Decode attention reads the whole live KV every step, so braid was being
+timed on a cheaper step. Shape-matched, BF16 at B=16 is **0.76×**, not 0.85×.
+
+**"Batch buckets stop at 16" was wrong, and it was hiding the win.** That decision held
+that c=32 does not fit in VRAM and is throughput-pointless because the linear state
+term overtakes the fixed weight sweep at B=14–18. Measured: B=64 peaks at **20.61 GB
+of 32.6 GB**, B=16→32 is **1.93×** and B=32→64 is **1.43×**, and at 102 MiB of state
+per sequence against 8.44 GB of weights the crossover is near **B≈83**, not 14–18. The
+roadmap scoped this head-to-head at c ∈ {1,2,4,8,16} — exactly the range where braid
+loses every row. Run as written it would have returned a clean NO-GO with the win
+sitting one bucket higher. A planning assumption, never re-measured, nearly falsified
+the project's central claim.
+
+### What is not measured here
+
+This table is **decode only**. braid's end-to-end serving throughput including prefill
+is lower and is reported separately below; llama.cpp's S_TG column excludes its prefill
+too, so the comparison is like-for-like but neither number is a full serving result.
+braid also has no prefix caching, which a multi-turn benchmark would reward llama.cpp
+for and which is a scoped gap rather than a defect.
+
+## Serving, end to end
+
+braid's own service, prefill included — c=16, 128-token prompts, 64 new tokens, medians
+of 3 processes, spread ≤ 0.8%:
 
 | | aggregate tok/s | prefill tok/s | prefill share of wall | ITL p99 |
 |---|---:|---:|---:|---:|
@@ -70,37 +136,6 @@ sixteen times in sequence at a flat 270 tok/s. The scan's loop costs one iterati
 *column*, not per token, so a batch of sixteen rows costs what one row costs: prefill
 throughput is now **exactly `270 × rows-per-forward`** to three significant figures. No
 arithmetic got faster.
-
-**The comparison that decides the project has not been run.** That is ROADMAP Phase 4
-items 3–4: reproduce llama.cpp's baseline on the same box in the same session, then sweep
-c ∈ {1,2,4,8,16} in ABBA order, 5 processes per arm, speculation off in both, fresh
-non-repeating prompts, GIL-free multi-process client. Until then braid has *component*
-numbers, not a verdict.
-
-## What we are aiming at
-
-Projections from the roofline for this model plus **measured** state-traffic and
-weight-read rates, with what braid actually measures beside them:
-
-| parallel | llama.cpp (measured) | braid (**projected**) | braid (**measured**, decode) |
-|---:|---:|---:|---:|
-| 1 | 250.11 | — | 131.2 |
-| 8 | 1,418.06 | ~1,300 | not re-measured at the current config |
-| 16 | 1,879.68 | ~2,390 | **1,592.9 — 33% short of projection** |
-| 32 | 2,497.41 | ~4,110 | not attempted |
-| 64 | 2,928.34 | ~6,440 | not attempted |
-
-**These are projections, not results**, and the one point where both exist shows the
-projection was optimistic. They assumed braid hits end-to-end the bandwidth efficiency its
-scan kernel hits in isolation; it does not, because the step is GEMM-dominated and braid
-carries twice llama.cpp's weight bytes.
-
-> **Unresolved:** the B=32/64 rows contradict a decision braid already made. Phase 1
-> concluded that **batch buckets stop at 16** — c=32 does not fit in VRAM and is
-> throughput-pointless, since the linear state term overtakes the fixed weight sweep around
-> B=14–18. As scoped, braid cannot attempt half of its own stated target. One of the two has
-> to move, and it is tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md) rather than quietly
-> dropped.
 
 ## What is built and verified
 
