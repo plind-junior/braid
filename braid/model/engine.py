@@ -161,6 +161,51 @@ class Engine:
         """`input_ids` is `[B, T]` -> logits `[B, T_out, vocab]`."""
         return F.linear(self.hidden_states(input_ids, cache, last_only), self.lm_head)
 
+    # --- the graph-safe decode step ------------------------------------------
+
+    @torch.no_grad()
+    def decode_step(self, tokens: torch.Tensor, cache: Cache) -> torch.Tensor:
+        """One token per row -> logits `[B, vocab]`. **No host sync, static shapes.**
+
+        `hidden_states` is the general path and cannot be captured: it reads
+        `positions.max().item()` to size the KV slice and takes a Python `bool`
+        of a device tensor to decide whether a mask is needed. Both are host
+        syncs, and a host sync during capture is a capture failure.
+
+        Two things are traded away to remove them:
+
+        * **`kv_len` is fixed at `cache.max_len`** rather than the live maximum,
+          because a shape that depends on device state cannot be a captured
+          shape. Masked keys contribute `exp(-inf) = 0`, so the result is
+          unchanged; the cost is reading the whole KV buffer every step. That is
+          the argument for bucketing `kv_len` as well as batch, which item 3's
+          block manager makes natural.
+        * **The mask is always built**, never skipped by a data-dependent branch.
+        """
+        B = tokens.shape[0]
+        if cache.slots.numel() < B:
+            raise ValueError(f"cache assigns {cache.slots.numel()} slots for B={B}")
+        slots, slots_i32 = cache.slots[:B], cache.slots_i32[:B]
+        kv_len = cache.max_len
+
+        positions = cache.lengths.index_select(0, slots)          # [B]
+        key = torch.arange(kv_len, device=self.device)
+        allowed = key[None, :] <= positions[:, None]              # [B, kv_len]
+        mask = torch.zeros(B, kv_len, device=self.device, dtype=self.dtype)
+        mask = mask.masked_fill_(~allowed, torch.finfo(self.dtype).min)[:, None, None]
+
+        h = F.embedding(tokens, self.embed_tokens)
+        cos, sin = self.rope(positions[:, None])
+
+        for i, layer in enumerate(self.layers):
+            h = layer(h, cos, sin, cache=cache.layers[i], slots=slots,
+                      positions=positions, kv_len=kv_len, attn_mask=mask,
+                      slots_i32=slots_i32)
+
+        cache.lengths.index_copy_(0, slots, positions + 1)
+        h = rms_norm(h, self.final_norm, self.config.rms_norm_eps)
+        return F.linear(h, self.lm_head)[:, 0]
+
     # --- generation ----------------------------------------------------------
 
     @torch.no_grad()

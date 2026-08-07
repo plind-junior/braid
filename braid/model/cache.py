@@ -154,6 +154,30 @@ class Cache:
                      max_slots=self.max_slots, max_len=self.max_len,
                      slots_i32=idx.to(torch.int32))
 
+    def snapshot(self) -> list[torch.Tensor]:
+        """Copy every mutable pool. A decode step advances state, conv, KV *and*
+        lengths, so rewinding only the lengths leaves the caller comparing two
+        different starting states — which reads as a catastrophic mismatch and
+        is really a bookkeeping error."""
+        out = [self.lengths.clone()]
+        for lyr in self.layers:
+            if isinstance(lyr, KVCache):
+                out += [lyr.k.clone(), lyr.v.clone()]
+            else:
+                out += [lyr.conv.clone(), lyr.state.clone()]
+        return out
+
+    def restore(self, snap: list[torch.Tensor]) -> None:
+        it = iter(snap)
+        self.lengths.copy_(next(it))
+        for lyr in self.layers:
+            if isinstance(lyr, KVCache):
+                lyr.k.copy_(next(it))
+                lyr.v.copy_(next(it))
+            else:
+                lyr.conv.copy_(next(it))
+                lyr.state.copy_(next(it))
+
     @property
     def batch_lengths(self) -> torch.Tensor:
         """Committed token count for each row of the *current* assignment."""
