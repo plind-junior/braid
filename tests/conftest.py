@@ -48,32 +48,71 @@ def weight_bytes(cfg, n_layers: int | None = None, itemsize: int = 4) -> int:
     return params * itemsize
 
 
-def fp32_layer_budget(cfg, reserve_gib: float = 0.0) -> int:
-    """How many leading layers of `cfg` fit in fp32 on this card.
+def layer_budget(cfg, itemsize: int = 4, reserve_gib: float = 0.0) -> int:
+    """How many leading layers of `cfg` fit on this card at `itemsize` bytes.
 
     `reserve_gib` is memory the caller has already committed elsewhere and that
     this engine may not use — in practice another module-scoped engine. pytest
     holds a module fixture until the module ends, so a module carrying both a
-    bf16 engine and an fp32 one needs them sized *together*, not each against an
-    empty card.
+    bf16 engine and a second one needs them sized *together*, not each against
+    an empty card.
 
     Returns `cfg.num_hidden_layers` when the whole stack fits.
     """
     if not torch.cuda.is_available():
         return cfg.num_hidden_layers
-    total = torch.cuda.get_device_properties(0).total_memory
-    cap = min(total * FP32_WEIGHT_BUDGET, total * 0.94 - reserve_gib * 2 ** 30)
+    cuda_reclaim()
+    # Against **free** memory, not total. A second engine is built while the
+    # first is still resident *and holding its caches and graph pool* — in
+    # `test_graph_decode` that is 16.7 GiB of weights plus ~1.2 of pools, and a
+    # budget computed from the card's total size cheerfully hands out memory
+    # that is already spoken for. `mem_get_info` after a reclaim is the only
+    # number that knows about all of it.
+    free, total = torch.cuda.mem_get_info()
+    # 0.70 leaves room for what this engine allocates *after* its weights: the
+    # cache pool, the graph's private pool, and decode activations.
+    cap = min(total * FP32_WEIGHT_BUDGET, free * 0.70 - reserve_gib * 2 ** 30)
     for n in range(cfg.num_hidden_layers, 0, -1):
         types = cfg.layer_types[:n]
         # A truncated stack that lost one of the two mixer types would quietly
         # stop testing half the engine.
         if "full_attention" not in types or "linear_attention" not in types:
             break
-        if weight_bytes(cfg, n) <= cap:
+        if weight_bytes(cfg, n, itemsize) <= cap:
             return n
     raise RuntimeError(
-        f"no fp32 stack with both mixer types fits in "
+        f"no {itemsize}-byte stack with both mixer types fits in "
         f"{cap / 2 ** 30:.1f} GiB for {cfg.num_hidden_layers} layers")
+
+
+def fp32_layer_budget(cfg, reserve_gib: float = 0.0) -> int:
+    return layer_budget(cfg, 4, reserve_gib)
+
+
+def budgeted_checkpoint(model_dir, dtype, reserve_gib: float = 0.0, label: str = ""):
+    """A checkpoint truncated to as many leading layers as the card allows.
+
+    Says so on stdout when it truncates, because a gate that quietly tests less
+    of the model than its name claims is worse than one that fails.
+    """
+    from braid.model.config import ModelConfig
+    from braid.model.loader import load_checkpoint
+
+    model_dir = Path(model_dir)
+    cfg = ModelConfig.from_pretrained(model_dir)
+    n = layer_budget(cfg, dtype.itemsize, reserve_gib)
+
+    cuda_reclaim()
+    if n == cfg.num_hidden_layers:
+        return load_checkpoint(model_dir, device="cuda", dtype=dtype)
+    ck = load_checkpoint(model_dir, device="cuda", dtype=dtype,
+                         layers=tuple(range(n)))
+    print(f"\n  [{label or 'budget'}] {model_dir.name}: stack truncated to {n} of "
+          f"{cfg.num_hidden_layers} layers "
+          f"({weight_bytes(cfg, n, dtype.itemsize) / 2 ** 30:.1f} GiB) — the full "
+          f"stack is {weight_bytes(cfg, None, dtype.itemsize) / 2 ** 30:.1f} GiB")
+    return replace(ck, config=replace(ck.config, num_hidden_layers=n,
+                                      layer_types=cfg.layer_types[:n]))
 
 
 def fp32_engine(model_dir, reserve_gib: float = 0.0, **engine_kwargs):
@@ -94,28 +133,28 @@ def fp32_engine(model_dir, reserve_gib: float = 0.0, **engine_kwargs):
     `layer_types`, so a truncated config *is* a shorter model — nothing else has
     to know.
     """
-    from braid.model.config import ModelConfig
     from braid.model.engine import Engine
-    from braid.model.loader import load_checkpoint
 
-    model_dir = Path(model_dir)
-    cfg = ModelConfig.from_pretrained(model_dir)
-    n = fp32_layer_budget(cfg, reserve_gib)
-
-    cuda_reclaim()
-    if n == cfg.num_hidden_layers:
-        ck = load_checkpoint(model_dir, device="cuda", dtype=torch.float32)
-    else:
-        ck = load_checkpoint(model_dir, device="cuda", dtype=torch.float32,
-                             layers=tuple(range(n)))
-        ck = replace(ck, config=replace(ck.config, num_hidden_layers=n,
-                                        layer_types=cfg.layer_types[:n]))
-        print(f"\n  [fp32 gate] {model_dir.name}: stack truncated to {n} of "
-              f"{cfg.num_hidden_layers} layers "
-              f"({weight_bytes(cfg, n) / 2 ** 30:.1f} GiB fp32) — the full "
-              f"stack is {weight_bytes(cfg) / 2 ** 30:.1f} GiB")
+    ck = budgeted_checkpoint(model_dir, torch.float32, reserve_gib, "fp32 gate")
     return Engine.from_checkpoint(ck, device="cuda", dtype=torch.float32,
                                   **engine_kwargs)
+
+
+def budgeted_engine(model_dir, dtype=torch.bfloat16, reserve_gib: float = 0.0,
+                    label: str = "", **engine_kwargs):
+    """An engine at `dtype`, truncated to what fits beside `reserve_gib`.
+
+    For gates that must build a **second** engine while a module-scoped one is
+    still alive. At Qwen3.5-4B two bf16 engines are 7.8 GiB each and the card
+    absorbs it; at Qwen3.5-9B they are 16.7 each against 31.4 and it does not.
+    """
+    from braid.model.engine import Engine
+
+    ck = budgeted_checkpoint(model_dir, dtype, reserve_gib, label)
+    eng = Engine.from_checkpoint(ck, device="cuda", dtype=dtype, **engine_kwargs)
+    del ck
+    cuda_reclaim()
+    return eng
 
 
 def cuda_reclaim() -> None:

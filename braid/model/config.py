@@ -166,7 +166,7 @@ class ModelConfig:
     # --- construction --------------------------------------------------------
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "ModelConfig":
+    def from_dict(cls, raw: dict[str, Any]) -> ModelConfig:
         text = raw.get("text_config", raw)
         rope = text.get("rope_parameters", {})
 
@@ -213,7 +213,7 @@ class ModelConfig:
         )
 
     @classmethod
-    def from_pretrained(cls, path: str | Path) -> "ModelConfig":
+    def from_pretrained(cls, path: str | Path) -> ModelConfig:
         p = Path(path)
         if p.is_dir():
             p = p / "config.json"

@@ -32,6 +32,7 @@ import torch.nn.functional as F
 from braid.model.cache import RecurrentCache
 from braid.model.config import ModelConfig
 from braid.model.norm import rms_norm_gated
+from braid.model.quant import FP8Weight, linear, maybe_quantize, project
 from braid.reference.gdn_ref import _l2norm, gdn_decode_vectorized
 
 
@@ -39,13 +40,13 @@ class GatedDeltaNet:
     """One `linear_attention` layer. Weights are `[out, in]`."""
 
     def __init__(self, cfg: ModelConfig, weights: dict[str, torch.Tensor],
-                 use_kernels: bool = False):
+                 use_kernels: bool = False, quant: bool = False):
         self.cfg = cfg
         self.g = cfg.gdn
         self.use_kernels = use_kernels
         w = weights
-        self.in_proj_qkv = w["linear_attn.in_proj_qkv"]
-        self.in_proj_z = w["linear_attn.in_proj_z"]
+        self.in_proj_qkv = maybe_quantize(w["linear_attn.in_proj_qkv"], quant)
+        self.in_proj_z = maybe_quantize(w["linear_attn.in_proj_z"], quant)
         # `a` and `b` are two `[n_heads, hidden]` projections of the same x, and
         # the profile says they are expensive for their size: `[16, 2560] x
         # [2560, 32]` is two 16-wide tiles, i.e. **two CTAs on a 170-SM card**,
@@ -57,9 +58,17 @@ class GatedDeltaNet:
         # N=64 changes cuBLAS's tile choice and so the reduction order. The
         # 0.35 ms is real and the way to collect it is a fused kernel that keeps
         # the arithmetic fixed, not a reshaped cuBLAS call.
+        #
+        # **`a` and `b` are never quantized**, and that is deliberate rather
+        # than an oversight. They are `[n_heads, hidden]` — 0.4% of the layer's
+        # weight bytes — so there is nothing to save, and the GEMM is two CTAs,
+        # so it is launch-bound and fp8 cannot make it faster. What it could do
+        # is damage: `a_raw` goes through `exp(A * softplus(a + dt_bias))`, so
+        # fp8's three mantissa bits would land inside an exponent and the error
+        # would be amplified rather than averaged. Cost nil, risk real.
         self.in_proj_a = w["linear_attn.in_proj_a"]
         self.in_proj_b = w["linear_attn.in_proj_b"]
-        self.out_proj = w["linear_attn.out_proj"]
+        self.out_proj = maybe_quantize(w["linear_attn.out_proj"], quant)
         self.conv1d = w["linear_attn.conv1d"]          # [C, K], fp/bf16
         self.conv_bias = w.get("linear_attn.conv1d_bias")
         self.A = w["linear_attn.A"]                    # fp32, already -exp(A_log)
@@ -78,9 +87,14 @@ class GatedDeltaNet:
 
             self._mod = load_gdn()
 
+    @property
+    def quantized(self) -> bool:
+        return isinstance(self.in_proj_qkv, FP8Weight)
+
     # --- the CUDA decode step ------------------------------------------------
 
-    def _decode_kernels(self, x: torch.Tensor, cache: RecurrentCache,
+    def _decode_kernels(self, qkv_proj: torch.Tensor, a_raw: torch.Tensor,
+                        b_raw: torch.Tensor, cache: RecurrentCache,
                         slots_i32: torch.Tensor) -> torch.Tensor:
         """One token, all rows, through `conv1d_decode` + `gdn_decode`.
 
@@ -95,10 +109,10 @@ class GatedDeltaNet:
         reference; neither is bit-identical to it.
         """
         g = self.g
-        B = x.shape[0]
+        B = qkv_proj.shape[0]
         mod = self._mod
 
-        qkv = F.linear(x, self.in_proj_qkv)[:, 0].float().contiguous()   # [B, C]
+        qkv = qkv_proj[:, 0].float().contiguous()                        # [B, C]
         conv_out = torch.empty_like(qkv)
         mod.conv1d_decode(cache.conv, slots_i32, qkv,
                           self.conv1d_f32, self.conv_bias_f32, conv_out)
@@ -109,12 +123,12 @@ class GatedDeltaNet:
         k = k.reshape(B, g.n_groups, g.state_size).contiguous()
         v = v.reshape(B, g.n_heads, g.head_dim).contiguous()
 
-        a_raw = F.linear(x, self.in_proj_a)[:, 0]
-        b_raw = F.linear(x, self.in_proj_b)[:, 0]
-        beta = torch.sigmoid(b_raw).float().contiguous()
-        alpha = torch.exp(self.A * F.softplus(a_raw.float() + self.dt_bias)).contiguous()
+        beta = torch.sigmoid(b_raw[:, 0]).float().contiguous()
+        alpha = torch.exp(
+            self.A * F.softplus(a_raw[:, 0].float() + self.dt_bias)).contiguous()
 
-        y = torch.empty(B, g.n_heads, g.head_dim, device=x.device, dtype=torch.float32)
+        y = torch.empty(B, g.n_heads, g.head_dim, device=qkv.device,
+                        dtype=torch.float32)
         mod.gdn_decode(cache.state, slots_i32, q, k, v, alpha, beta, y)
         return y[:, None]     # [B, 1, H, HD]
 
@@ -197,11 +211,18 @@ class GatedDeltaNet:
         if seq_lens is not None and cache is None:
             raise ValueError("seq_lens describes a pooled batch; it needs a cache")
 
-        if self.use_kernels and cache is not None and T == 1:
-            y = self._decode_kernels(x, cache, slots_i32)
-            return self._readout(x, y, B, T, dtype)
+        # Every projection in this block reads the same x, so they are issued
+        # together: when the block is quantized that is one activation quantize
+        # for the four of them instead of four. `in_proj_a` / `in_proj_b` stay
+        # bf16 and `project` leaves them on the ordinary path.
+        qkv_proj, z, a_raw, b_raw = project(
+            x, self.in_proj_qkv, self.in_proj_z, self.in_proj_a, self.in_proj_b)
 
-        qkv = F.linear(x, self.in_proj_qkv).transpose(1, 2)              # [B, C, T]
+        if self.use_kernels and cache is not None and T == 1:
+            y = self._decode_kernels(qkv_proj, a_raw, b_raw, cache, slots_i32)
+            return self._readout(z, y, B, T, dtype)
+
+        qkv = qkv_proj.transpose(1, 2)                                   # [B, C, T]
         qkv = self._conv(qkv, cache, slots, seq_lens).transpose(1, 2)    # [B, T, C]
 
         # [Q | K | V], Q FIRST. Settled empirically by tests/test_hf_parity.py,
@@ -212,9 +233,6 @@ class GatedDeltaNet:
         q = q.reshape(B, T, g.n_groups, g.state_size)
         k = k.reshape(B, T, g.n_groups, g.state_size)
         v = v.reshape(B, T, g.n_heads, g.head_dim)
-
-        a_raw = F.linear(x, self.in_proj_a)
-        b_raw = F.linear(x, self.in_proj_b)
 
         # beta's sigmoid is taken in the ACTIVATION dtype and only then widened;
         # `g` is computed entirely in fp32. That asymmetry is HF's (`beta =
@@ -267,19 +285,22 @@ class GatedDeltaNet:
         if cache is not None:
             cache.state.index_copy_(0, slots, state)
 
-        return self._readout(x, y, B, T, dtype)
+        return self._readout(z, y, B, T, dtype)
 
-    def _readout(self, x: torch.Tensor, y: torch.Tensor, B: int, T: int,
+    def _readout(self, z: torch.Tensor, y: torch.Tensor, B: int, T: int,
                  dtype: torch.dtype) -> torch.Tensor:
         """Gated norm then out_proj. Shared by both scan paths.
+
+        Takes the already-projected gate `z` rather than `x`, so that the single
+        activation quantization in `forward` covers this projection too.
 
         HF casts the scan output back to the activation dtype BEFORE gating, so
         this cast is part of the reference and not a rounding convenience.
         """
         g = self.g
         core = y.to(dtype).reshape(-1, g.head_dim)
-        z = F.linear(x, self.in_proj_z).reshape(-1, g.head_dim)
-        core = rms_norm_gated(core, z, self.norm, self.cfg.rms_norm_eps)
-        return F.linear(core.reshape(B, T, g.inner_size), self.out_proj)
+        core = rms_norm_gated(core, z.reshape(-1, g.head_dim), self.norm,
+                              self.cfg.rms_norm_eps)
+        return linear(core.reshape(B, T, g.inner_size), self.out_proj)
 
     __call__ = forward

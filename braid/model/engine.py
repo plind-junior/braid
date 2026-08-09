@@ -14,7 +14,8 @@ Scope, against the roadmap as originally written for the 35B:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -26,6 +27,18 @@ from braid.model.config import ModelConfig
 from braid.model.layer import DecoderLayer
 from braid.model.loader import Checkpoint, load_checkpoint
 from braid.model.norm import rms_norm
+from braid.model.quant import FP8Weight, linear, maybe_quantize, parse_groups
+
+
+def checkpoint_bytes(ckpt: Checkpoint) -> int:
+    """Distinct bytes held by a checkpoint's tensors."""
+    seen, total = set(), 0
+    for t in ckpt.tensors.values():
+        if t.data_ptr() in seen:
+            continue  # a tied lm_head aliases embed_tokens
+        seen.add(t.data_ptr())
+        total += t.numel() * t.element_size()
+    return total
 
 
 @dataclass
@@ -38,9 +51,20 @@ class Engine:
     rope: RotaryEmbedding
     device: torch.device
     dtype: torch.dtype
-    checkpoint: Checkpoint
+    # The checkpoint's own footprint, captured as a number so that reporting it
+    # does not require holding the tensors. See `source`.
+    ckpt_bytes: int
+    # The checkpoint this engine was built from, **or None if anything was
+    # quantized**. An unquantized engine aliases the checkpoint's tensors, so
+    # keeping it costs nothing and lets a caller build a sibling engine over the
+    # same weights (`use_kernels=True`, say) for free. A *quantized* engine does
+    # not alias them — `maybe_quantize` allocates fp8 copies and the bf16
+    # originals would stay reachable through this field forever, leaving a "half
+    # the bytes" engine resident at 14.78 + 7.40 GiB and OOMing the B=64 capture
+    # on a 31 GiB card. So it is dropped exactly when it would be a duplicate.
+    source: Checkpoint | None = None
     use_kernels: bool = False
-    quant_mlp: bool = False
+    quant: frozenset[str] = field(default_factory=frozenset)
 
     # --- construction --------------------------------------------------------
 
@@ -48,32 +72,37 @@ class Engine:
     def from_checkpoint(cls, ckpt: Checkpoint, device: str | torch.device = "cuda",
                         dtype: torch.dtype = torch.bfloat16,
                         use_kernels: bool = False,
-                        quant_mlp: bool = False) -> Engine:
+                        quant: str | Iterable[str] | None = None) -> Engine:
         cfg = ckpt.config
+        groups = parse_groups(quant)
         layers = [DecoderLayer(cfg, i, ckpt.layer(i), use_kernels=use_kernels,
-                               quant_mlp=quant_mlp)
+                               quant=groups)
                   for i in range(cfg.num_hidden_layers)]
         return cls(
             config=cfg,
             layers=layers,
             embed_tokens=ckpt["embed_tokens"],
             final_norm=ckpt["norm"],
-            lm_head=ckpt["lm_head"],
+            # `embed_tokens` is gathered, never swept, so it is left alone even
+            # under "all" — quantizing it would cost accuracy for no bandwidth.
+            # `lm_head` is a full GEMM every step and is the one that pays.
+            lm_head=maybe_quantize(ckpt["lm_head"], "head" in groups),
             rope=RotaryEmbedding(cfg, device, dtype),
             device=torch.device(device),
             dtype=dtype,
-            checkpoint=ckpt,
+            ckpt_bytes=checkpoint_bytes(ckpt),
+            source=None if groups else ckpt,
             use_kernels=use_kernels,
-            quant_mlp=quant_mlp,
+            quant=groups,
         )
 
     @classmethod
     def from_pretrained(cls, path: str | Path, device: str | torch.device = "cuda",
                         dtype: torch.dtype = torch.bfloat16,
                         use_kernels: bool = False,
-                        quant_mlp: bool = False) -> Engine:
+                        quant: str | Iterable[str] | None = None) -> Engine:
         return cls.from_checkpoint(load_checkpoint(path, device=device, dtype=dtype),
-                                   device, dtype, use_kernels, quant_mlp)
+                                   device, dtype, use_kernels, quant)
 
     def allocate_cache(self, max_len: int, max_slots: int = 1) -> Cache:
         # The conv kernel requires an fp32 window; the torch path keeps the
@@ -192,8 +221,8 @@ class Engine:
         seq_lens: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """`input_ids` is `[B, T]` -> logits `[B, T_out, vocab]`."""
-        return F.linear(self.hidden_states(input_ids, cache, last_only, seq_lens),
-                        self.lm_head)
+        return linear(self.hidden_states(input_ids, cache, last_only, seq_lens),
+                      self.lm_head)
 
     # --- the graph-safe decode step ------------------------------------------
 
@@ -246,7 +275,7 @@ class Engine:
 
         cache.lengths.index_copy_(0, slots, positions + 1)
         h = rms_norm(h, self.final_norm, self.config.rms_norm_eps)
-        return F.linear(h, self.lm_head)[:, 0]
+        return linear(h, self.lm_head)[:, 0]
 
     # --- generation ----------------------------------------------------------
 
@@ -355,10 +384,67 @@ class Engine:
     # --- reporting -----------------------------------------------------------
 
     def weight_bytes(self) -> int:
-        seen, total = set(), 0
-        for t in self.checkpoint.tensors.values():
-            if t.data_ptr() in seen:
-                continue  # tied lm_head aliases embed_tokens
-            seen.add(t.data_ptr())
-            total += t.numel() * t.element_size()
-        return total
+        """The **checkpoint's** footprint, i.e. what was loaded from the file.
+
+        Unchanged by quantization on purpose: this is the "did the visual tower
+        leak in" number. For what the engine actually reads per decode step, use
+        `step_bytes`.
+        """
+        return self.ckpt_bytes
+
+    def _projections(self) -> dict[str, list]:
+        """Every weight a decode step sweeps, by group. Not `embed_tokens`,
+        which is gathered per token rather than read."""
+        out: dict[str, list] = {"mlp": [], "attn": [], "gdn": [], "head": []}
+        for lyr in self.layers:
+            m = lyr.mixer
+            out["mlp"] += [lyr.mlp.gate_proj, lyr.mlp.up_proj, lyr.mlp.down_proj]
+            if lyr.is_gdn:
+                out["gdn"] += [m.in_proj_qkv, m.in_proj_z, m.in_proj_a,
+                               m.in_proj_b, m.out_proj]
+            else:
+                out["attn"] += [m.q_proj, m.k_proj, m.v_proj, m.o_proj]
+        out["head"] = [self.lm_head]
+        return out
+
+    def step_bytes(self) -> dict[str, int]:
+        """Bytes of weight a single decode step reads, per group.
+
+        **This is the number the head-to-head turns on.** Decode is weight-bound
+        at the batches braid is built for, so the ratio of this total against the
+        competitor's is the first-order predictor of the throughput ratio, and it
+        is the only quantity FP8 moves.
+        """
+        def nbytes(w):
+            return (w.nbytes if isinstance(w, FP8Weight)
+                    else w.numel() * w.element_size())
+
+        return {g: sum(nbytes(w) for w in ws) for g, ws in self._projections().items()}
+
+    def quant_report(self) -> str:
+        """What was actually quantized, and what it bought — one line per group.
+
+        Stated rather than assumed because `maybe_quantize` **declines shapes**
+        it cannot handle (`_scaled_mm` needs both dims a multiple of 16) and
+        `gdn` deliberately leaves `in_proj_a` / `in_proj_b` alone. A run can ask
+        for a group and get less of it than it asked for, and a benchmark that
+        reported the request instead of the result would be publishing a label,
+        not a measurement.
+        """
+        lines, tot_now, tot_bf16 = [], 0, 0
+        for g, ws in self._projections().items():
+            if not ws:
+                continue
+            q = sum(1 for w in ws if isinstance(w, FP8Weight))
+            now = sum((w.nbytes if isinstance(w, FP8Weight)
+                       else w.numel() * w.element_size()) for w in ws)
+            bf16 = sum((w.data.numel() * 2 if isinstance(w, FP8Weight)
+                        else w.numel() * w.element_size()) for w in ws)
+            tot_now += now
+            tot_bf16 += bf16
+            asked = "on" if g in self.quant else "off"
+            lines.append(f"  {g:<5} {q:>4}/{len(ws):<4} fp8  {now / 2 ** 30:>6.2f} GiB"
+                         f"  (bf16 {bf16 / 2 ** 30:>6.2f})  [{asked}]")
+        head = (f"decode-step weights {tot_now / 2 ** 30:.2f} GiB of "
+                f"{tot_bf16 / 2 ** 30:.2f} bf16 ({tot_now / tot_bf16:.3f}x)")
+        return head + "\n" + "\n".join(lines)

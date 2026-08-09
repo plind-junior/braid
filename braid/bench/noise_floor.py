@@ -6,8 +6,8 @@ chosen. A 2% gate against a 10% noise floor is a coin flip.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 import torch
 
@@ -160,7 +160,7 @@ class HostHealthSampler:
                 pass
             self._stop.wait(self._interval)
 
-    def __enter__(self) -> "HostHealthSampler":
+    def __enter__(self) -> HostHealthSampler:
         import threading
 
         self._stop = threading.Event()

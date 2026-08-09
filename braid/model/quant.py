@@ -43,10 +43,42 @@ is fine; `.item()` anywhere in this file would be a capture failure.
 """
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
 import torch.nn.functional as F
+
+# Which families of projection may be quantized. Selected by name rather than by
+# one boolean because they are not equally safe and not equally worth it, and
+# the measurement has to be able to say which of them was on.
+#
+#   mlp    gate/up/down. 54% of weight bytes, three homogeneous matrices.
+#   attn   q(+gate)/k/v/o on the 8 full_attention layers.
+#   gdn    in_proj_qkv, in_proj_z and out_proj on the 24 linear_attention layers.
+#          NOT in_proj_a / in_proj_b -- see `GatedDeltaNet.__init__`.
+#   head   lm_head. Sits directly on the greedy token; off unless asked for.
+GROUPS = ("mlp", "attn", "gdn", "head")
+
+
+def parse_groups(spec: str | Iterable[str] | None) -> frozenset[str]:
+    """`"mlp,attn"` / `("mlp", "attn")` / `"all"` / `""` -> a set of group names.
+
+    Unknown names raise. A silent typo here would produce a run that looks
+    quantized in the command line and is not, which is the kind of thing that
+    reaches a published table.
+    """
+    if not spec:
+        return frozenset()
+    names = spec.split(",") if isinstance(spec, str) else list(spec)
+    names = [n.strip() for n in names if n.strip()]
+    if "all" in names:
+        return frozenset(GROUPS)
+    bad = sorted(set(names) - set(GROUPS))
+    if bad:
+        raise ValueError(f"unknown quant group(s) {bad}; known: {list(GROUPS)}")
+    return frozenset(names)
+
 
 FP8 = torch.float8_e4m3fn
 FP8_MAX = 448.0
@@ -73,8 +105,35 @@ class FP8Weight:
         return self.data.numel() + 4
 
 
-def _amax_scale(t: torch.Tensor) -> torch.Tensor:
+def _act_scale(t: torch.Tensor) -> torch.Tensor:
+    """Per-tensor dequant scale for an **activation**.
+
+    Three kernels — cast, abs, reduce — and it runs inside a captured graph on
+    every decode step, so kernel count is what matters here and the tensor is a
+    few tens of KiB. Contrast `_weight_scale`.
+    """
     return (t.detach().float().abs().amax() / FP8_MAX).clamp(min=EPS).reshape(1, 1)
+
+
+def _weight_scale(t: torch.Tensor) -> torch.Tensor:
+    """Per-tensor dequant scale for a **weight**, without copying it.
+
+    Same value as `_act_scale`, computed the other way round, because the
+    trade-off is inverted: this runs once at load and never inside a graph, and
+    the tensors are large. `t.float().abs().amax()` allocates a full fp32 image
+    — 3.8 GiB for a `[248320, 4096]` lm_head — which OOMs a card already holding
+    the model, which is exactly when quantizing it is worth doing. Two bare
+    reductions allocate two scalars.
+    """
+    t = t.detach()
+    return ((torch.maximum(t.amax().abs(), t.amin().abs()).float() / FP8_MAX)
+            .clamp(min=EPS).reshape(1, 1))
+
+
+# Largest fp32 temporary `quantize_weight` will build at once. The cast has to
+# go through fp32 (`_scaled_mm` wants the division done there), so a big weight
+# is converted in row bands instead of whole.
+_CAST_CHUNK_BYTES = 256 * 2 ** 20
 
 
 def quantize_weight(w: torch.Tensor) -> FP8Weight:
@@ -86,9 +145,13 @@ def quantize_weight(w: torch.Tensor) -> FP8Weight:
         raise ValueError(
             f"_scaled_mm needs both weight dims to be multiples of 16; got "
             f"[{N}, {K}]. Leave this projection in bf16.")
-    scale = _amax_scale(w)
-    data = (w.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8)
-    return FP8Weight(data=data.contiguous(), scale=scale, shape=(N, K))
+    scale = _weight_scale(w)
+    data = torch.empty((N, K), dtype=FP8, device=w.device)
+    rows = max(1, min(N, _CAST_CHUNK_BYTES // (K * 4)))
+    for i in range(0, N, rows):
+        band = w[i:i + rows]
+        data[i:i + rows] = (band.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8)
+    return FP8Weight(data=data, scale=scale, shape=(N, K))
 
 
 def quantize_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -102,7 +165,7 @@ def quantize_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     projections that share an activation (`fp8_matmul` takes the pre-quantized
     form for exactly that reason).
     """
-    scale = _amax_scale(x)
+    scale = _act_scale(x)
     return (x.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8), scale
 
 
@@ -132,6 +195,35 @@ def fp8_linear(x: torch.Tensor, w: FP8Weight) -> torch.Tensor:
 def linear(x: torch.Tensor, w: torch.Tensor | FP8Weight) -> torch.Tensor:
     """Dispatch on the weight's type, so call sites do not branch."""
     return fp8_linear(x, w) if isinstance(w, FP8Weight) else F.linear(x, w)
+
+
+def project(x: torch.Tensor,
+            *weights: torch.Tensor | FP8Weight) -> list[torch.Tensor]:
+    """`F.linear(x, w)` for several projections that share one activation.
+
+    The activation is quantized **once** for all of them. That is not a
+    micro-optimisation: `quantize_act` is a device-side amax plus a scaled cast
+    at ~16 us a call, against a ~16 us saving on the GEMM itself, so paying it
+    per projection hands the entire win back. Attention's q/k/v and the GDN
+    block's qkv/z all read the same `x`, which is why they call this rather than
+    `linear` three times.
+
+    Mixed sets are fine — a weight left in bf16 takes the ordinary path — so a
+    group can quantize the matrices worth quantizing and leave the rest alone
+    without the caller branching.
+    """
+    if not any(isinstance(w, FP8Weight) for w in weights):
+        return [F.linear(x, w) for w in weights]
+    *lead, K = x.shape
+    xq, sx = quantize_act(x.reshape(-1, K))
+    out = []
+    for w in weights:
+        if isinstance(w, FP8Weight):
+            out.append(fp8_matmul(xq, sx, w, out_dtype=x.dtype)
+                       .reshape(*lead, w.shape[0]))
+        else:
+            out.append(F.linear(x, w))
+    return out
 
 
 def maybe_quantize(w: torch.Tensor, enabled: bool) -> torch.Tensor | FP8Weight:

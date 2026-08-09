@@ -52,7 +52,7 @@ from dataclasses import dataclass, field
 import torch
 
 from braid.model.engine import Engine
-from braid.model.graph import GraphedDecoder
+from braid.model.graph import DEFAULT_BUCKETS, GraphedDecoder
 
 _ids = itertools.count(1)
 
@@ -172,7 +172,7 @@ class Scheduler:
 
         self.decoder = None
         if graphed:
-            usable = buckets or tuple(b for b in (1, 2, 4, 8, 16) if b <= capacity)
+            usable = buckets or tuple(b for b in DEFAULT_BUCKETS if b <= capacity)
             self.decoder = GraphedDecoder(engine, self.cache, buckets=usable)
             for s in range(capacity + 1):
                 self.cache.reset_slot(s)

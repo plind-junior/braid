@@ -13,8 +13,7 @@ import torch
 import torch.nn.functional as F
 
 from braid.model.config import ModelConfig
-from braid.model.quant import (FP8Weight, fp8_matmul, linear, maybe_quantize,
-                               quantize_act)
+from braid.model.quant import FP8Weight, fp8_matmul, linear, maybe_quantize, quantize_act
 
 
 class MLP:

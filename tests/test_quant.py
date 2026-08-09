@@ -1,4 +1,4 @@
-"""FP8 W8A8 on the MLP projections.
+"""FP8 W8A8 on the projections, by group (`mlp`, `attn`, `gdn`, `head`).
 
 The interesting thing about this path is that its gate cannot be a tolerance.
 e4m3 has 3 mantissa bits, so a single GEMM lands ~3.7e-2 from bf16 — roughly
@@ -13,12 +13,27 @@ whole corpus is a claim worth making. That split is deliberate.
 """
 from __future__ import annotations
 
+import gc
+import os
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
 
-from braid.model.quant import (FP8, FP8_MAX, FP8Weight, fp8_linear, linear,
-                               maybe_quantize, quantize_act, quantize_weight)
+from braid.model.quant import (
+    FP8,
+    FP8_MAX,
+    GROUPS,
+    FP8Weight,
+    fp8_linear,
+    linear,
+    maybe_quantize,
+    parse_groups,
+    project,
+    quantize_act,
+    quantize_weight,
+)
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="needs GPU")
 
@@ -53,6 +68,32 @@ def test_the_scale_is_a_device_tensor_not_a_python_float():
     q = quantize_weight(_w())
     assert isinstance(q.scale, torch.Tensor) and q.scale.is_cuda
     assert q.scale.shape == (1, 1) and q.scale.dtype is torch.float32
+
+
+def test_the_two_scale_paths_agree():
+    """`_weight_scale` avoids an fp32 image of the tensor; it must still be the
+    same number `_act_scale` computes the obvious way."""
+    from braid.model.quant import _act_scale, _weight_scale
+    for w in (_w(512, 256), -_w(512, 256).abs(), _w(64, 32) * 100):
+        torch.testing.assert_close(_weight_scale(w), _act_scale(w), rtol=0, atol=0)
+
+
+def test_a_weight_too_large_for_one_fp32_temporary_is_banded():
+    """The lm_head is `[248320, 4096]` — an fp32 image of it is 3.8 GiB and OOMs
+    a card that is already holding the model, which is precisely the situation
+    where quantizing it is worth doing. Banding must not change the result."""
+    from braid.model import quant as q
+
+    w = _w(2048, 256)
+    full = quantize_weight(w)
+    old = q._CAST_CHUNK_BYTES
+    q._CAST_CHUNK_BYTES = 256 * 4 * 3        # 3 rows at a time
+    try:
+        banded = quantize_weight(w)
+    finally:
+        q._CAST_CHUNK_BYTES = old
+    assert torch.equal(banded.data, full.data)
+    torch.testing.assert_close(banded.scale, full.scale, rtol=0, atol=0)
 
 
 def test_an_all_zero_weight_does_not_produce_nans():
@@ -143,3 +184,175 @@ def test_quantized_mlp_reports_itself():
     from braid.model.quant import maybe_quantize
     assert isinstance(maybe_quantize(_w(512, 256), True), FP8Weight)
     assert not isinstance(maybe_quantize(_w(512, 250), True), FP8Weight)
+
+
+# --- group selection ----------------------------------------------------------
+
+def test_group_names_round_trip():
+    assert parse_groups("") == frozenset()
+    assert parse_groups(None) == frozenset()
+    assert parse_groups("mlp") == {"mlp"}
+    assert parse_groups("mlp, attn") == {"mlp", "attn"}
+    assert parse_groups(["gdn", "head"]) == {"gdn", "head"}
+    assert parse_groups("all") == frozenset(GROUPS)
+
+
+def test_an_unknown_group_raises_rather_than_quietly_doing_nothing():
+    """A typo that parsed to the empty set would produce a run labelled
+    quantized that is not, and the label is what reaches the table."""
+    with pytest.raises(ValueError, match="unknown quant group"):
+        parse_groups("mpl")
+    with pytest.raises(ValueError, match="unknown quant group"):
+        parse_groups("mlp,attention")
+
+
+# --- one activation shared across several projections -------------------------
+
+def test_project_matches_linear_per_weight():
+    x = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
+    a, b = _w(512, 256), _w(128, 256, scale=0.03)
+    qa, qb = quantize_weight(a), quantize_weight(b)
+
+    got_a, got_b = project(x, qa, qb)
+    torch.testing.assert_close(got_a, fp8_linear(x, qa), rtol=0, atol=0)
+    torch.testing.assert_close(got_b, fp8_linear(x, qb), rtol=0, atol=0)
+
+
+def test_project_leaves_unquantized_weights_on_the_bf16_path():
+    """A mixed set is the normal case — `gdn` quantizes qkv/z/out and never
+    touches in_proj_a / in_proj_b — and the bf16 ones must be untouched."""
+    x = torch.randn(4, 256, device="cuda", dtype=torch.bfloat16)
+    a, b = _w(512, 256), _w(128, 256)
+    got_a, got_b = project(x, quantize_weight(a), b)
+    assert isinstance(got_a, torch.Tensor)
+    torch.testing.assert_close(got_b, F.linear(x, b), rtol=0, atol=0)
+
+
+def test_project_with_no_fp8_weights_is_exactly_f_linear():
+    x = torch.randn(2, 3, 256, device="cuda", dtype=torch.bfloat16)
+    a, b = _w(512, 256), _w(128, 256)
+    got_a, got_b = project(x, a, b)
+    torch.testing.assert_close(got_a, F.linear(x, a), rtol=0, atol=0)
+    torch.testing.assert_close(got_b, F.linear(x, b), rtol=0, atol=0)
+
+
+def test_project_preserves_leading_dims():
+    x = torch.randn(2, 3, 256, device="cuda", dtype=torch.bfloat16)
+    out, = project(x, quantize_weight(_w(512, 256)))
+    assert out.shape == (2, 3, 512) and out.dtype is torch.bfloat16
+
+
+# --- the real checkpoint: which weights actually became fp8 -------------------
+
+MODEL_DIR = Path(os.environ.get("BRAID_MODEL_DIR", "/root/models/Qwen3.5-4B"))
+needs_model = pytest.mark.skipif(not MODEL_DIR.exists(),
+                                 reason=f"no checkpoint at {MODEL_DIR}")
+
+
+def _engine(quant):
+    from braid.model.engine import Engine
+    from braid.model.loader import load_checkpoint
+
+    ck = load_checkpoint(MODEL_DIR, device="cuda", dtype=torch.bfloat16)
+    eng = Engine.from_checkpoint(ck, device="cuda", dtype=torch.bfloat16, quant=quant)
+    del ck
+    gc.collect()
+    torch.cuda.empty_cache()
+    return eng
+
+
+@needs_model
+@pytest.mark.parametrize("group", GROUPS)
+def test_a_group_quantizes_itself_and_nothing_else(group):
+    """Asking for one group must not quietly quantize a neighbour. `attn` and
+    `gdn` in particular sit on alternating layers of the same stack."""
+    eng = _engine(group)
+    try:
+        got = {g: [isinstance(w, FP8Weight) for w in ws]
+               for g, ws in eng._projections().items()}
+        assert all(got[group]) or group == "gdn", f"{group} was not quantized"
+        if group == "gdn":
+            # a and b are excluded by design; everything else in the group goes.
+            assert sum(got["gdn"]) == len(got["gdn"]) * 3 // 5
+        for other in set(GROUPS) - {group}:
+            assert not any(got[other]), f"asking for {group} also quantized {other}"
+    finally:
+        del eng
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+@needs_model
+def test_the_gdn_gates_stay_bf16_even_under_all():
+    """`in_proj_a` feeds `exp(A * softplus(...))`, so fp8's three mantissa bits
+    would land inside an exponent. It is 0.4% of the layer's bytes, so there is
+    nothing to win and something to lose."""
+    eng = _engine("all")
+    try:
+        gdn = [lyr.mixer for lyr in eng.layers if lyr.is_gdn]
+        assert gdn, "no linear_attention layers in this checkpoint"
+        for m in gdn:
+            assert not isinstance(m.in_proj_a, FP8Weight)
+            assert not isinstance(m.in_proj_b, FP8Weight)
+            assert isinstance(m.in_proj_qkv, FP8Weight)
+            assert isinstance(m.in_proj_z, FP8Weight)
+            assert isinstance(m.out_proj, FP8Weight)
+    finally:
+        del eng
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+@needs_model
+def test_embed_tokens_is_never_quantized():
+    """It is gathered per token, not swept, so quantizing it buys no bandwidth
+    and costs accuracy on every embedding lookup."""
+    eng = _engine("all")
+    try:
+        assert isinstance(eng.embed_tokens, torch.Tensor)
+        assert eng.embed_tokens.dtype is torch.bfloat16
+    finally:
+        del eng
+        gc.collect()
+        torch.cuda.empty_cache()
+
+
+@needs_model
+def test_each_group_removes_its_own_bytes_from_the_decode_step():
+    """The claim the head-to-head turns on: decode is weight-bound, so what FP8
+    is worth is exactly the bytes it removes from `step_bytes`."""
+    base = _engine("")
+    want = base.step_bytes()
+    del base
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    for group in GROUPS:
+        eng = _engine(group)
+        try:
+            got = eng.step_bytes()
+            assert got[group] < want[group] * 0.75, (
+                f"{group}: {got[group]} vs bf16 {want[group]} — barely moved")
+            for other in set(GROUPS) - {group}:
+                assert got[other] == want[other], f"{group} moved {other}'s bytes"
+        finally:
+            del eng
+            gc.collect()
+            torch.cuda.empty_cache()
+
+
+@needs_model
+def test_quant_report_states_the_result_not_the_request():
+    eng = _engine("gdn")
+    try:
+        rep = eng.quant_report()
+        assert "[on]" in rep and "[off]" in rep
+        # 3 of the 5 gdn projections are quantizable; the report must show that
+        # rather than claiming the group.
+        line = next(x for x in rep.splitlines() if x.strip().startswith("gdn"))
+        n_q, n = line.split()[1].split("/")
+        assert int(n_q) == int(n) * 3 // 5, line
+    finally:
+        del eng
+        gc.collect()
+        torch.cuda.empty_cache()

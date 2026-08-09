@@ -138,7 +138,7 @@ def test_a_kv_len_the_cache_cannot_hold_is_refused(engine):
 def test_padding_uses_scratch_slots_and_leaves_live_ones_alone(engine, graphed):
     """A padded row still advances whatever slot it names."""
     dec, cache = graphed
-    B, size = 3, 4
+    B = 3
     tokens = torch.arange(7, 7 + B, device="cuda")[:, None]
     slots = torch.arange(B, device="cuda")
     scratch = torch.tensor([MAX_SLOTS - 1], device="cuda")

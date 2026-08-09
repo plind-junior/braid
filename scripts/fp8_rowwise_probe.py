@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 
 from braid.bench.noise_floor import measure_graphed
-from braid.model.quant import FP8, FP8_MAX, fp8_linear, quantize_act, quantize_weight
+from braid.model.quant import FP8, fp8_linear, quantize_act, quantize_weight
 
 SHAPES = [
     ("mlp.gate/up",   2560,   9216),

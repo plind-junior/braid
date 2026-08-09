@@ -35,6 +35,7 @@ from braid.bench.noise_floor import HostHealthSampler
 from braid.model.engine import Engine
 from braid.model.graph import GraphedDecoder
 from braid.model.loader import load_checkpoint
+from braid.model.quant import GROUPS, parse_groups
 
 MODEL_DIR = Path(os.environ.get("BRAID_MODEL_DIR", "/root/models/Qwen3.5-4B"))
 
@@ -56,6 +57,7 @@ class Arm:
     ms_per_step: float
     tok_per_s: float
     steps: int
+    peak_gib: float = 0.0
 
 
 def _seed(engine: Engine, cache, batch: int, prompt_len: int = PROMPT_LEN) -> None:
@@ -91,15 +93,34 @@ def _time(fn, steps: int, reset) -> float:
     return start.elapsed_time(end) / 1e3 / steps
 
 
-def measure(batch: int, steps: int, max_len: int, ckpt,
-            quant_mlp: bool = False, prompt_len: int = PROMPT_LEN) -> list[Arm]:
+def _engine(use_kernels: bool, quant) -> Engine:
+    """A fresh engine, with the source checkpoint dropped immediately.
+
+    **Loading once outside the loop and reusing the checkpoint is what this
+    avoids, and it was not free.** `from_checkpoint` aliases the checkpoint's
+    tensors when it leaves a weight alone, but *quantizing* allocates a new fp8
+    copy while the bf16 original stays reachable through the checkpoint. At
+    Qwen3.5-9B that is 16.7 GiB of bf16 held beside the engine that no longer
+    needs it, and it OOMs the B=64 arm on a 31 GiB card — the quantized arm,
+    the one whose whole purpose is to need less memory. Reloading costs ~2 s
+    from page cache.
+    """
+    ck = load_checkpoint(MODEL_DIR, device="cuda")
+    eng = Engine.from_checkpoint(ck, device="cuda", dtype=torch.bfloat16,
+                                 use_kernels=use_kernels, quant=quant)
+    del ck
+    torch.cuda.empty_cache()
+    return eng
+
+
+def measure(batch: int, steps: int, max_len: int,
+            quant=None, prompt_len: int = PROMPT_LEN) -> list[Arm]:
     arms: list[Arm] = []
     tokens = torch.full((batch, 1), 42, dtype=torch.long, device="cuda")
     slots = torch.arange(batch, device="cuda")
 
     for name, use_kernels in (("eager-torch", False), ("eager-kernels", True)):
-        eng = Engine.from_checkpoint(ckpt, device="cuda", dtype=torch.bfloat16,
-                                     use_kernels=use_kernels, quant_mlp=quant_mlp)
+        eng = _engine(use_kernels, quant)
         cache = eng.allocate_cache(max_len, max_slots=batch)
         view = cache.select(list(range(batch)))
         _seed(eng, cache, batch, prompt_len)
@@ -109,8 +130,18 @@ def measure(batch: int, steps: int, max_len: int, ckpt,
         arms.append(Arm(name, batch, s * 1e3, batch / s, steps))
         del eng, cache, view, snap
 
-    eng = Engine.from_checkpoint(ckpt, device="cuda", dtype=torch.bfloat16,
-                                 use_kernels=True, quant_mlp=quant_mlp)
+    eng = _engine(True, quant)
+    # Peak is measured from **here**, not from process start, and the difference
+    # is not cosmetic. Building a quantized engine holds the bf16 originals and
+    # the fp8 copies at the same moment, so the construction transient is larger
+    # for fp8 than for bf16 — 24.6 GiB against 16.9 at B=1 on Qwen3.5-9B. Left
+    # in, the published VRAM column would say fp8 costs *more* memory to serve,
+    # which is the opposite of true: `reset_peak_memory_stats` rebases the peak
+    # to what is resident now, so what follows measures weights + caches + graph
+    # pool + activations, i.e. what serving actually needs. The construction
+    # transient is a real load-time limit and is reported separately, not folded
+    # into this number.
+    torch.cuda.reset_peak_memory_stats()
     cache = eng.allocate_cache(max_len, max_slots=batch)
     _seed(eng, cache, batch, prompt_len)
     snap = cache.snapshot()
@@ -136,8 +167,18 @@ def measure(batch: int, steps: int, max_len: int, ckpt,
 
     s = _time(kv_step, steps, kv_reset)
     arms.append(Arm("graphed-kvbucket", batch, s * 1e3, batch / s, steps))
+
+    # Own-peak VRAM, which the roadmap's bench harness is required to publish and
+    # which is the field that says whether a batch is near the card. Read after
+    # the graph pool exists, so it includes it. Attributed to every arm at this
+    # batch: the graphed arm is the one a server would run, and the eager arms
+    # differ only in the cache they hold.
+    peak = torch.cuda.max_memory_allocated() / 2 ** 30
+    for a in arms:
+        a.peak_gib = peak
     del eng, cache, dec
     torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
     return arms
 
 
@@ -147,34 +188,51 @@ def main() -> None:
     p.add_argument("--steps", type=int, default=192)
     p.add_argument("--max-len", type=int, default=512)
     p.add_argument("--json", action="store_true")
+    p.add_argument("--quant", default="",
+                   help=f"FP8 W8A8 groups, comma separated: {','.join(GROUPS)}, "
+                        f"or 'all'")
     p.add_argument("--quant-mlp", action="store_true",
-                   help="FP8 W8A8 on the MLP projections")
+                   help="shorthand for --quant mlp")
     p.add_argument("--prompt-len", type=int, default=PROMPT_LEN,
                    help="KV under each row before timing; match the competitor's "
                         "shape when producing a head-to-head number")
     args = p.parse_args()
 
-    ckpt = load_checkpoint(MODEL_DIR, device="cuda")
+    quant = "mlp" if args.quant_mlp else args.quant
+    # Built once up front purely to state what the run actually quantized --
+    # `maybe_quantize` declines shapes it cannot handle, so the request and the
+    # result are not the same thing (`Engine.quant_report`).
+    probe = _engine(True, quant)
+    report_q, step_bytes = probe.quant_report(), probe.step_bytes()
+    del probe
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+
     out: list[Arm] = []
     with HostHealthSampler() as health:
         for b in args.batches:
-            out.extend(measure(b, args.steps, args.max_len, ckpt,
-                               quant_mlp=args.quant_mlp,
+            out.extend(measure(b, args.steps, args.max_len, quant=quant,
                                prompt_len=args.prompt_len))
     report = health.report()
 
     if args.json:
         print(json.dumps({"arms": [asdict(a) for a in out],
-                          "health": str(report)}))
+                          "health": str(report),
+                          "quant": sorted(parse_groups(quant)),
+                          "step_bytes": step_bytes}))
         return
 
     print(f"\nhost health: {report}")
+    print(report_q)
     print(f"seeded with {args.prompt_len} tokens of KV per row; "
           f"{args.steps} timed steps -> KV {args.prompt_len}.."
           f"{args.prompt_len + args.steps}\n")
-    print(f"{'batch':>5} {'arm':<18} {'ms/step':>9} {'tok/s':>10}")
+    total = torch.cuda.get_device_properties(0).total_memory / 2 ** 30
+    print(f"{'batch':>5} {'arm':<18} {'ms/step':>9} {'tok/s':>10} {'peak GiB':>9}")
     for a in out:
-        print(f"{a.batch:>5} {a.name:<18} {a.ms_per_step:>9.3f} {a.tok_per_s:>10.1f}")
+        print(f"{a.batch:>5} {a.name:<18} {a.ms_per_step:>9.3f} {a.tok_per_s:>10.1f} "
+              f"{a.peak_gib:>9.2f}")
+    print(f"  (card total {total:.2f} GiB)")
 
     print(f"\n{'batch':>5} {'graphs_on/off':>14}  (vs the better eager arm)")
     for b in args.batches:

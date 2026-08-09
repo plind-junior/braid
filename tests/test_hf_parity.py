@@ -39,7 +39,6 @@ def _inputs(B, cfg, dev, seed=0):
 
 def _hf_reference(state, inp, cfg):
     """One decode step through HF's torch_recurrent_gated_delta_rule."""
-    B = state.shape[0]
     hpg = cfg.heads_per_group
     # HF shapes: [B, seq=1, heads, dim]; repeat_interleave BEFORE the rule.
     q = inp["q"][:, None].repeat_interleave(hpg, dim=2)

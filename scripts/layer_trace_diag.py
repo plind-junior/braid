@@ -31,7 +31,6 @@ def main():
 
     sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "tests"))
     from test_full_forward import _load_hf_text_model  # noqa: E402
-
     from transformers import AutoConfig
     from transformers.models.qwen3_5 import modeling_qwen3_5 as hf  # noqa: F401
 

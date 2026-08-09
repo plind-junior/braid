@@ -24,6 +24,7 @@ import torch.nn.functional as F
 
 from braid.model.config import ModelConfig
 from braid.model.norm import rms_norm
+from braid.model.quant import FP8Weight, linear, maybe_quantize, project
 
 if TYPE_CHECKING:
     from braid.model.cache import KVCache
@@ -134,14 +135,22 @@ def grouped_decode_attention(
 class Attention:
     """One `full_attention` layer's self-attention. Weights are `[out, in]`."""
 
-    def __init__(self, cfg: ModelConfig, weights: dict[str, torch.Tensor]):
+    def __init__(self, cfg: ModelConfig, weights: dict[str, torch.Tensor],
+                 quant: bool = False):
         self.cfg = cfg
-        self.q_proj = weights["self_attn.q_proj"]
-        self.k_proj = weights["self_attn.k_proj"]
-        self.v_proj = weights["self_attn.v_proj"]
-        self.o_proj = weights["self_attn.o_proj"]
+        self.q_proj = maybe_quantize(weights["self_attn.q_proj"], quant)
+        self.k_proj = maybe_quantize(weights["self_attn.k_proj"], quant)
+        self.v_proj = maybe_quantize(weights["self_attn.v_proj"], quant)
+        self.o_proj = maybe_quantize(weights["self_attn.o_proj"], quant)
+        # The norms stay in their stored dtype. They are per-head vectors, they
+        # are not a GEMM, and this checkpoint deliberately keeps some of them in
+        # fp32.
         self.q_norm = weights["self_attn.q_norm"]
         self.k_norm = weights["self_attn.k_norm"]
+
+    @property
+    def quantized(self) -> bool:
+        return isinstance(self.q_proj, FP8Weight)
 
     def forward(
         self,
@@ -159,16 +168,19 @@ class Attention:
         B, T, _ = x.shape
         H, KVH, D = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
 
+        # q/k/v all read the same x, so the activation is quantized once for the
+        # three of them when this layer is quantized (see `project`).
+        qg, kp, vp = project(x, self.q_proj, self.k_proj, self.v_proj)
+
         # Per-head [q | gate]: view as [B, T, H, 2D] and split the LAST axis.
         # Chunking the flat 8192 instead pairs head h with the gate of head h/2.
-        qg = F.linear(x, self.q_proj).view(B, T, H, 2 * D)
-        q, gate = qg.chunk(2, dim=-1)
+        q, gate = qg.view(B, T, H, 2 * D).chunk(2, dim=-1)
         gate = gate.reshape(B, T, H * D)
 
         q = rms_norm(q, self.q_norm, cfg.rms_norm_eps).transpose(1, 2)
-        k = rms_norm(F.linear(x, self.k_proj).view(B, T, KVH, D),
+        k = rms_norm(kp.view(B, T, KVH, D),
                      self.k_norm, cfg.rms_norm_eps).transpose(1, 2)
-        v = F.linear(x, self.v_proj).view(B, T, KVH, D).transpose(1, 2)
+        v = vp.view(B, T, KVH, D).transpose(1, 2)
 
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
 
@@ -201,6 +213,6 @@ class Attention:
         o = o.transpose(1, 2).reshape(B, T, H * D)
         # Gate AFTER attention, BEFORE o_proj.
         o = o * torch.sigmoid(gate)
-        return F.linear(o, self.o_proj)
+        return linear(o, self.o_proj)
 
     __call__ = forward

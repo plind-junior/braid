@@ -27,7 +27,18 @@ import torch
 from braid.model.cache import Cache
 from braid.model.engine import Engine
 
-DEFAULT_BUCKETS = (1, 2, 4, 8, 16)
+# The ladder stops at 64 and not at 16, and the change was forced by
+# measurement. Phase 1 item 4 held that "batch buckets stop at 16 -- c=32 does
+# not fit in VRAM and is throughput-pointless", on the reasoning that the linear
+# per-sequence state term overtakes the fixed weight sweep at B=14-18. All three
+# clauses were wrong: B=64 peaks at 20.6 GB of 32.6 on Qwen3.5-4B, B=16->32 is
+# 1.93x and B=32->64 is 1.43x, and the crossover is at B~83. Worse, **B>=32 is
+# where braid overtakes llama.cpp at all** -- a ceiling of 16 kept every bucket
+# in the range where braid loses.
+#
+# Buckets are only ever *captured* up to `cache.max_slots`, so a small pool
+# still costs nothing; this widens what a large pool is allowed to use.
+DEFAULT_BUCKETS = (1, 2, 4, 8, 16, 32, 64)
 # `kv_len` is the second capture axis. A graph's shapes are fixed, so the KV
 # extent attention reads has to be a constant -- and pinning it to `max_len`
 # means every step reads the whole buffer however short the live sequences are:

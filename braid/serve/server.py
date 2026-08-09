@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from braid.model.engine import Engine
+from braid.model.quant import GROUPS
 from braid.serve.scheduler import Request, Scheduler
 
 _DONE = object()
@@ -225,13 +226,19 @@ def main() -> None:
     p.add_argument("--port", type=int, default=8000)
     p.add_argument("--capacity", type=int, default=8)
     p.add_argument("--max-len", type=int, default=2048)
-    p.add_argument("--quant-mlp", action="store_true")
+    p.add_argument("--quant", default="",
+                   help=f"FP8 W8A8 groups: {','.join(GROUPS)}, or 'all'")
+    p.add_argument("--quant-mlp", action="store_true",
+                   help="shorthand for --quant mlp")
     p.add_argument("--no-graphs", action="store_true")
     args = p.parse_args()
 
+    quant = "mlp" if args.quant_mlp else args.quant
     ck = load_checkpoint(args.model_dir, device="cuda", dtype=torch.bfloat16)
     eng = Engine.from_checkpoint(ck, device="cuda", dtype=torch.bfloat16,
-                                 use_kernels=True, quant_mlp=args.quant_mlp)
+                                 use_kernels=True, quant=quant)
+    del ck
+    torch.cuda.empty_cache()
     httpd, service = serve(eng, args.host, args.port, capacity=args.capacity,
                            max_len=args.max_len, graphed=not args.no_graphs)
     print(f"braid serving on http://{args.host}:{args.port} "

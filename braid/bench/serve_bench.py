@@ -34,6 +34,7 @@ import torch
 from braid.bench.noise_floor import HostHealthSampler
 from braid.model.engine import Engine
 from braid.model.loader import load_checkpoint
+from braid.model.quant import GROUPS, parse_groups
 from braid.serve.scheduler import Request, Scheduler
 
 MODEL_DIR = Path(os.environ.get("BRAID_MODEL_DIR", "/root/models/Qwen3.5-4B"))
@@ -181,13 +182,20 @@ def measure(engine: Engine, concurrency: int, n_requests: int, prompt_len: int,
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--concurrency", type=int, nargs="+", default=[1, 2, 4, 8, 16])
+    # Stops at 64, not 16. The old ceiling came from Phase 1 item 4's claim that
+    # c=32 neither fits nor pays; both halves were measured false, and B >= 32 is
+    # the only range where braid is ahead of llama.cpp at all.
+    p.add_argument("--concurrency", type=int, nargs="+",
+                   default=[1, 2, 4, 8, 16, 32, 64])
     p.add_argument("--requests-per-stream", type=int, default=2,
                    help="requests submitted per concurrent slot")
     p.add_argument("--prompt-len", type=int, default=128)
     p.add_argument("--max-new-tokens", type=int, default=64)
     p.add_argument("--max-len", type=int, default=1024)
-    p.add_argument("--quant-mlp", action="store_true")
+    p.add_argument("--quant", default="",
+                   help=f"FP8 W8A8 groups: {','.join(GROUPS)}, or 'all'")
+    p.add_argument("--quant-mlp", action="store_true",
+                   help="shorthand for --quant mlp")
     p.add_argument("--no-graphs", action="store_true")
     p.add_argument("--prefill-chunk", type=int, default=256,
                    help="per-row prompt tokens per tick; bounds the scan loop's T")
@@ -199,9 +207,13 @@ def main() -> None:
     p.add_argument("--json", action="store_true")
     args = p.parse_args()
 
+    quant = "mlp" if args.quant_mlp else args.quant
+    quant_groups = parse_groups(quant)
     ck = load_checkpoint(MODEL_DIR, device="cuda", dtype=torch.bfloat16)
     eng = Engine.from_checkpoint(ck, device="cuda", dtype=torch.bfloat16,
-                                 use_kernels=True, quant_mlp=args.quant_mlp)
+                                 use_kernels=True, quant=quant)
+    del ck
+    torch.cuda.empty_cache()
 
     rep = Report(env=_env())
     for c in args.concurrency:
@@ -220,7 +232,7 @@ def main() -> None:
     print(f"prompt {args.prompt_len} tok, {args.max_new_tokens} new, "
           f"{args.requests_per_stream} requests per slot, "
           f"graphs {'off' if args.no_graphs else 'on'}, "
-          f"MLP {'fp8' if args.quant_mlp else 'bf16'}, "
+          f"fp8 {sorted(quant_groups) or 'none'}, "
           f"prefill chunk {args.prefill_chunk} budget "
           f"{args.prefill_budget or 'capacity*chunk'}\n")
     print(f"{'c':>3}{'tok/s':>9}{'TTFT p50':>10}{'p90':>8}"

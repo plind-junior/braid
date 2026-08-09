@@ -19,13 +19,17 @@ from braid.model.norm import rms_norm
 
 class DecoderLayer:
     def __init__(self, cfg: ModelConfig, layer_idx: int, weights: dict[str, torch.Tensor],
-                 use_kernels: bool = False, quant_mlp: bool = False):
+                 use_kernels: bool = False,
+                 quant: frozenset[str] = frozenset()):
         self.cfg = cfg
         self.layer_idx = layer_idx
         self.is_gdn = cfg.is_gdn(layer_idx)
-        self.mixer = (GatedDeltaNet(cfg, weights, use_kernels=use_kernels)
-                      if self.is_gdn else Attention(cfg, weights))
-        self.mlp = MLP(cfg, weights, quant=quant_mlp)
+        self.mixer = (
+            GatedDeltaNet(cfg, weights, use_kernels=use_kernels,
+                          quant="gdn" in quant)
+            if self.is_gdn else
+            Attention(cfg, weights, quant="attn" in quant))
+        self.mlp = MLP(cfg, weights, quant="mlp" in quant)
         self.input_layernorm = weights["input_layernorm"]
         self.post_attention_layernorm = weights["post_attention_layernorm"]
 

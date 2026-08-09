@@ -10,6 +10,7 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 rsync -az --delete \
   --exclude '.git' --exclude '__pycache__' --exclude '*.pyc' --exclude '.pytest_cache' \
+  --exclude '.ruff_cache' --exclude '.venv' \
   -e "ssh $SSH_OPTS" \
   "$REPO_ROOT/" "$BRAID_SSH_HOST:$BRAID_REMOTE_DIR/"
 

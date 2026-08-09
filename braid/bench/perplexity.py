@@ -34,6 +34,8 @@ from pathlib import Path
 
 import torch
 
+from braid.model.quant import GROUPS, linear, parse_groups
+
 DEFAULT_MODEL_DIR = Path(os.environ.get("BRAID_MODEL_DIR", "/root/models/Qwen3.5-4B"))
 CORPUS_REPO = "Salesforce/wikitext"
 CORPUS_FILE = "wikitext-2-raw-v1/test-00000-of-00001.parquet"
@@ -112,7 +114,7 @@ def _window_nll(
     T = hidden.shape[1]
     for s in range(0, T - 1, slice_size):
         e = min(s + slice_size, T - 1)
-        logits = torch.nn.functional.linear(hidden[0, s:e], lm_head).float()
+        logits = linear(hidden[0, s:e], lm_head).float()
         total += torch.nn.functional.cross_entropy(
             logits, targets[s + 1:e + 1], reduction="sum").item()
         count += e - s
@@ -152,7 +154,7 @@ def perplexity(
 def braid_perplexity(corpus: Corpus, model_dir: Path = DEFAULT_MODEL_DIR,
                      dtype: torch.dtype = torch.bfloat16, window: int = 2048,
                      progress: bool = False, drop_final_norm_offset: bool = False,
-                     quant_mlp: bool = False):
+                     quant=None):
     """`drop_final_norm_offset` is the deliberate-bug arm: it undoes the `1+W`
     fold on the final norm only, which the roadmap predicts costs ~2x perplexity.
     It exists so the gate is shown to detect the thing it is for."""
@@ -162,8 +164,8 @@ def braid_perplexity(corpus: Corpus, model_dir: Path = DEFAULT_MODEL_DIR,
     ck = load_checkpoint(model_dir, device="cuda", dtype=dtype)
     if drop_final_norm_offset:
         ck.tensors["norm"] = ck.tensors["norm"] - 1.0
-    eng = Engine.from_checkpoint(ck, device="cuda", dtype=dtype,
-                                 quant_mlp=quant_mlp)
+    eng = Engine.from_checkpoint(ck, device="cuda", dtype=dtype, quant=quant)
+    del ck
     res = perplexity(lambda ids: eng.hidden_states(ids, cache=None, last_only=False),
                      eng.lm_head, corpus, window=window, progress=progress)
     return res, eng
@@ -241,8 +243,11 @@ def main() -> None:
     p.add_argument("--model-dir", type=Path, default=DEFAULT_MODEL_DIR)
     p.add_argument("--ablate-final-norm", action="store_true",
                    help="also run braid with the final norm's 1+W offset removed")
+    p.add_argument("--quant", default="",
+                   help=f"also run braid with FP8 W8A8 on these groups: "
+                        f"{','.join(GROUPS)}, or 'all'")
     p.add_argument("--quant-mlp", action="store_true",
-                   help="also run braid with FP8 W8A8 on the MLP projections")
+                   help="shorthand for --quant mlp")
     p.add_argument("--skip-hf", action="store_true",
                    help="skip the HF arm (it is the slow one and does not move)")
     args = p.parse_args()
@@ -272,15 +277,16 @@ def main() -> None:
         print(f"\n  braid {br_res.perplexity:.4f} vs HF {hf_res.perplexity:.4f}  "
               f"-> {delta * 100:.4f}% (gate: within 20%)")
 
-    if args.quant_mlp:
+    quant = "mlp" if args.quant_mlp else args.quant
+    if quant:
         # The comparison that matters is against braid-bf16 on the SAME corpus
         # and window, not against HF: this isolates what fp8 costs from what
         # braid already differs by.
         q, eng3 = braid_perplexity(corpus, args.model_dir, window=args.window,
-                                   progress=True, quant_mlp=True)
-        n_q = sum(1 for l in eng3.layers if l.mlp.quantized)
+                                   progress=True, quant=quant)
         rel = (q.perplexity - br_res.perplexity) / br_res.perplexity
-        print(f"\n  FP8 W8A8 on MLP ({n_q}/{len(eng3.layers)} layers quantized)")
+        print(f"\n  FP8 W8A8, groups {sorted(parse_groups(quant))}")
+        print(eng3.quant_report())
         print(f"    braid bf16 {br_res.perplexity:.4f} -> fp8 {q.perplexity:.4f}"
               f"   {rel * 100:+.2f}%")
         del eng3

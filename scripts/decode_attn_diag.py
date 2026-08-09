@@ -15,8 +15,6 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from braid.model.attention import grouped_decode_attention
-
 B, H, KVH, D, L = 3, 16, 4, 256, 96
 G, SCALE = H // KVH, D ** -0.5
 
