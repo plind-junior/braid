@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 import torch
+from conftest import assert_greedy
 
 from braid.model.engine import Engine
 from braid.model.graph import GraphedDecoder
@@ -124,7 +125,14 @@ def test_a_short_kv_bucket_gives_the_same_logits_as_the_full_one(engine):
     short = engine.decode_step(tokens, view, kv_len=16)
     cache.restore(snap)
     torch.testing.assert_close(short, full, rtol=2e-2, atol=2e-2)
-    assert torch.equal(short.argmax(-1), full.argmax(-1))
+    # **Not `torch.equal(argmax)`.** This module is bf16 and the two arms reduce
+    # over different numbers of keys, which is why the line above tolerates
+    # 2e-2 — and a 2e-2 logit move is the same order as a bf16 top-2 gap, which
+    # was measured as low as 0.0625 on this model. Asserting exact argmax under
+    # a 2e-2 tolerance is asserting that no near-tie ever occurs, which is a
+    # statement about the prompt rather than about `kv_len`. See
+    # `conftest.assert_greedy`.
+    assert_greedy(short, full, "kv_len=16 vs full")
 
 
 def test_a_kv_len_the_cache_cannot_hold_is_refused(engine):

@@ -179,3 +179,54 @@ def _reclaim_between_modules():
     if torch.cuda.is_available():
         gc.collect()
         torch.cuda.empty_cache()
+
+
+def assert_greedy(mine, ref, what):
+    """Greedy tokens must agree **wherever the arithmetic can resolve the choice**.
+
+    A flat `torch.equal(argmax)` is not a well-posed gate on a low-precision arm,
+    and this suite asserted it in two places before anyone checked. Both were
+    measured, and both were measuring reduction order rather than the model:
+
+      * `test_decode_matches_prefill` (Qwen3.5-9B, bf16): at position 1 the top
+        two logits are tokens 847 and 11 and they are **the same bf16 number** —
+        top-2 gap exactly 0.00000. Reading the same hidden states through an fp32
+        head resolves the gap to 0.019 and both arms then agree everywhere.
+      * `test_graphed_scheduler_matches_the_eager_one` (same model): the eager
+        and graphed schedulers run the partial batch at B=3 and B=4, and the
+        measured logit residual between them is 0.06-0.19 while the top-2 gap
+        goes as low as 0.0625. It flipped when a *more accurate* prefill landed.
+
+    The rule this encodes: a difference is a defect only where the two arms could
+    tell the two tokens apart. `gap > residual` means resolvable, so a difference
+    there is real. `gap <= residual` means the arithmetic never distinguished
+    them, and the position is reported rather than asserted on.
+
+    This keeps everything the flat assertion caught — a miswired layer moves
+    logits by ~1e-1, hundreds of times the residual, and lands on positions with
+    ordinary gaps — and drops only the part that was measuring tie-breaks.
+
+    `mine` and `ref` are `[..., vocab]`; leading dims are flattened, so this
+    takes `[T, V]` prefill logits and `[B, V]` decode logits alike. Returns the
+    number of unresolvable positions, so a caller can assert the gate is not
+    vacuous if it wants to.
+    """
+    m = mine.reshape(-1, mine.shape[-1]).float()
+    r = ref.reshape(-1, ref.shape[-1]).float()
+    top2 = r.topk(2, dim=-1).values
+    gap = top2[:, 0] - top2[:, 1]
+    resid = (m - r).abs().amax(dim=-1)
+    differ = m.argmax(-1) != r.argmax(-1)
+    hard = differ & (gap > resid)
+    soft = differ & ~hard
+
+    if bool(soft.any()):
+        p = soft.nonzero().flatten().tolist()
+        print(f"\n  {what}: {len(p)} unresolvable position(s) {p} — top-2 gap "
+              f"{[round(g, 5) for g in gap[p].tolist()]} within residual "
+              f"{[round(x, 5) for x in resid[p].tolist()]}")
+    assert not bool(hard.any()), (
+        f"{what}: greedy tokens differ at resolvable position(s) "
+        f"{hard.nonzero().flatten().tolist()} — gap "
+        f"{gap[hard].tolist()} exceeds residual {resid[hard].tolist()}")
+    return int(soft.sum())

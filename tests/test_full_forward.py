@@ -30,7 +30,7 @@ from pathlib import Path
 
 import pytest
 import torch
-from conftest import cuda_reclaim, weight_bytes
+from conftest import assert_greedy, cuda_reclaim, weight_bytes
 
 from braid.model.config import ModelConfig
 from braid.model.engine import Engine
@@ -65,47 +65,10 @@ def _assert_parity(mine, ref, what, rel_max=REL_L2_MAX, cos_min=COSINE_MIN):
     return r, c
 
 
-def _assert_greedy(mine, ref, what):
-    """Greedy tokens must agree **wherever bf16 can resolve the choice**.
-
-    A flat `torch.equal(argmax)` is not a well-posed gate on a bf16 arm and this
-    suite was asserting it anyway. Measured on Qwen3.5-9B, `test_decode_matches_
-    prefill`: at position 1 the top two logits are tokens 847 and 11 and they are
-    **the same bf16 number** — top-2 gap exactly 0.00000. `argmax` then breaks
-    the tie by reduction order, which differs between a T=8 call and eight T=1
-    calls, so the two arms report different tokens for a choice neither of them
-    actually made. Reading the *same* hidden states out through an fp32 head
-    resolves the gap to 0.019 and both arms agree at every position.
-
-    So the gate compares each position's disagreement against what the arms can
-    tell apart there: the reference's own top-2 gap versus the largest
-    elementwise residual between the arms. `gap > residual` means the choice was
-    resolvable and a difference is a real defect. `gap <= residual` means the
-    arithmetic never distinguished the two tokens, and the position is reported
-    rather than asserted on.
-
-    This keeps everything the old assertion caught — a miswired layer moves
-    logits by ~1e-1, hundreds of times the residual, and lands on positions with
-    ordinary gaps — and drops only the part that was measuring tie-breaks.
-    """
-    m, r = mine[0].float(), ref[0].float()
-    top2 = r.topk(2, dim=-1).values
-    gap = top2[:, 0] - top2[:, 1]                        # [T]
-    resid = (m - r).abs().amax(dim=-1)                   # [T]
-    differ = m.argmax(-1) != r.argmax(-1)
-    hard = differ & (gap > resid)
-    soft = differ & ~hard
-
-    if bool(soft.any()):
-        p = soft.nonzero().flatten().tolist()
-        print(f"\n  {what}: {len(p)} unresolvable position(s) {p} — "
-              f"top-2 gap {[round(g, 5) for g in gap[p].tolist()]} within residual "
-              f"{[round(x, 5) for x in resid[p].tolist()]}")
-    assert not bool(hard.any()), (
-        f"{what}: greedy tokens differ at resolvable position(s) "
-        f"{hard.nonzero().flatten().tolist()} — gap "
-        f"{gap[hard].tolist()} exceeds residual {resid[hard].tolist()}")
-    return int(soft.sum())
+# `_assert_greedy` moved to `conftest.assert_greedy` once a second module
+# needed it (`test_graph_decode`, the kv_len arm). The reasoning is long and
+# load-bearing enough that two copies of it would drift.
+_assert_greedy = assert_greedy
 
 
 @pytest.fixture(scope="module")
