@@ -147,16 +147,23 @@ struct RawGates {
 // (.claude/skills/sm120-cuda-expert/references/known-issues.md:55). The min-1
 // form is also what lets ptxas give each thread the ~128 registers S_reg needs
 // without spilling it to local memory.
+// `q_row` / `k_row` / `v_row` are the stride between batch rows, in ELEMENTS.
+// Dense inputs pass G*SS / H*HD; the decode path passes the row stride of the
+// conv output so that q, k and v can be COLUMN SLICES of the [B, C] conv
+// buffer rather than three `.contiguous()` copies of it — 72 copy launches per
+// step at B>1 whose only job was to satisfy a contiguity check. The last two
+// dims must still be dense; only the batch stride is free.
 template <typename ST, typename GS, int SS, int HD>
 __global__ void __launch_bounds__(HD, 1) gdn_decode_kernel(
     ST* __restrict__ pool,             // [S_max, H, SS, HD], fp32 / fp16 / bf16
     const int* __restrict__ slot_idx,  // [B]
-    const float* __restrict__ q,       // [B, G, SS]
-    const float* __restrict__ k,       // [B, G, SS]
-    const float* __restrict__ v,       // [B, H, HD]
+    const float* __restrict__ q,       // [B, G, SS], row stride q_row
+    const float* __restrict__ k,       // [B, G, SS], row stride k_row
+    const float* __restrict__ v,       // [B, H, HD], row stride v_row
     GS gates,                          // alpha/beta, loaded or computed -- see above
-    float* __restrict__ y,             // [B, H, HD]
-    int H, int G) {
+    float* __restrict__ y,             // [B, H, HD], dense
+    int H, int G,
+    long q_row, long k_row, long v_row) {
   const int b = blockIdx.x;
   const int h = blockIdx.y;
   const int d = threadIdx.x;
@@ -182,8 +189,8 @@ __global__ void __launch_bounds__(HD, 1) gdn_decode_kernel(
   // thread reads s_reduce[0] and immediately writes s_reduce[d] with no
   // barrier between (gdn.cu:129-131 and three sibling sites). Two arrays cost
   // 512 extra bytes of shared memory and remove the hazard entirely.
-  const float* q_in = q + (size_t)b * G * SS + (size_t)g * SS;
-  const float* k_in = k + (size_t)b * G * SS + (size_t)g * SS;
+  const float* q_in = q + (size_t)b * q_row + (size_t)g * SS;
+  const float* k_in = k + (size_t)b * k_row + (size_t)g * SS;
 
   __shared__ float red_q[HD];
   __shared__ float red_k[HD];
@@ -242,7 +249,7 @@ __global__ void __launch_bounds__(HD, 1) gdn_decode_kernel(
   float kv = 0.f;
 #pragma unroll
   for (int s = 0; s < SS; ++s) kv += S_reg[s] * k_hat[s];
-  const float delta = (v[((size_t)b * H + h) * HD + d] - a * kv) * bt;
+  const float delta = (v[(size_t)b * v_row + (size_t)h * HD + d] - a * kv) * bt;
 
   // State update and y accumulation share ONE loop, as the reference engine
   // does (gdn.cu:148-174). Splitting into "update then read" changes the fp32
@@ -289,6 +296,20 @@ static void validate_slots(const torch::Tensor& slot_idx, int64_t n_slots, cudaS
   }
 }
 
+// A [B, G, SS]-shaped operand whose batch rows may live anywhere (a column
+// slice of the conv output has row stride C, not G*SS) but whose inner two
+// dims must be dense. Returns the row stride in elements. A dense tensor
+// passes trivially with stride(0) == inner.
+static int64_t row_stride_3d(const torch::Tensor& t, const char* name) {
+  TORCH_CHECK(t.is_cuda() && t.scalar_type() == torch::kFloat32, name, " must be cuda fp32");
+  TORCH_CHECK(t.dim() == 3, name, " must be 3-d");
+  TORCH_CHECK(t.stride(2) == 1 && t.stride(1) == t.size(2),
+              name, " must be dense in its last two dims (only the batch "
+              "stride may differ; got strides ", t.strides(), ")");
+  TORCH_CHECK(t.stride(0) >= t.size(1) * t.size(2), name, " rows overlap");
+  return t.stride(0);
+}
+
 void gdn_decode(torch::Tensor pool, torch::Tensor slot_idx, torch::Tensor q, torch::Tensor k,
                 torch::Tensor v, torch::Tensor alpha, torch::Tensor beta, torch::Tensor y) {
   TORCH_CHECK(pool.is_cuda(), "pool must be cuda");
@@ -297,10 +318,13 @@ void gdn_decode(torch::Tensor pool, torch::Tensor slot_idx, torch::Tensor q, tor
               "state pool must be fp32, fp16 or bf16");
   TORCH_CHECK(slot_idx.scalar_type() == torch::kInt32, "slot_idx must be int32");
   TORCH_CHECK(pool.is_contiguous(), "pool must be contiguous");
-  for (const auto& t : {q, k, v, alpha, beta, y}) {
+  for (const auto& t : {alpha, beta, y}) {
     TORCH_CHECK(t.is_cuda() && t.scalar_type() == torch::kFloat32 && t.is_contiguous(),
-                "all operands must be contiguous cuda fp32");
+                "alpha/beta/y must be contiguous cuda fp32");
   }
+  const int64_t q_row = row_stride_3d(q, "q");
+  const int64_t k_row = row_stride_3d(k, "k");
+  const int64_t v_row = row_stride_3d(v, "v");
 
   const int B = q.size(0), G = q.size(1), SS = q.size(2);
   const int H = v.size(1), HD = v.size(2);
@@ -321,7 +345,7 @@ void gdn_decode(torch::Tensor pool, torch::Tensor slot_idx, torch::Tensor q, tor
 #define BRAID_LAUNCH_GDN(ST, PTR)                                                              \
   gdn_decode_kernel<ST, PrecomputedGates, 128, 128><<<grid, HD, smem, stream>>>(               \
       PTR, slot_idx.data_ptr<int>(), q.data_ptr<float>(), k.data_ptr<float>(),                 \
-      v.data_ptr<float>(), gates, y.data_ptr<float>(), H, G)
+      v.data_ptr<float>(), gates, y.data_ptr<float>(), H, G, q_row, k_row, v_row)
 
   if (st == torch::kFloat32) {
     BRAID_LAUNCH_GDN(float, pool.data_ptr<float>());
@@ -350,10 +374,11 @@ void gdn_decode_raw(torch::Tensor pool, torch::Tensor slot_idx, torch::Tensor q,
               "state pool must be fp32, fp16 or bf16");
   TORCH_CHECK(slot_idx.scalar_type() == torch::kInt32, "slot_idx must be int32");
   TORCH_CHECK(pool.is_contiguous(), "pool must be contiguous");
-  for (const auto& t : {q, k, v, y}) {
-    TORCH_CHECK(t.is_cuda() && t.scalar_type() == torch::kFloat32 && t.is_contiguous(),
-                "q/k/v/y must be contiguous cuda fp32");
-  }
+  TORCH_CHECK(y.is_cuda() && y.scalar_type() == torch::kFloat32 && y.is_contiguous(),
+              "y must be contiguous cuda fp32");
+  const int64_t q_row = row_stride_3d(q, "q");
+  const int64_t k_row = row_stride_3d(k, "k");
+  const int64_t v_row = row_stride_3d(v, "v");
   const auto at = a_raw.scalar_type();
   TORCH_CHECK(at == torch::kFloat32 || at == torch::kBFloat16,
               "a_raw/b_raw must be fp32 or bf16 (the activation dtypes braid runs)");
@@ -391,7 +416,7 @@ void gdn_decode_raw(torch::Tensor pool, torch::Tensor slot_idx, torch::Tensor q,
       v.data_ptr<float>(),                                                                     \
       RawGates<AT>{APTR, BPTR, A.data_ptr<float>(), dt_bias.data_ptr<float>(),                 \
                    /*seq_lens=*/nullptr},                                                      \
-      y.data_ptr<float>(), H, G)
+      y.data_ptr<float>(), H, G, q_row, k_row, v_row)
 
 #define BRAID_GDN_RAW_ACT(ST, PTR)                                                             \
   if (at == torch::kFloat32) {                                                                 \

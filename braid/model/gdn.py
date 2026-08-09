@@ -123,16 +123,30 @@ class GatedDeltaNet:
         B = qkv_proj.shape[0]
         mod = self._mod
 
-        qkv = qkv_proj[:, 0].float().contiguous()                        # [B, C]
-        conv_out = torch.empty_like(qkv)
-        mod.conv1d_decode(cache.conv, slots_i32, qkv,
+        # The conv kernel widens the activation dtype internally, so the [B, C]
+        # projection goes in as the bf16 (or fp32) view it already is — the
+        # `.float().contiguous()` that used to sit here was a full-tensor cast
+        # kernel, 24 launches per step feeding a kernel that could read bf16.
+        # bf16 -> fp32 widening is exact, so this is a launch-count change and
+        # not a numerics one.
+        qkv = qkv_proj[:, 0]                                             # [B, C]
+        conv_out = torch.empty(qkv.shape, device=qkv.device, dtype=torch.float32)
+        mod.conv1d_decode(cache.conv, slots_i32, qkv.contiguous(),
                           self.conv1d_f32, self.conv_bias_f32, conv_out)
 
+        # Column slices of the conv output, NOT copies — and that was checked
+        # both ways before it was trusted. A cross-session comparison first
+        # read the views as −2% at B=64/128, so a same-session A/B was run
+        # (3 processes per arm, B=8 as the shared-code control agreeing to
+        # 0.1%): the views BEAT dense `.contiguous()` copies by ~1% at
+        # B=64/128 and tie below, and the −2% was session drift wearing a
+        # regression's clothes. So the views stay, everywhere: fewer launches,
+        # no duplicated bytes, bit-identical by test (test_copy_kill.py).
         key_dim = g.n_groups * g.state_size
         q, k, v = torch.split(conv_out, [key_dim, key_dim, g.inner_size], dim=-1)
-        q = q.reshape(B, g.n_groups, g.state_size).contiguous()
-        k = k.reshape(B, g.n_groups, g.state_size).contiguous()
-        v = v.reshape(B, g.n_heads, g.head_dim).contiguous()
+        q = q.unflatten(-1, (g.n_groups, g.state_size))
+        k = k.unflatten(-1, (g.n_groups, g.state_size))
+        v = v.unflatten(-1, (g.n_heads, g.head_dim))
 
         y = torch.empty(B, g.n_heads, g.head_dim, device=qkv.device,
                         dtype=torch.float32)
