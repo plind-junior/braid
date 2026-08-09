@@ -28,9 +28,9 @@ from __future__ import annotations
 import hashlib
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
 
 import torch
 
@@ -207,7 +207,21 @@ def hf_perplexity(corpus: Corpus, model_dir: Path = DEFAULT_MODEL_DIR,
     model.rotary_emb = hf.Qwen3_5TextRotaryEmbedding(tcfg, device="cuda")
     model.eval()
 
-    lm_head = sd["embed_tokens.weight"]  # tie_word_embeddings
+    # The head is tied on Qwen3.5-4B and **not** on Qwen3.5-9B / Qwen3.6-27B,
+    # where it ships as a top-level `lm_head.weight` outside the text tower —
+    # so the `model.language_model.` filter above never collects it. Reading
+    # `embed_tokens` unconditionally is right for the tied case and a *fluent*
+    # disaster on an untied one: it decodes through the input embedding matrix,
+    # which is a real matrix of the right shape and utter nonsense as a head.
+    # Measured on the 9B before this branch existed: reference perplexity
+    # **931,600** against braid's 7.13 — which presents as braid being broken,
+    # when the reference was.
+    if tcfg.tie_word_embeddings:
+        lm_head = sd["embed_tokens.weight"]
+    else:
+        with safe_open(Path(model_dir) / wm["lm_head.weight"], framework="pt") as f:
+            t = f.get_tensor("lm_head.weight")
+        lm_head = t.to("cuda", torch.float32 if t.dtype == torch.float32 else dtype)
 
     @torch.no_grad()
     def hidden_fn(ids):

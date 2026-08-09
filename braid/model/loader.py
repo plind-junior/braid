@@ -1,12 +1,20 @@
 """Load the HF safetensors checkpoint into braid's flat tensor namespace.
 
-The published Qwen3.5-4B is a vision-language checkpoint: **738 tensors, of
-which braid runs 426.** The other 312 are a 24-block visual tower (297) and a
-multi-token-prediction head (15). Both are absent from the GGUF llama.cpp runs,
-so a loader that walks the index naively does not merely waste VRAM — it makes
-the head-to-head compare two different models. `load_checkpoint` therefore
-*filters by prefix and reports what it dropped*, rather than loading whatever it
-finds.
+**Every published member of this family is a vision-language checkpoint**, and
+braid runs the text tower only. On Qwen3.5-4B that is **738 tensors of which
+braid runs 426** — the other 312 being a 24-block visual tower (297) and a
+multi-token-prediction head (15). On Qwen3.5-9B it is **775 of which braid runs
+427**, the filter dropping 333 visual and 15 MTP — the extra text tensor over
+the 4B being the untied `lm_head`. Both towers are absent from the GGUF
+llama.cpp runs, so a loader that walks the index naively does not merely waste
+VRAM — it makes the head-to-head compare two different models. `load_checkpoint`
+therefore *filters by prefix and reports what it dropped*, rather than loading
+whatever it finds.
+
+The counts differ per checkpoint and are deliberately not asserted; what is
+asserted is that **no tensor falls outside the known prefixes**. An unrecognised
+key raises rather than being silently dropped, which is how the untied `lm_head`
+below was caught rather than quietly discarded.
 
 Four load-time transforms, each silently wrong if missed:
 
@@ -19,7 +27,11 @@ Four load-time transforms, each silently wrong if missed:
      (Settled empirically in `tests/test_hf_parity.py`, not read off the
      reference engine's source.)
   3. `conv1d.weight` is `[C, 1, K]`; the kernel wants `[C, K]`.
-  4. `tie_word_embeddings` — there is no `lm_head` tensor in this file at all.
+  4. `tie_word_embeddings` — on the 4B there is no `lm_head` tensor in the file
+     at all and it is synthesised from `embed_tokens`. On the untied members of
+     the family (Qwen3.5-9B, Qwen3.6-27B) it *is* shipped, at the **top level**
+     rather than under the text tower. Both land in the same flat `lm_head`
+     slot, so nothing downstream branches on it.
 
 The NVFP4-specific transforms in ROADMAP Phase 2 item 1 (llm-compressor suffix
 renames, the `tensor_scale = 1/weight_global_scale` reciprocal-direction trap)
@@ -29,9 +41,9 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
 
 import torch
 from safetensors import safe_open
@@ -41,6 +53,11 @@ from braid.model.config import ModelConfig
 TEXT_PREFIX = "model.language_model."
 VISUAL_PREFIX = "model.visual."
 MTP_PREFIX = "mtp."
+# The untied LM head sits at the TOP level, not under the text tower, because
+# `Qwen3_5ForConditionalGeneration` owns it rather than the language model does.
+# Qwen3.5-4B is tied and ships no such tensor; Qwen3.5-9B and Qwen3.6-27B are
+# untied and ship it here.
+LM_HEAD_PREFIX = "lm_head."
 
 # Norms whose stored weight is a DELTA. `linear_attn.norm` is deliberately
 # absent: it is `Qwen3_5RMSNormGated` and stores gamma directly.
@@ -116,9 +133,15 @@ def braid_name(hf_key: str) -> str | None:
     """HF key -> braid flat name. `None` means "not part of the text tower"."""
     if hf_key.startswith((VISUAL_PREFIX, MTP_PREFIX)):
         return None
-    if not hf_key.startswith(TEXT_PREFIX):
+    if hf_key.startswith(LM_HEAD_PREFIX):
+        # Kept flat rather than folded into the text namespace: the tied case
+        # synthesises `lm_head` from `embed_tokens` under exactly this name, so
+        # both paths land in the same slot and `Engine` needs no branch.
+        name = hf_key
+    elif hf_key.startswith(TEXT_PREFIX):
+        name = hf_key[len(TEXT_PREFIX):]
+    else:
         return None
-    name = hf_key[len(TEXT_PREFIX):]
     # `A_log` and `dt_bias` are bare parameters; everything else is `<mod>.weight`.
     if name.endswith(".weight"):
         name = name[: -len(".weight")]
@@ -227,7 +250,10 @@ def load_checkpoint(
         if m is not None:
             if want_layers is not None and int(m.group(1)) not in want_layers:
                 continue
-        elif not include_embeddings and name in ("embed_tokens",):
+        elif not include_embeddings and name in ("embed_tokens", "lm_head"):
+            # `lm_head` is embedding-sized (1.0 GB untied at 9B), so the
+            # single-layer parity tests must skip it for the same reason they
+            # skip `embed_tokens` — they never apply it.
             continue
         per_file.setdefault(shard, []).append((hf_key, name))
 
@@ -308,3 +334,9 @@ def _validate(cfg: ModelConfig, tensors: dict[str, torch.Tensor], layers: list[i
     if "embed_tokens" in tensors:
         if tuple(tensors["embed_tokens"].shape) != (cfg.vocab_size, h):
             raise ValueError(f"embed_tokens: {tuple(tensors['embed_tokens'].shape)}")
+    # Checked separately rather than folded above: when untied this is a
+    # distinct tensor and nothing else would catch it being the wrong one.
+    if "lm_head" in tensors:
+        if tuple(tensors["lm_head"].shape) != (cfg.vocab_size, h):
+            raise ValueError(f"lm_head: {tuple(tensors['lm_head'].shape)}, "
+                             f"config predicts {(cfg.vocab_size, h)}")

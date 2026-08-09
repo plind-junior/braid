@@ -35,9 +35,7 @@ from pathlib import Path
 
 import pytest
 import torch
-
-from braid.model.engine import Engine
-from braid.model.loader import load_checkpoint
+from conftest import fp32_engine
 
 MODEL_DIR = Path(os.environ.get("BRAID_MODEL_DIR", "/root/models/Qwen3.5-4B"))
 
@@ -51,8 +49,7 @@ MAX_LEN, MAX_SLOTS = 96, 8
 
 @pytest.fixture(scope="module")
 def engine():
-    ck = load_checkpoint(MODEL_DIR, device="cuda", dtype=torch.float32)
-    return Engine.from_checkpoint(ck, device="cuda", dtype=torch.float32)
+    return fp32_engine(MODEL_DIR)
 
 
 def _fresh(engine):

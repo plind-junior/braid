@@ -42,7 +42,9 @@ from pathlib import Path
 
 import pytest
 import torch
+from conftest import cuda_reclaim, fp32_engine, weight_bytes
 
+from braid.model.config import ModelConfig
 from braid.model.engine import Engine
 from braid.model.loader import load_checkpoint
 
@@ -106,14 +108,15 @@ def _report(batched, sequential, n) -> str:
 
 @pytest.fixture(scope="module")
 def engine_fp32():
-    ck = load_checkpoint(MODEL_DIR, device="cuda", dtype=torch.float32)
-    eng = Engine.from_checkpoint(ck, device="cuda", dtype=torch.float32)
+    # This module also holds a module-scoped *bf16* engine for the
+    # teacher-forced tripwires, and pytest keeps both alive until the module
+    # ends. Sizing the fp32 stack against an empty card is what OOMed at 9B.
+    cfg = ModelConfig.from_pretrained(MODEL_DIR)
+    reserve = weight_bytes(cfg, itemsize=2) / 2 ** 30
+    eng = fp32_engine(MODEL_DIR, reserve_gib=reserve)
     yield eng
-    del eng, ck
-    import gc
-
-    gc.collect()
-    torch.cuda.empty_cache()
+    del eng
+    cuda_reclaim()
 
 
 @pytest.mark.parametrize("batch", [2, 4, 8])

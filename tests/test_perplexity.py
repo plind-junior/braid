@@ -1,7 +1,12 @@
 """The Phase 2 perplexity gate: braid within 20% of an HF reference.
 
-Marked `slow` — it loads two 4B models in sequence and needs the corpus, which
-is downloaded once and cached. Deselect with `-m 'not slow'`.
+Marked `slow` — it loads two copies of the model in sequence and needs the
+corpus, which is downloaded once and cached. Deselect with `-m 'not slow'`.
+
+**Perplexity is a property of the checkpoint, not of braid**, so the absolute
+values are recorded per target rather than pinned once. The *gate* — braid
+within 20% of the reference, and the ablation outside it — is target-independent
+and is what actually protects the engine.
 
 Numbers and method live in `docs/runbooks/perplexity.md`.
 """
@@ -28,8 +33,21 @@ CORPUS_SHA256 = "e5ab1f058d3dfc4cf63a1220da79116a7e2ecc5c1f60eb9ed6f968d04091554
 N_TOKENS, WINDOW = 16384, 2048
 
 GATE = 0.20          # ROADMAP Phase 2: PPL within 20% of the reference
-BRAID_PPL = 8.2376   # measured; see the runbook
-HF_PPL = 8.2393
+
+# Measured per checkpoint; see the runbook. `max_weight_gib` is the Phase 2 VRAM
+# budget for that target, not a universal constant.
+EXPECTED = {
+    "Qwen3.5-4B": {"braid": 8.2376, "hf": 8.2393, "max_weight_gib": 9.0},
+    "Qwen3.5-9B": {"braid": 7.1272, "hf": 7.1312, "max_weight_gib": 19.0},
+}
+
+
+def _expected():
+    name = MODEL_DIR.name
+    if name not in EXPECTED:
+        pytest.skip(f"no recorded perplexity for {name}; add one to EXPECTED "
+                    f"after measuring it, rather than loosening the gate")
+    return EXPECTED[name]
 
 
 @pytest.fixture(scope="module")
@@ -84,17 +102,21 @@ def test_absolute_perplexity_is_recorded(measured):
     load-time transform regressed on both sides.
     """
     br, hf, _ = measured
-    assert br.perplexity == pytest.approx(BRAID_PPL, rel=1e-3), (
-        f"braid perplexity moved: {br.perplexity:.4f} vs recorded {BRAID_PPL}")
-    assert hf.perplexity == pytest.approx(HF_PPL, rel=1e-3)
+    want = _expected()
+    assert br.perplexity == pytest.approx(want["braid"], rel=1e-3), (
+        f"braid perplexity moved: {br.perplexity:.4f} vs recorded {want['braid']}")
+    assert hf.perplexity == pytest.approx(want["hf"], rel=1e-3), (
+        f"reference perplexity moved: {hf.perplexity:.4f} vs recorded {want['hf']}")
 
 
 def test_peak_vram_under_the_phase2_budget(measured):
     """Rescoped Phase 2 budget is 12 GiB, against the 35B's original 30 GiB."""
     _, _, weights = measured
+    budget = _expected()["max_weight_gib"]
     peak = torch.cuda.max_memory_allocated() / 2 ** 30
-    print(f"\n  weights {weights / 2 ** 30:.2f} GiB, peak {peak:.2f} GiB")
-    assert weights / 2 ** 30 < 9.0
+    print(f"\n  weights {weights / 2 ** 30:.2f} GiB, peak {peak:.2f} GiB, "
+          f"budget {budget} GiB")
+    assert weights / 2 ** 30 < budget
 
 
 def test_dropping_the_final_norm_offset_is_caught_by_the_gate(corpus, measured):
@@ -115,6 +137,10 @@ def test_dropping_the_final_norm_offset_is_caught_by_the_gate(corpus, measured):
     gc.collect()
     torch.cuda.empty_cache()
 
+    # Against the *reference*, which is the arm the gate is written against. If
+    # the reference itself is broken this ratio collapses toward zero rather
+    # than exceeding the gate — which is how the untied-lm_head bug in
+    # `hf_perplexity` announced itself.
     ratio = ab.perplexity / hf.perplexity
     print(f"\n  ablation (no 1+W on final norm): {ab.perplexity:.4f} = {ratio:.2f}x")
     assert ratio > 1 + GATE, (

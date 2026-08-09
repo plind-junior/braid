@@ -28,9 +28,8 @@ from pathlib import Path
 
 import pytest
 import torch
+from conftest import fp32_engine
 
-from braid.model.engine import Engine
-from braid.model.loader import load_checkpoint
 from braid.serve.scheduler import Request, Scheduler
 
 MODEL_DIR = Path(os.environ.get("BRAID_MODEL_DIR", "/root/models/Qwen3.5-4B"))
@@ -45,8 +44,7 @@ MAX_LEN = 128
 
 @pytest.fixture(scope="module")
 def engine_f32():
-    ck = load_checkpoint(MODEL_DIR, device="cuda", dtype=torch.float32)
-    return Engine.from_checkpoint(ck, device="cuda", dtype=torch.float32)
+    return fp32_engine(MODEL_DIR)
 
 
 def _prompts(n, lo=6, hi=14, seed=41):

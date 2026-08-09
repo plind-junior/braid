@@ -7,6 +7,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -14,7 +15,7 @@ import torch
 
 from braid.config import GDNConfig
 from braid.model.config import ModelConfig
-from braid.model.loader import MTP_PREFIX, VISUAL_PREFIX, braid_name
+from braid.model.loader import LM_HEAD_PREFIX, MTP_PREFIX, VISUAL_PREFIX, braid_name
 
 MODEL_DIR = Path(os.environ.get("BRAID_MODEL_DIR", "/root/models/Qwen3.5-4B"))
 needs_ckpt = pytest.mark.skipif(not MODEL_DIR.exists(), reason=f"no checkpoint at {MODEL_DIR}")
@@ -93,12 +94,50 @@ def test_name_mapping_filters_the_non_text_towers():
             == "layers.3.self_attn.q_proj")
 
 
+def test_the_untied_lm_head_is_found_outside_the_text_tower():
+    """`lm_head.weight` sits at the TOP level, not under `model.language_model.`.
+
+    Qwen3.5-4B is tied and ships no such tensor, so this path never ran until
+    the 9B. It matters that the loader *recognises* the prefix rather than
+    merely tolerating it: an unrecognised key raises, and a key silently
+    dropped instead would give an untied model a random LM head — fluent
+    garbage, the failure mode this codebase keeps having to catch.
+
+    Both the tied and untied paths land in the same flat `lm_head` slot, so
+    nothing downstream branches on `tie_word_embeddings`.
+    """
+    assert braid_name(LM_HEAD_PREFIX + "weight") == "lm_head"
+    assert braid_name("lm_head.weight") == "lm_head"
+    # Still not a member of the text tower's namespace, and must not collide
+    # with a same-named tensor inside it.
+    assert braid_name("model.language_model.lm_head.weight") == "lm_head"
+
+
+def test_untied_config_parses_and_reports_untied():
+    """The 9B/27B shape: `tie_word_embeddings` false at the text level."""
+    raw = copy.deepcopy(MINIMAL)
+    raw["text_config"]["tie_word_embeddings"] = False
+    raw["text_config"]["hidden_size"] = 4096
+    raw["text_config"]["intermediate_size"] = 12288
+    cfg = ModelConfig.from_dict(raw)
+    assert cfg.tie_word_embeddings is False
+    assert cfg.hidden_size == 4096
+    # The GDN half is untouched by any of that -- the whole reason the 9B is a
+    # cheap retarget. `n_gdn_layers` is normalised away because MINIMAL is a
+    # 4-layer stub; the real 32-layer equality is asserted against the
+    # checkpoint on disk in test_checkpoint_config_matches_the_pinned_gdn_shapes.
+    assert (replace(cfg.gdn, n_gdn_layers=24)
+            == GDNConfig.qwen35_4b() == GDNConfig.qwen35_9b())
+
+
 # --- against the real checkpoint ------------------------------------------------
 
 @needs_ckpt
 def test_checkpoint_config_matches_the_pinned_gdn_shapes():
     cfg = ModelConfig.from_pretrained(MODEL_DIR)
-    assert cfg.gdn == GDNConfig.qwen35_4b(), (
+    # 4B and 9B are GDN-identical, so one assertion covers both targets; if it
+    # ever fails, `braid/config.py` has drifted from the checkpoint on disk.
+    assert cfg.gdn == GDNConfig.qwen35_4b() == GDNConfig.qwen35_9b(), (
         f"braid/config.py's pinned shapes drifted from the checkpoint: "
         f"{cfg.gdn} vs {GDNConfig.qwen35_4b()}"
     )
@@ -114,11 +153,17 @@ def test_loader_excludes_the_visual_tower_and_mtp_head():
 
     ck = load_checkpoint(MODEL_DIR, device="cpu", layers=(0, 3), include_embeddings=False)
     r = ck.report
-    assert r.total_in_index == 738
-    assert r.text == 426
-    assert r.visual_skipped == 297
-    assert r.mtp_skipped == 15
+
+    # Asserted as an ACCOUNTING IDENTITY, not as per-checkpoint constants. The
+    # counts differ across the family -- Qwen3.5-4B is 738 = 426 text + 297
+    # visual + 15 MTP, Qwen3.5-9B is 775 = 427 + 333 + 15 -- and pinning them
+    # makes the suite reject the next target for no reason. What must hold on
+    # every member is that nothing is unaccounted for.
     assert r.text + r.visual_skipped + r.mtp_skipped == r.total_in_index
+    assert r.unrecognised == (), f"unrecognised prefixes: {r.unrecognised}"
+    # Non-vacuous: this checkpoint really does carry both towers, so the filter
+    # is doing work rather than passing a file that never had them.
+    assert r.visual_skipped > 0 and r.mtp_skipped > 0
     assert not any("visual" in k or k.startswith("mtp") for k in ck.tensors)
 
 
@@ -194,14 +239,32 @@ def test_conv1d_is_squeezed_and_shapes_validate():
 
 @needs_ckpt
 @pytest.mark.slow
-def test_full_load_ties_lm_head():
-    """The whole text tower, once. ~8.8 GB — CPU, so it does not fight the GPU tests."""
+def test_full_load_resolves_the_lm_head_either_way():
+    """The whole text tower, once. CPU, so it does not fight the GPU tests.
+
+    Both resolutions land in the same flat `lm_head` slot and this asserts
+    whichever one the checkpoint calls for: Qwen3.5-4B is tied and has no such
+    tensor, so it is aliased onto `embed_tokens`; Qwen3.5-9B ships a real one at
+    the top level of the index. An untied checkpoint that silently aliased would
+    generate fluently from the wrong head, which is why the alias is asserted by
+    pointer identity rather than by shape.
+    """
     from braid.model.loader import load_checkpoint
 
     ck = load_checkpoint(MODEL_DIR, device="cpu")
-    assert ck.report.tied_lm_head
-    assert ck["lm_head"].data_ptr() == ck["embed_tokens"].data_ptr()
-    assert ck.report.layers_loaded == tuple(range(32))
-    # 426 text tensors, minus 24 A_log names that become A (same count), plus lm_head.
-    assert ck.report.loaded == 427
-    assert ck.report.a_log_transformed == 24
+    cfg, r = ck.config, ck.report
+    tied = cfg.tie_word_embeddings
+
+    assert r.tied_lm_head is tied
+    assert "lm_head" in ck.tensors
+    same = ck["lm_head"].data_ptr() == ck["embed_tokens"].data_ptr()
+    assert same is tied, (
+        "tied checkpoint must alias embed_tokens; untied must not"
+        if tied else "untied checkpoint aliased its lm_head onto embed_tokens")
+    assert tuple(ck["lm_head"].shape) == (cfg.vocab_size, cfg.hidden_size)
+
+    assert r.layers_loaded == tuple(range(cfg.num_hidden_layers))
+    assert r.a_log_transformed == len(cfg.gdn_layers)
+    # A_log -> A is a rename, so it does not change the count; the only tensor
+    # that appears beyond the filtered set is a synthesised tied head.
+    assert r.loaded == r.text + (1 if tied else 0)
