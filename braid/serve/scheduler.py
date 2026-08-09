@@ -173,6 +173,14 @@ class Scheduler:
         self.decoder = None
         if graphed:
             usable = buckets or tuple(b for b in DEFAULT_BUCKETS if b <= capacity)
+            # The ladder must COVER capacity, not merely fit under it. At an
+            # off-rung capacity (say 100) the filtered default tops out at 96,
+            # and the first tick where every slot decodes at once asks
+            # `bucket_for(100)` — a ValueError mid-serve, load-dependent, hours
+            # in. One extra graph captured at exactly `capacity` turns that
+            # crash into a rung.
+            if usable and usable[-1] < capacity:
+                usable = (*usable, capacity)
             self.decoder = GraphedDecoder(engine, self.cache, buckets=usable)
             for s in range(capacity + 1):
                 self.cache.reset_slot(s)

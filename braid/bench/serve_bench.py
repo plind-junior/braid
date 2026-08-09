@@ -184,8 +184,13 @@ def measure(engine: Engine, concurrency: int, n_requests: int, prompt_len: int,
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
     # Stops at 64, not 16. The old ceiling came from Phase 1 item 4's claim that
-    # c=32 neither fits nor pays; both halves were measured false, and B >= 32 is
-    # the only range where braid is ahead of llama.cpp at all.
+    # c=32 neither fits nor pays; both halves were measured false, and B >= 16 is
+    # the range where braid is ahead of llama.cpp at all.
+    #
+    # 96 and 128 are reachable now that `DEFAULT_BUCKETS` goes there, but they
+    # are not in the default list: they need an fp16 state pool to fit, so a
+    # default that included them would OOM every `--state-dtype fp32` run rather
+    # than reporting a smaller table. Ask for them explicitly.
     p.add_argument("--concurrency", type=int, nargs="+",
                    default=[1, 2, 4, 8, 16, 32, 64])
     p.add_argument("--requests-per-stream", type=int, default=2,

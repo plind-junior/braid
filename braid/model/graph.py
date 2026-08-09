@@ -38,7 +38,17 @@ from braid.model.engine import Engine
 #
 # Buckets are only ever *captured* up to `cache.max_slots`, so a small pool
 # still costs nothing; this widens what a large pool is allowed to use.
-DEFAULT_BUCKETS = (1, 2, 4, 8, 16, 32, 64)
+# Stops at 128, not 64. The decode sweep reaches B=128 on this card once the
+# state pool is fp16 (26.0 GiB peak, measured), and braid's margin over
+# llama.cpp is still widening there — +84% at B=64, +137% at B=128 — so a served
+# ceiling of 64 was leaving the best part of the curve unreachable through the
+# scheduler. Callers filter this by their own capacity (`b <= capacity`) — and
+# the Scheduler additionally appends an off-rung capacity as its own top rung,
+# because a filtered ladder that stops BELOW capacity is a mid-serve ValueError
+# the first time every slot decodes in one tick. The extra rungs cost nothing
+# to anyone serving fewer rows and no test captures a graph it did not already
+# capture.
+DEFAULT_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 96, 128)
 # `kv_len` is the second capture axis. A graph's shapes are fixed, so the KV
 # extent attention reads has to be a constant -- and pinning it to `max_len`
 # means every step reads the whole buffer however short the live sequences are:
