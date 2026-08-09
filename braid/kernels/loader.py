@@ -36,7 +36,7 @@ def load_gdn():
     return load(
         name="braid_gdn",
         sources=[str(_CSRC / "bindings.cpp"), str(_CSRC / "gdn_decode.cu"),
-                 str(_CSRC / "conv1d_decode.cu")],
+                 str(_CSRC / "conv1d_decode.cu"), str(_CSRC / "quant_act.cu")],
         # NO --use_fast_math: it turns rsqrtf into an approximation and breaks
         # fp32 parity against the oracle at the tolerances the tests assert.
         extra_cuda_cflags=flags,

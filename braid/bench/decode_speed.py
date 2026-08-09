@@ -97,6 +97,11 @@ def _time(fn, steps: int, reset) -> float:
 STATE_DTYPES = {"fp32": torch.float32, "fp16": torch.float16,
                 "bf16": torch.bfloat16}
 
+# Bench-process levers, applied per engine build in `_engine`. Module state
+# rather than parameters because `measure` builds engines at three sites and
+# threading two booleans through all of them obscures the actual measurement.
+_TUNE = {"fused_quant": True, "raw_gates": True}
+
 
 def _engine(use_kernels: bool, quant, state_dtype=torch.float32) -> Engine:
     """A fresh engine, with the source checkpoint dropped immediately.
@@ -116,6 +121,11 @@ def _engine(use_kernels: bool, quant, state_dtype=torch.float32) -> Engine:
                                  state_dtype=state_dtype)
     del ck
     torch.cuda.empty_cache()
+    if not _TUNE["fused_quant"]:
+        from braid.model.quant import warm_fused
+        warm_fused(False)
+    if not _TUNE["raw_gates"]:
+        eng.set_raw_gates(False)
     return eng
 
 
@@ -206,7 +216,21 @@ def main() -> None:
     p.add_argument("--prompt-len", type=int, default=PROMPT_LEN,
                    help="KV under each row before timing; match the competitor's "
                         "shape when producing a head-to-head number")
+    # Launch-count levers, off-switchable for attribution runs. Both are
+    # asserted bit-identical to their fallbacks, so an arm differs only in
+    # launch count — never in what it computes.
+    p.add_argument("--no-fused-quant", action="store_true",
+                   help="torch-spelling activation quantization")
+    p.add_argument("--no-raw-gates", action="store_true",
+                   help="alpha/beta computed in torch, not in-kernel")
     args = p.parse_args()
+
+    # Applied in `_engine`, NOT here: every arm rebuilds its engine, and
+    # `from_checkpoint` re-enables the fused path as part of construction, so a
+    # one-shot disable at startup would silently evaporate on the second arm —
+    # the flag would print "off" and measure "on".
+    _TUNE["fused_quant"] = not args.no_fused_quant
+    _TUNE["raw_gates"] = not args.no_raw_gates
 
     quant = "mlp" if args.quant_mlp else args.quant
     # Built once up front purely to state what the run actually quantized --

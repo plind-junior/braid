@@ -5,6 +5,7 @@
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
+#include <optional>
 #include <vector>
 
 // The state pool's STORAGE type. The recurrence itself is fp32 whatever this
@@ -34,6 +35,106 @@ struct StateIO<__nv_bfloat16> {
   __device__ static inline void store(__nv_bfloat16* p, float v) { *p = __float2bfloat16(v); }
 };
 
+// The ACTIVATION dtype, for reading raw gate projections. Distinct from
+// StateIO on purpose: the state pool's dtype and the activation dtype are
+// independent axes (an fp16 pool under bf16 activations is the shipping
+// configuration), and `round_trip` -- narrow to the activation dtype, widen
+// back -- is a gate-specific operation the state never performs. The explicit
+// `_rn` conversions are round-to-nearest-even, which is what c10's float->bf16
+// and float->half conversions do; the default-rounding intrinsics happen to
+// agree today, but the parity claim below should not hang on "happen to".
+template <typename T>
+struct ActIO;
+template <>
+struct ActIO<float> {
+  __device__ static inline float widen(float v) { return v; }
+  __device__ static inline float round_trip(float v) { return v; }
+};
+template <>
+struct ActIO<__nv_bfloat16> {
+  __device__ static inline float widen(__nv_bfloat16 v) { return __bfloat162float(v); }
+  __device__ static inline float round_trip(float v) {
+    return __bfloat162float(__float2bfloat16_rn(v));
+  }
+};
+
+// --- where alpha and beta come from ------------------------------------------
+//
+// The recurrence consumes one (alpha, beta) pair per (row, head, token). Where
+// that pair comes from is a POLICY template argument, so the recurrence itself
+// stays written exactly once and the decode/prefill bit-identity gate keeps
+// meaning something:
+//
+//   PrecomputedGates   loads gates the caller computed in torch. The original
+//                      interface; every existing parity test pins it.
+//   RawGates<AT>       computes them in-kernel from the raw projections:
+//
+//                        beta  = widen(round_AT(1 / (1 + exp(-b_raw))))
+//                        alpha = exp(A[h] * softplus(a_raw + dt_bias[h]))
+//                        softplus(x) = x > 20 ? x : log1p(exp(x))
+//
+// **Why in-kernel:** the torch spelling of those two lines is ~8 kernel
+// launches per GDN layer per step -- sigmoid, two casts, add, softplus, mul,
+// exp, contiguous -- ~190 launches across 24 layers, inside a step that is
+// already 91% device-busy at B=1. Computed here they are ~4 transcendentals per
+// thread against a 2x128-FMA recurrence, and the [B, T, H] alpha/beta tensors
+// stop existing at all.
+//
+// **The numerics are torch's, deliberately.** beta's sigmoid is taken in the
+// ACTIVATION dtype and only then widened -- HF's asymmetry, load-bearing
+// (braid/model/gdn.py documents the 4.8e-3 shift from doing it in fp32) --
+// hence `round_trip`. alpha is fp32 throughout. softplus carries torch's own
+// threshold-20 branch. Every primitive maps to the same CUDA math-library call
+// torch's own kernels lower to (expf, log1pf, IEEE div; this file builds
+// without fast math), so the result is BIT-IDENTICAL to the torch path --
+// asserted by tests/test_gdn_raw_gates.py, not argued.
+//
+// **Padding lives here too.** For a pad column (seq_lens given and
+// t >= seq_lens[b]) RawGates yields alpha = 1, beta = 0 -- the exact identity
+// step the ragged-prefill contract requires -- replacing the caller's
+// torch.where over [B, T, H]. A null seq_lens means every column is live,
+// which is what decode (T = 1) always passes.
+//
+// All HD threads of a block compute the same gate pair redundantly. That is a
+// few dozen ALU instructions against the ~700 of the recurrence loop, and the
+// alternative -- one thread computes, smem broadcast -- would add a barrier to
+// a kernel whose barriers are already load-bearing for the q_hat/k_hat reuse.
+struct PrecomputedGates {
+  const float* alpha;  // [B, H] at T = 1, [B, T, H] otherwise
+  const float* beta;
+  __device__ inline void get(int b, int h, int t, int H, int T, float& a, float& bt) const {
+    const size_t i = ((size_t)b * T + t) * H + h;
+    a = alpha[i];
+    bt = beta[i];
+  }
+};
+
+template <typename AT>
+struct RawGates {
+  const AT* a_raw;       // [B, T, H], activation dtype
+  const AT* b_raw;       // [B, T, H], activation dtype
+  const float* A;        // [H], already -exp(A_log)
+  const float* dt_bias;  // [H]
+  const int* seq_lens;   // [B], or nullptr = all columns live
+  __device__ inline void get(int b, int h, int t, int H, int T, float& a, float& bt) const {
+    if (seq_lens != nullptr && t >= seq_lens[b]) {
+      a = 1.f;  // S' = 1*S + k (x) 0 = S, bit for bit -- the pad identity
+      bt = 0.f;
+      return;
+    }
+    const size_t i = ((size_t)b * T + t) * H + h;
+    // torch.sigmoid on a reduced-precision tensor computes 1/(1+exp(-x)) in
+    // fp32 and rounds the RESULT to the tensor's dtype; the .float() after it
+    // widens that rounded value. round_trip reproduces exactly that.
+    bt = ActIO<AT>::round_trip(1.f / (1.f + expf(-ActIO<AT>::widen(b_raw[i]))));
+    const float x = ActIO<AT>::widen(a_raw[i]) + dt_bias[h];
+    // torch's softplus (beta=1, threshold=20), branch included: log1p(exp(x))
+    // overflows for large x where the function is x to fp32 precision anyway.
+    const float sp = x > 20.f ? x : log1pf(expf(x));
+    a = expf(A[h] * sp);
+  }
+};
+
 // One block per (batch row, head). One thread per head_dim column d.
 // Each thread holds the state column S[:, d] (state_size floats) in registers.
 // Mirrors the reference engine's gdn_scan_fused_kernel ownership model at
@@ -46,15 +147,14 @@ struct StateIO<__nv_bfloat16> {
 // (.claude/skills/sm120-cuda-expert/references/known-issues.md:55). The min-1
 // form is also what lets ptxas give each thread the ~128 registers S_reg needs
 // without spilling it to local memory.
-template <typename ST, int SS, int HD>
+template <typename ST, typename GS, int SS, int HD>
 __global__ void __launch_bounds__(HD, 1) gdn_decode_kernel(
     ST* __restrict__ pool,             // [S_max, H, SS, HD], fp32 / fp16 / bf16
     const int* __restrict__ slot_idx,  // [B]
     const float* __restrict__ q,       // [B, G, SS]
     const float* __restrict__ k,       // [B, G, SS]
     const float* __restrict__ v,       // [B, H, HD]
-    const float* __restrict__ alpha,   // [B, H]
-    const float* __restrict__ beta,    // [B, H]
+    GS gates,                          // alpha/beta, loaded or computed -- see above
     float* __restrict__ y,             // [B, H, HD]
     int H, int G) {
   const int b = blockIdx.x;
@@ -133,8 +233,8 @@ __global__ void __launch_bounds__(HD, 1) gdn_decode_kernel(
 #pragma unroll
   for (int s = 0; s < SS; ++s) S_reg[s] = StateIO<ST>::load(H_col + (size_t)s * HD);
 
-  const float a = alpha[(size_t)b * H + h];
-  const float bt = beta[(size_t)b * H + h];
+  float a, bt;
+  gates.get(b, h, /*t=*/0, H, /*T=*/1, a, bt);
 
   // kv on the UNDECAYED state, then scale by alpha. Order matters for fp32
   // parity: decaying first and then reducing is algebraically identical and
@@ -216,12 +316,12 @@ void gdn_decode(torch::Tensor pool, torch::Tensor slot_idx, torch::Tensor q, tor
 
   dim3 grid(B, H);
   const size_t smem = 2 * SS * sizeof(float);
+  const PrecomputedGates gates{alpha.data_ptr<float>(), beta.data_ptr<float>()};
 
 #define BRAID_LAUNCH_GDN(ST, PTR)                                                              \
-  gdn_decode_kernel<ST, 128, 128><<<grid, HD, smem, stream>>>(                                 \
+  gdn_decode_kernel<ST, PrecomputedGates, 128, 128><<<grid, HD, smem, stream>>>(               \
       PTR, slot_idx.data_ptr<int>(), q.data_ptr<float>(), k.data_ptr<float>(),                 \
-      v.data_ptr<float>(), alpha.data_ptr<float>(), beta.data_ptr<float>(),                    \
-      y.data_ptr<float>(), H, G)
+      v.data_ptr<float>(), gates, y.data_ptr<float>(), H, G)
 
   if (st == torch::kFloat32) {
     BRAID_LAUNCH_GDN(float, pool.data_ptr<float>());
@@ -232,6 +332,86 @@ void gdn_decode(torch::Tensor pool, torch::Tensor slot_idx, torch::Tensor q, tor
                      reinterpret_cast<__nv_bfloat16*>(pool.data_ptr<at::BFloat16>()));
   }
 #undef BRAID_LAUNCH_GDN
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// The raw-gates decode entry: identical recurrence, gates computed in-kernel.
+// `a_raw` / `b_raw` are the [B, H] projection outputs in the ACTIVATION dtype
+// (bf16 in the shipping engine, fp32 in the fp32 parity engines) -- the bf16
+// bits themselves, because beta's sigmoid must round through that dtype to
+// match HF. `A` and `dt_bias` are the [H] fp32 layer constants.
+void gdn_decode_raw(torch::Tensor pool, torch::Tensor slot_idx, torch::Tensor q,
+                    torch::Tensor k, torch::Tensor v, torch::Tensor a_raw,
+                    torch::Tensor b_raw, torch::Tensor A, torch::Tensor dt_bias,
+                    torch::Tensor y) {
+  TORCH_CHECK(pool.is_cuda(), "pool must be cuda");
+  const auto st = pool.scalar_type();
+  TORCH_CHECK(st == torch::kFloat32 || st == torch::kFloat16 || st == torch::kBFloat16,
+              "state pool must be fp32, fp16 or bf16");
+  TORCH_CHECK(slot_idx.scalar_type() == torch::kInt32, "slot_idx must be int32");
+  TORCH_CHECK(pool.is_contiguous(), "pool must be contiguous");
+  for (const auto& t : {q, k, v, y}) {
+    TORCH_CHECK(t.is_cuda() && t.scalar_type() == torch::kFloat32 && t.is_contiguous(),
+                "q/k/v/y must be contiguous cuda fp32");
+  }
+  const auto at = a_raw.scalar_type();
+  TORCH_CHECK(at == torch::kFloat32 || at == torch::kBFloat16,
+              "a_raw/b_raw must be fp32 or bf16 (the activation dtypes braid runs)");
+  TORCH_CHECK(b_raw.scalar_type() == at, "a_raw and b_raw must share a dtype");
+  for (const auto& t : {a_raw, b_raw}) {
+    TORCH_CHECK(t.is_cuda() && t.is_contiguous(), "a_raw/b_raw must be contiguous cuda");
+  }
+  for (const auto& t : {A, dt_bias}) {
+    TORCH_CHECK(t.is_cuda() && t.scalar_type() == torch::kFloat32 && t.is_contiguous(),
+                "A/dt_bias must be contiguous cuda fp32");
+  }
+
+  const int B = q.size(0), G = q.size(1), SS = q.size(2);
+  const int H = v.size(1), HD = v.size(2);
+  TORCH_CHECK(SS == 128 && HD == 128, "only SS=HD=128 is instantiated");
+  TORCH_CHECK(H % G == 0, "n_heads must be divisible by n_groups");
+  TORCH_CHECK(slot_idx.numel() == B, "slot_idx must have one entry per batch row");
+  TORCH_CHECK(a_raw.size(0) == B && a_raw.numel() == (int64_t)B * H,
+              "a_raw must be [B, H]");
+  TORCH_CHECK(b_raw.sizes() == a_raw.sizes(), "b_raw must match a_raw");
+  TORCH_CHECK(A.numel() == H && dt_bias.numel() == H, "A and dt_bias must be [H]");
+  TORCH_CHECK(pool.size(1) == H && pool.size(2) == SS && pool.size(3) == HD,
+              "pool shape must be [S_max, H, SS, HD]");
+  TORCH_CHECK(y.size(0) == B && y.size(1) == H && y.size(2) == HD, "y shape must be [B, H, HD]");
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  validate_slots(slot_idx, pool.size(0), stream);
+
+  dim3 grid(B, H);
+  const size_t smem = 2 * SS * sizeof(float);
+
+#define BRAID_LAUNCH_GDN_RAW(ST, PTR, AT, APTR, BPTR)                                          \
+  gdn_decode_kernel<ST, RawGates<AT>, 128, 128><<<grid, HD, smem, stream>>>(                   \
+      PTR, slot_idx.data_ptr<int>(), q.data_ptr<float>(), k.data_ptr<float>(),                 \
+      v.data_ptr<float>(),                                                                     \
+      RawGates<AT>{APTR, BPTR, A.data_ptr<float>(), dt_bias.data_ptr<float>(),                 \
+                   /*seq_lens=*/nullptr},                                                      \
+      y.data_ptr<float>(), H, G)
+
+#define BRAID_GDN_RAW_ACT(ST, PTR)                                                             \
+  if (at == torch::kFloat32) {                                                                 \
+    BRAID_LAUNCH_GDN_RAW(ST, PTR, float, a_raw.data_ptr<float>(), b_raw.data_ptr<float>());    \
+  } else {                                                                                     \
+    BRAID_LAUNCH_GDN_RAW(ST, PTR, __nv_bfloat16,                                               \
+                         reinterpret_cast<const __nv_bfloat16*>(a_raw.data_ptr<at::BFloat16>()),\
+                         reinterpret_cast<const __nv_bfloat16*>(b_raw.data_ptr<at::BFloat16>()));\
+  }
+
+  if (st == torch::kFloat32) {
+    BRAID_GDN_RAW_ACT(float, pool.data_ptr<float>())
+  } else if (st == torch::kFloat16) {
+    BRAID_GDN_RAW_ACT(__half, reinterpret_cast<__half*>(pool.data_ptr<at::Half>()))
+  } else {
+    BRAID_GDN_RAW_ACT(__nv_bfloat16,
+                      reinterpret_cast<__nv_bfloat16*>(pool.data_ptr<at::BFloat16>()))
+  }
+#undef BRAID_GDN_RAW_ACT
+#undef BRAID_LAUNCH_GDN_RAW
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -259,15 +439,15 @@ void gdn_decode(torch::Tensor pool, torch::Tensor slot_idx, torch::Tensor q, tor
 // pad column. That makes the step an exact identity on the state (delta = 0,
 // S' = S bit-for-bit) rather than an approximate one, and it keeps the ragged
 // masking in one place instead of two.
-template <typename ST, int SS, int HD>
+template <typename ST, typename GS, int SS, int HD>
 __global__ void __launch_bounds__(HD, 1) gdn_prefill_kernel(
     ST* __restrict__ pool,             // [S_max, H, SS, HD]
     const int* __restrict__ slot_idx,  // [B]
     const float* __restrict__ q,       // [B, T, G, SS]
     const float* __restrict__ k,       // [B, T, G, SS]
     const float* __restrict__ v,       // [B, T, H, HD]
-    const float* __restrict__ alpha,   // [B, T, H], pad columns already 1
-    const float* __restrict__ beta,    // [B, T, H], pad columns already 0
+    GS gates,                          // PrecomputedGates: pad columns already 1/0.
+                                       // RawGates: pad handled via seq_lens.
     float* __restrict__ y,             // [B, T, H, HD]
     int H, int G, int T) {
   const int b = blockIdx.x;
@@ -319,8 +499,8 @@ __global__ void __launch_bounds__(HD, 1) gdn_prefill_kernel(
     __syncthreads();
 
     const size_t bth = ((size_t)b * T + t) * H + h;
-    const float a = alpha[bth];
-    const float bt = beta[bth];
+    float a, bt;
+    gates.get(b, h, t, H, T, a, bt);
 
     float kv = 0.f;
 #pragma unroll
@@ -378,12 +558,12 @@ void gdn_prefill(torch::Tensor pool, torch::Tensor slot_idx, torch::Tensor q, to
 
   dim3 grid(B, H);
   const size_t smem = 2 * SS * sizeof(float);
+  const PrecomputedGates gates{alpha.data_ptr<float>(), beta.data_ptr<float>()};
 
 #define BRAID_LAUNCH_PREFILL(ST, PTR)                                                          \
-  gdn_prefill_kernel<ST, 128, 128><<<grid, HD, smem, stream>>>(                                \
+  gdn_prefill_kernel<ST, PrecomputedGates, 128, 128><<<grid, HD, smem, stream>>>(              \
       PTR, slot_idx.data_ptr<int>(), q.data_ptr<float>(), k.data_ptr<float>(),                 \
-      v.data_ptr<float>(), alpha.data_ptr<float>(), beta.data_ptr<float>(),                    \
-      y.data_ptr<float>(), H, G, T)
+      v.data_ptr<float>(), gates, y.data_ptr<float>(), H, G, T)
 
   if (st == torch::kFloat32) {
     BRAID_LAUNCH_PREFILL(float, pool.data_ptr<float>());
@@ -394,5 +574,101 @@ void gdn_prefill(torch::Tensor pool, torch::Tensor slot_idx, torch::Tensor q, to
                          reinterpret_cast<__nv_bfloat16*>(pool.data_ptr<at::BFloat16>()));
   }
 #undef BRAID_LAUNCH_PREFILL
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// The raw-gates prefill entry. `seq_lens` (int32 [B], or None) replaces the
+// caller's torch.where mask: a pad column becomes alpha=1, beta=0 inside the
+// kernel, from the same comparison the mask would have made. `a_raw` / `b_raw`
+// are [B, T, H] in the activation dtype, straight off the projection -- the
+// sigmoid/softplus/exp chain and the two [B, T, H] fp32 gate tensors it used
+// to materialise stop existing.
+void gdn_prefill_raw(torch::Tensor pool, torch::Tensor slot_idx, torch::Tensor q,
+                     torch::Tensor k, torch::Tensor v, torch::Tensor a_raw,
+                     torch::Tensor b_raw, torch::Tensor A, torch::Tensor dt_bias,
+                     torch::Tensor y, std::optional<torch::Tensor> seq_lens) {
+  TORCH_CHECK(pool.is_cuda(), "pool must be cuda");
+  const auto st = pool.scalar_type();
+  TORCH_CHECK(st == torch::kFloat32 || st == torch::kFloat16 || st == torch::kBFloat16,
+              "state pool must be fp32, fp16 or bf16");
+  TORCH_CHECK(slot_idx.scalar_type() == torch::kInt32, "slot_idx must be int32");
+  TORCH_CHECK(pool.is_contiguous(), "pool must be contiguous");
+  for (const auto& t : {q, k, v, y}) {
+    TORCH_CHECK(t.is_cuda() && t.scalar_type() == torch::kFloat32 && t.is_contiguous(),
+                "q/k/v/y must be contiguous cuda fp32");
+  }
+  const auto at = a_raw.scalar_type();
+  TORCH_CHECK(at == torch::kFloat32 || at == torch::kBFloat16,
+              "a_raw/b_raw must be fp32 or bf16 (the activation dtypes braid runs)");
+  TORCH_CHECK(b_raw.scalar_type() == at, "a_raw and b_raw must share a dtype");
+  for (const auto& t : {a_raw, b_raw}) {
+    TORCH_CHECK(t.is_cuda() && t.is_contiguous(), "a_raw/b_raw must be contiguous cuda");
+  }
+  for (const auto& t : {A, dt_bias}) {
+    TORCH_CHECK(t.is_cuda() && t.scalar_type() == torch::kFloat32 && t.is_contiguous(),
+                "A/dt_bias must be contiguous cuda fp32");
+  }
+
+  const int B = q.size(0), T = q.size(1), G = q.size(2), SS = q.size(3);
+  const int H = v.size(2), HD = v.size(3);
+  TORCH_CHECK(SS == 128 && HD == 128, "only SS=HD=128 is instantiated");
+  TORCH_CHECK(H % G == 0, "n_heads must be divisible by n_groups");
+  TORCH_CHECK(slot_idx.numel() == B, "slot_idx must have one entry per batch row");
+  TORCH_CHECK(k.sizes() == q.sizes(), "k must match q");
+  TORCH_CHECK(v.size(0) == B && v.size(1) == T, "v must match q in [B, T]");
+  TORCH_CHECK(a_raw.size(0) == B && a_raw.size(1) == T &&
+                  a_raw.numel() == (int64_t)B * T * H,
+              "a_raw must be [B, T, H]");
+  TORCH_CHECK(b_raw.sizes() == a_raw.sizes(), "b_raw must match a_raw");
+  TORCH_CHECK(A.numel() == H && dt_bias.numel() == H, "A and dt_bias must be [H]");
+  TORCH_CHECK(pool.size(1) == H && pool.size(2) == SS && pool.size(3) == HD,
+              "pool shape must be [S_max, H, SS, HD]");
+  TORCH_CHECK(y.size(0) == B && y.size(1) == T && y.size(2) == H && y.size(3) == HD,
+              "y shape must be [B, T, H, HD]");
+
+  const int* sl = nullptr;
+  if (seq_lens.has_value()) {
+    const auto& s = seq_lens.value();
+    TORCH_CHECK(s.is_cuda() && s.scalar_type() == torch::kInt32 && s.is_contiguous(),
+                "seq_lens must be contiguous cuda int32");
+    TORCH_CHECK(s.numel() == B, "seq_lens must have one entry per batch row");
+    sl = s.data_ptr<int>();
+  }
+
+  auto stream = at::cuda::getCurrentCUDAStream();
+  validate_slots(slot_idx, pool.size(0), stream);
+
+  dim3 grid(B, H);
+  const size_t smem = 2 * SS * sizeof(float);
+
+#define BRAID_LAUNCH_PREFILL_RAW(ST, PTR, AT, APTR, BPTR)                                      \
+  gdn_prefill_kernel<ST, RawGates<AT>, 128, 128><<<grid, HD, smem, stream>>>(                  \
+      PTR, slot_idx.data_ptr<int>(), q.data_ptr<float>(), k.data_ptr<float>(),                 \
+      v.data_ptr<float>(),                                                                     \
+      RawGates<AT>{APTR, BPTR, A.data_ptr<float>(), dt_bias.data_ptr<float>(), sl},            \
+      y.data_ptr<float>(), H, G, T)
+
+#define BRAID_PREFILL_RAW_ACT(ST, PTR)                                                         \
+  if (at == torch::kFloat32) {                                                                 \
+    BRAID_LAUNCH_PREFILL_RAW(ST, PTR, float, a_raw.data_ptr<float>(),                          \
+                             b_raw.data_ptr<float>());                                         \
+  } else {                                                                                     \
+    BRAID_LAUNCH_PREFILL_RAW(ST, PTR, __nv_bfloat16,                                           \
+                             reinterpret_cast<const __nv_bfloat16*>(                           \
+                                 a_raw.data_ptr<at::BFloat16>()),                              \
+                             reinterpret_cast<const __nv_bfloat16*>(                           \
+                                 b_raw.data_ptr<at::BFloat16>()));                             \
+  }
+
+  if (st == torch::kFloat32) {
+    BRAID_PREFILL_RAW_ACT(float, pool.data_ptr<float>())
+  } else if (st == torch::kFloat16) {
+    BRAID_PREFILL_RAW_ACT(__half, reinterpret_cast<__half*>(pool.data_ptr<at::Half>()))
+  } else {
+    BRAID_PREFILL_RAW_ACT(__nv_bfloat16,
+                          reinterpret_cast<__nv_bfloat16*>(pool.data_ptr<at::BFloat16>()))
+  }
+#undef BRAID_PREFILL_RAW_ACT
+#undef BRAID_LAUNCH_PREFILL_RAW
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

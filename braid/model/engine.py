@@ -27,7 +27,14 @@ from braid.model.config import ModelConfig
 from braid.model.layer import DecoderLayer
 from braid.model.loader import Checkpoint, load_checkpoint
 from braid.model.norm import rms_norm
-from braid.model.quant import FP8Weight, linear, maybe_quantize, parse_groups
+from braid.model.quant import (
+    FP8Weight,
+    fused_state,
+    linear,
+    maybe_quantize,
+    parse_groups,
+    warm_fused,
+)
 
 
 def checkpoint_bytes(ckpt: Checkpoint) -> int:
@@ -79,6 +86,13 @@ class Engine:
                         state_dtype: torch.dtype = torch.float32) -> Engine:
         cfg = ckpt.config
         groups = parse_groups(quant)
+        # Built here, not on first use. `quantize_act` runs inside the captured
+        # decode step, and the first call is the one that would JIT-compile the
+        # extension — building inside a graph capture is not a thing to find out
+        # about at capture time. Only when something is actually quantized: an
+        # unquantized engine never calls it and should not pay a build.
+        if groups and torch.cuda.is_available():
+            warm_fused()
         layers = [DecoderLayer(cfg, i, ckpt.layer(i), use_kernels=use_kernels,
                                quant=groups)
                   for i in range(cfg.num_hidden_layers)]
@@ -133,6 +147,24 @@ class Engine:
                 # `use_kernels=False` has no kernel module to call, so enabling
                 # the chunk scan there is not a slower arm, it is an AttributeError.
                 mixer.chunk_prefill = enabled and mixer.use_kernels
+                n += 1
+        return n
+
+    def set_raw_gates(self, enabled: bool) -> int:
+        """Compute alpha/beta inside the GDN kernels, or in torch.
+
+        The other single-attribute A/B lever, same contract as
+        `set_chunk_prefill`: serving always wants it on, the bench turns it off
+        to price it, and the return value exists so an arm that silently
+        matched nothing cannot masquerade as a null result. The two paths are
+        asserted bit-identical (tests/test_gdn_raw_gates.py), so this is a
+        launch-count switch, never a numerics one.
+        """
+        n = 0
+        for layer in self.layers:
+            mixer = getattr(layer, "mixer", None)
+            if hasattr(mixer, "raw_gates"):
+                mixer.raw_gates = enabled and mixer.use_kernels
                 n += 1
         return n
 
@@ -486,4 +518,10 @@ class Engine:
                          f"  (bf16 {bf16 / 2 ** 30:>6.2f})  [{asked}]")
         head = (f"decode-step weights {tot_now / 2 ** 30:.2f} GiB of "
                 f"{tot_bf16 / 2 ** 30:.2f} bf16 ({tot_now / tot_bf16:.3f}x)")
-        return head + "\n" + "\n".join(lines)
+        # Printed for the same reason the per-group counts are: the fused
+        # quantizer falls back to an exact torch spelling if it will not build,
+        # so a run can be nine-kernels-per-quantize while looking identical in
+        # every other respect. A launch-count change that vanishes silently from
+        # a benchmark is the failure mode this line exists to prevent.
+        tail = f"  act quantizer: {fused_state()}" if self.quant else ""
+        return head + "\n" + "\n".join(lines) + ("\n" + tail if tail else "")

@@ -95,6 +95,13 @@ def main() -> None:
     p.add_argument("--quant", default="all")
     p.add_argument("--state-dtype", default="fp16", choices=list(STATE_DTYPES))
     p.add_argument("--top", type=int, default=18, help="hottest kernels to list")
+    # The two launch-count levers, off-switchable so each can be priced alone.
+    # Both toggles are asserted bit-identical to their fallbacks (test_quant,
+    # test_gdn_raw_gates), so these change WHERE work happens, never what.
+    p.add_argument("--no-fused-quant", action="store_true",
+                   help="torch-spelling activation quantization (9 kernels/call)")
+    p.add_argument("--no-raw-gates", action="store_true",
+                   help="alpha/beta in torch (~8 launches/layer/step)")
     args = p.parse_args()
 
     ck = load_checkpoint(MODEL_DIR, device="cuda")
@@ -103,6 +110,11 @@ def main() -> None:
                                  state_dtype=STATE_DTYPES[args.state_dtype])
     del ck
     torch.cuda.empty_cache()
+    if args.no_fused_quant:
+        from braid.model.quant import warm_fused
+        warm_fused(False)
+    if args.no_raw_gates:
+        eng.set_raw_gates(False)
 
     B = args.batch
     cache = eng.allocate_cache(args.max_len, max_slots=B)
@@ -143,7 +155,9 @@ def main() -> None:
     busy_ms = total_us / 1e3 / n
 
     print(f"\nmodel {MODEL_DIR.name}  B={B}  fp8={args.quant or 'none'}  "
-          f"state={args.state_dtype}  KV {args.prompt_len}..{args.prompt_len + args.steps}")
+          f"state={args.state_dtype}  KV {args.prompt_len}..{args.prompt_len + args.steps}  "
+          f"fused-quant={'off' if args.no_fused_quant else 'on'}  "
+          f"raw-gates={'off' if args.no_raw_gates else 'on'}")
     print(f"\n  step, CUDA events, no profiler   {clean_ms:8.3f} ms")
     print(f"  sum of kernel device time        {busy_ms:8.3f} ms   "
           f"({busy_ms / clean_ms * 100:.0f}% of the step)")

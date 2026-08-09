@@ -356,3 +356,122 @@ def test_quant_report_states_the_result_not_the_request():
         del eng
         gc.collect()
         torch.cuda.empty_cache()
+
+
+# --- the fused activation quantizer -------------------------------------------
+#
+# `quantize_act` is nine kernels in torch and two in CUDA, and it runs ~129 times
+# per decode step — measured at ~1.18 ms of a 9.75 ms step at B=1 on the 9B.
+# Because it feeds every fp8 GEMM, the gate is **bit-identity against the torch
+# spelling**, not a tolerance. That is a reasonable thing to demand here for one
+# specific reason: the scale is an amax, and max is associative *and exact* in
+# floating point, so the reduction order the grid happens to use cannot change
+# it. A sum would not have this property and would not get this gate.
+
+def _quant_arms(x):
+    """(fused, torch) results for the same input, with the flag left restored."""
+    from braid.model import quant as Q
+
+    Q.warm_fused(True)
+    if Q.fused_state() != "active":
+        pytest.skip(f"fused quantizer not available: {Q.fused_state()}")
+    fused = Q.quantize_act(x)
+    Q.warm_fused(False)
+    try:
+        ref = Q.quantize_act(x)
+    finally:
+        Q.warm_fused(True)
+    return fused, ref
+
+
+@pytest.mark.parametrize("dt", [torch.bfloat16, torch.float32, torch.float16],
+                         ids=["bf16", "fp32", "fp16"])
+@pytest.mark.parametrize("shape", [(1, 4096), (8, 4096), (37, 12288), (128, 12288)],
+                         ids=["m1", "m8", "m37", "m128"])
+def test_the_fused_quantizer_is_bit_identical_to_the_torch_spelling(dt, shape):
+    g = torch.Generator(device="cuda").manual_seed(17)
+    x = (torch.randn(*shape, generator=g, device="cuda", dtype=torch.float32) * 3.5).to(dt)
+    (q, s), (qr, sr) = _quant_arms(x)
+
+    assert torch.equal(s, sr), f"scale differs: {s.item():.9e} vs {sr.item():.9e}"
+    # Compare the fp8 payloads as raw bytes; fp8 has no `==` worth trusting.
+    assert torch.equal(q.view(torch.uint8), qr.view(torch.uint8)), (
+        f"{dt} {shape}: "
+        f"{int((q.view(torch.uint8) != qr.view(torch.uint8)).sum())} of {q.numel()} "
+        f"fp8 bytes differ")
+
+
+def test_the_fused_quantizer_handles_the_degenerate_scales():
+    """An all-zero activation must not divide by zero, and a huge one must
+    saturate rather than produce a NaN. Both are reachable: a masked row can be
+    exactly zero, and the `clamp(min=EPS)` in the torch spelling exists for it."""
+    for label, x in (
+        ("zeros", torch.zeros(4, 4096, device="cuda", dtype=torch.bfloat16)),
+        ("huge", torch.full((4, 4096), 60000.0, device="cuda", dtype=torch.bfloat16)),
+        # 1e-10, not 1e-8: the clamp band is 0 < amax < 448*EPS = 4.48e-10, and
+        # 1e-8 sits above it — that case would exercise nothing degenerate. At
+        # 1e-10 the scale clamps to EPS with a nonzero payload, which is the
+        # branch this case exists to cover.
+        ("tiny", torch.full((4, 4096), 1e-10, device="cuda", dtype=torch.bfloat16)),
+    ):
+        (q, s), (qr, sr) = _quant_arms(x)
+        assert torch.isfinite(s).all(), f"{label}: scale not finite"
+        assert torch.equal(s, sr), f"{label}: scale differs from torch"
+        assert torch.equal(q.view(torch.uint8), qr.view(torch.uint8)), (
+            f"{label}: payload differs from torch")
+
+
+def test_a_non_contiguous_activation_falls_back_rather_than_corrupting():
+    """The kernel indexes linearly and so requires contiguity; the wrapper checks
+    it and falls back. The failure this guards is silent: a strided view read as
+    if it were dense returns the wrong elements at full speed.
+
+    So the reference is the **contiguous copy**, which does take the fused path.
+    Same values, same layout, therefore the same scale and the same payload —
+    comparing the view against the torch spelling instead would only assert that
+    the fallback equals itself.
+    """
+    from braid.model import quant as Q
+
+    Q.warm_fused(True)
+    if Q.fused_state() != "active":
+        pytest.skip(Q.fused_state())
+    g = torch.Generator(device="cuda").manual_seed(5)
+    base = torch.randn(64, 4096, generator=g, device="cuda", dtype=torch.bfloat16)
+    view = base.t()
+    assert not view.is_contiguous()
+
+    q, s = Q.quantize_act(view)                 # falls back, strided
+    qc, sc = Q.quantize_act(view.contiguous())  # fused, dense
+    assert torch.equal(s, sc), "the fallback found a different amax than the kernel"
+    assert torch.equal(q.view(torch.uint8), qc.view(torch.uint8)), (
+        "a strided activation quantized to different bytes than its own "
+        "contiguous copy")
+
+
+def test_a_nan_activation_survives_quantization():
+    """A NaN must reach the output, not be clamped away.
+
+    `fmaxf(NaN, x)` returns x, so the obvious spelling of a max-reduction
+    silently swallows NaN while `torch.amax` propagates it. If the kernel did
+    that, a diverged activation would quantize to a full tensor of plausible
+    -448..448 fp8 and the run would keep going looking healthy — the failure
+    would be invisible exactly when it matters most. `quant_act.cu` uses a
+    comparison-based max for this reason, and this is the test that says so.
+    """
+    from braid.model import quant as Q
+
+    Q.warm_fused(True)
+    if Q.fused_state() != "active":
+        pytest.skip(Q.fused_state())
+    g = torch.Generator(device="cuda").manual_seed(3)
+    x = torch.randn(4, 4096, generator=g, device="cuda", dtype=torch.bfloat16)
+    x[2, 100] = float("nan")
+
+    (q, s), (qr, sr) = _quant_arms(x)
+    assert torch.isnan(s).all(), (
+        f"a NaN activation produced a finite scale {s.item():.3e} — the "
+        f"reduction swallowed it")
+    assert torch.isnan(sr).all(), "the torch reference should propagate NaN too"
+    assert torch.equal(q.view(torch.uint8), qr.view(torch.uint8)), (
+        "fused and torch disagree on how a NaN activation quantizes")

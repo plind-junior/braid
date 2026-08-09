@@ -51,6 +51,10 @@ class GatedDeltaNet:
         # every other term held fixed — two separately-loaded engines would
         # differ by page-cache state and allocator history as well.
         self.chunk_prefill = use_kernels
+        # In-kernel alpha/beta (the `_raw` kernel variants). Same shape of
+        # toggle as `chunk_prefill` and for the same reason: the A/B that
+        # prices it must flip one attribute, not load two engines.
+        self.raw_gates = use_kernels
         w = weights
         self.in_proj_qkv = maybe_quantize(w["linear_attn.in_proj_qkv"], quant)
         self.in_proj_z = maybe_quantize(w["linear_attn.in_proj_z"], quant)
@@ -130,12 +134,21 @@ class GatedDeltaNet:
         k = k.reshape(B, g.n_groups, g.state_size).contiguous()
         v = v.reshape(B, g.n_heads, g.head_dim).contiguous()
 
+        y = torch.empty(B, g.n_heads, g.head_dim, device=qkv.device,
+                        dtype=torch.float32)
+        if self.raw_gates:
+            # The gates are computed inside the kernel from the raw projection
+            # outputs — the sigmoid/softplus/exp chain above this used to be ~8
+            # launches per layer per step. `[:, 0]` of a [B, 1, H] tensor is a
+            # contiguous view, so nothing is copied here either.
+            mod.gdn_decode_raw(cache.state, slots_i32, q, k, v,
+                               a_raw[:, 0].contiguous(), b_raw[:, 0].contiguous(),
+                               self.A, self.dt_bias, y)
+            return y[:, None]  # [B, 1, H, HD]
+
         beta = torch.sigmoid(b_raw[:, 0]).float().contiguous()
         alpha = torch.exp(
             self.A * F.softplus(a_raw[:, 0].float() + self.dt_bias)).contiguous()
-
-        y = torch.empty(B, g.n_heads, g.head_dim, device=qkv.device,
-                        dtype=torch.float32)
         mod.gdn_decode(cache.state, slots_i32, q, k, v, alpha, beta, y)
         return y[:, None]     # [B, 1, H, HD]
 
@@ -242,6 +255,25 @@ class GatedDeltaNet:
         q = q.reshape(B, T, g.n_groups, g.state_size)
         k = k.reshape(B, T, g.n_groups, g.state_size)
         v = v.reshape(B, T, g.n_heads, g.head_dim)
+
+        # **The raw-gates chunk kernel: gates, masking and scan in one launch.**
+        # This sits BEFORE the torch gate computation on purpose — under it, the
+        # sigmoid/softplus/exp chain below and the torch.where pad mask are not
+        # "fused", they simply never run. Padding moves in-kernel via seq_lens,
+        # producing the identical alpha=1/beta=0 identity step the mask
+        # produced (asserted bit-for-bit in tests/test_gdn_raw_gates.py).
+        if (self.chunk_prefill and self.raw_gates and cache is not None
+                and slots_i32 is not None):
+            y = torch.empty(B, T, g.n_heads, g.head_dim, device=x.device,
+                            dtype=torch.float32)
+            self._mod.gdn_prefill_raw(
+                cache.state, slots_i32,
+                q.float().contiguous(), k.float().contiguous(),
+                v.float().contiguous(),
+                a_raw.contiguous(), b_raw.contiguous(),
+                self.A, self.dt_bias, y,
+                None if seq_lens is None else seq_lens.to(torch.int32))
+            return self._readout(z, y, B, T, dtype)
 
         # beta's sigmoid is taken in the ACTIVATION dtype and only then widened;
         # `g` is computed entirely in fp32. That asymmetry is HF's (`beta =

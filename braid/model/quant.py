@@ -154,6 +154,58 @@ def quantize_weight(w: torch.Tensor) -> FP8Weight:
     return FP8Weight(data=data, scale=scale, shape=(N, K))
 
 
+_FUSED = None
+_FUSED_STATE = "not tried"
+
+
+def warm_fused(enable: bool = True) -> bool:
+    """Load the fused activation-quantization kernel, or turn it off.
+
+    **Called up front rather than lazily on purpose.** The first call would
+    otherwise JIT-compile, and the first call can land inside a CUDA graph
+    capture, where building an extension is not something to discover. `Engine`
+    calls this when it is built with any FP8 group.
+
+    `warm_fused(False)` forces the torch spelling, which is what the parity gate
+    uses to compare the two. They are asserted bit-identical, so this is a
+    performance switch and never a numerics one — there is no "which arm did I
+    measure" ambiguity to resolve later.
+
+    Returns whether the fused path is active. A failure to build is reported
+    through `fused_state()` rather than raised: the fallback is exact, so a box
+    without a working toolchain should still run, but it must not do so
+    *silently*, because the whole point is a launch-count change that would
+    otherwise vanish from a benchmark with no trace.
+    """
+    global _FUSED, _FUSED_STATE
+    if not enable:
+        _FUSED, _FUSED_STATE = None, "disabled by caller"
+        return False
+    if _FUSED is not None:
+        return True
+    try:
+        from braid.kernels.loader import load_gdn
+
+        mod = load_gdn()
+        if not hasattr(mod, "quantize_act"):
+            _FUSED, _FUSED_STATE = None, "extension has no quantize_act"
+            return False
+        _FUSED, _FUSED_STATE = mod, "active"
+        return True
+    except Exception as e:  # noqa: BLE001 - reported, not swallowed; see docstring
+        _FUSED = None
+        # split, not splitlines: an exception constructed with no args has an
+        # empty str(), and "".splitlines()[0] would crash the report-and-fall-
+        # back path for exactly the failure class it exists to absorb.
+        _FUSED_STATE = f"unavailable: {type(e).__name__}: {str(e).split(chr(10), 1)[0][:120]}"
+        return False
+
+
+def fused_state() -> str:
+    """One line on whether the fused quantizer is running. Printed by benches."""
+    return _FUSED_STATE
+
+
 def quantize_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     """`[M, K]` -> fp8 plus a `[1, 1]` scale. Dynamic, per call.
 
@@ -165,6 +217,14 @@ def quantize_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     projections that share an activation (`fp8_matmul` takes the pre-quantized
     form for exactly that reason).
     """
+    # Nine kernels in the torch spelling below, two in the fused one, and this
+    # runs ~129 times per decode step — measured at ~1.18 ms of a 9.75 ms step
+    # at B=1 on the 9B, which is 12%. `braid/kernels/csrc/quant_act.cu` carries
+    # the argument that the two are bit-identical; `tests/test_quant.py` asserts
+    # it rather than trusting it.
+    if _FUSED is not None and x.is_cuda and x.is_contiguous():
+        q, scale = _FUSED.quantize_act(x)
+        return q, scale
     scale = _act_scale(x)
     return (x.float() / scale).clamp(-FP8_MAX, FP8_MAX).to(FP8), scale
 
