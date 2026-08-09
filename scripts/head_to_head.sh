@@ -94,8 +94,13 @@ run_llamacpp() {   # $1 = rep
 run_braid() {      # $1 = rep, $2 = label, $3.. = flags
   local rep="$1" label="$2"
   shift 2
+  # `--max-len` is derived, not defaulted: decode_speed's default cache is 512
+  # tokens, so a long-prompt sweep (NPP=512, NTG=64) would overflow it — and
+  # the failure would surface as an OOM-shaped hole in the table, which the
+  # per-batch tolerance would then dutifully publish as "does not fit". Sized
+  # to the workload, plus a step of slack.
   python3 -B -m braid.bench.decode_speed --json --prompt-len "$NPP" \
-      --steps "$NTG" --batches $BATCHES "$@" \
+      --steps "$NTG" --max-len $((NPP + NTG + 16)) --batches $BATCHES "$@" \
     | python3 scripts/h2h_row.py "$rep" "$label"
 }
 

@@ -200,12 +200,25 @@ def make_handler(service: EngineService, tokenizer=None):
     return Handler
 
 
+class _Server(ThreadingHTTPServer):
+    # socketserver's default listen backlog is 5. A server whose whole purpose
+    # is c=128 concurrency meets 128 near-simultaneous connects on its first
+    # busy second, and a full accept queue does not degrade politely: the
+    # kernel resets or silently drops SYNs, the client sees ConnectionReset or
+    # a 1-2-4s TCP retransmission ladder, and the measurement reads "braid
+    # collapsed at c=128" when nothing past the listen(2) call ever ran.
+    # Measured before this line existed: 358 resets and ~10 tok/s at c=128;
+    # zero errors after. llama-server's httplib has the same default and the
+    # same failure shape, which is worth knowing when benchmarking against it.
+    request_queue_size = 512
+
+
 def serve(engine: Engine, host: str = "127.0.0.1", port: int = 8000,
           capacity: int = 8, max_len: int = 2048, graphed: bool = True,
           tokenizer=None) -> tuple[ThreadingHTTPServer, EngineService]:
     service = EngineService(engine, capacity=capacity, max_len=max_len,
                             graphed=graphed)
-    httpd = ThreadingHTTPServer((host, port), make_handler(service, tokenizer))
+    httpd = _Server((host, port), make_handler(service, tokenizer))
     return httpd, service
 
 
@@ -231,12 +244,18 @@ def main() -> None:
     p.add_argument("--quant-mlp", action="store_true",
                    help="shorthand for --quant mlp")
     p.add_argument("--no-graphs", action="store_true")
+    p.add_argument("--state-dtype", default="fp32", choices=["fp32", "fp16", "bf16"],
+                   help="storage type for the recurrent state pool; the scan is "
+                        "fp32 either way. The shipping config is fp16.")
     args = p.parse_args()
+
+    from braid.bench.decode_speed import STATE_DTYPES
 
     quant = "mlp" if args.quant_mlp else args.quant
     ck = load_checkpoint(args.model_dir, device="cuda", dtype=torch.bfloat16)
     eng = Engine.from_checkpoint(ck, device="cuda", dtype=torch.bfloat16,
-                                 use_kernels=True, quant=quant)
+                                 use_kernels=True, quant=quant,
+                                 state_dtype=STATE_DTYPES[args.state_dtype])
     del ck
     torch.cuda.empty_cache()
     httpd, service = serve(eng, args.host, args.port, capacity=args.capacity,
