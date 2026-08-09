@@ -4,16 +4,17 @@ A single-GPU inference engine for **hybrid** language models — attention inter
 linear-recurrent mixer (Gated DeltaNet) — built to serve them **at concurrency** on one
 RTX 5090.
 
-> **Status: braid beats llama.cpp above batch 16, and loses below it.**
-> Measured head-to-head on one card in one session, 5 processes per arm:
-> **+23.7% at B=32 and +48.6% at B=64**, against −16.1% at B=16 and −47.3% at B=1.
-> From B=1 to B=64 braid scales **32.9×** where llama.cpp scales **11.7×**, which is
-> the thesis. braid loads `Qwen3.5-4B`, matches HuggingFace to fp32 machine precision
-> over all 32 layers, and serves concurrent streams over SSE with continuous batching.
-> **170 tests green** on a remote RTX 5090.
+> **Status: braid beats llama.cpp above batch 16, reaches parity at 16, and loses below it.**
+> Measured head-to-head on `Qwen3.5-9B`, one card, one session, 5 processes per arm:
+> **+30.1% at B=32 and +57.8% at B=64**, −0.7% at B=16, −34.9% at B=1.
+> From B=1 to B=64 braid scales **36.9×** where llama.cpp scales **15.2×**, which is
+> the thesis. braid matches HuggingFace to fp32 machine precision over all 32 layers
+> and serves concurrent streams over SSE with continuous batching.
+> **194 tests green** on a remote RTX 5090, on both the 9B and the 4B.
 >
-> The locked MVP target — ≥+25% at B=16 and ≥+100% at B=64 — is **not met**, so this is
-> a NO-GO against the target despite the wins. See
+> The locked MVP target — ≥+25% at B=16 and ≥+100% at B=64 — is **still not met**, so
+> this remains a NO-GO against the target despite the wins. The re-scoped target the
+> falsification clause produced (≥+20% at B=32, ≥+50% at B=64) **is** met. See
 > [The head-to-head](#the-head-to-head). Every number is labelled **measured** or
 > **projected**.
 
@@ -25,19 +26,21 @@ Hybrid models are the best quality-per-byte checkpoints that fit on a 32 GB card
 interesting question is not whether they run — several engines run them — but how well they
 run **with many concurrent requests**, which is the shape of real agent workloads.
 
-Measured on an RTX 5090, `llama.cpp` serving `Qwen3.5-4B-Q8_0`:
+Measured on an RTX 5090, `llama.cpp` serving `Qwen3.5-9B-Q8_0`. The bandwidth column
+counts **weight bytes only** — the ~7.87 GiB the decode step sweeps, i.e. the 8.87 GiB
+GGUF less its ~1.01 GiB embedding table, which is gathered rather than read:
 
 | parallel | aggregate tok/s | ms/step | weight bandwidth | **% of memory wall** |
 |---:|---:|---:|---:|---:|
-| 1 | 250.11 | 4.00 | 1,117 GB/s | **74%** |
-| 8 | 1,418.06 | 5.64 | 792 GB/s | 52% |
-| 16 | 1,879.68 | 8.52 | 524 GB/s | **35%** |
-| 32 | 2,497.41 | 12.81 | 349 GB/s | 23% |
-| 64 | 2,928.34 | 21.85 | 204 GB/s | **13%** |
+| 1 | 157.4 | 6.35 | 1,330 GB/s | **88%** |
+| 8 | 901.1 | 8.88 | 952 GB/s | 63% |
+| 16 | 1,369.6 | 11.68 | 723 GB/s | 48% |
+| 32 | 1,934.3 | 16.54 | 511 GB/s | 34% |
+| 64 | 2,398.9 | 26.68 | 317 GB/s | **21%** |
 
 A dense model reads its weights **once per step** regardless of batch size, so batching
 should push *toward* the memory wall, not away from it. llama.cpp goes the other way: 74%
-efficient at batch 1, 13% at batch 64.
+efficient at batch 1, 21% at batch 64.
 
 **braid's thesis, in one line:**
 
@@ -45,73 +48,90 @@ efficient at batch 1, 13% at batch 64.
 > braid targets the wall.
 
 That is the whole idea. It is a reproducible number, not a claim about anyone's code.
+
+---
+
 ## The head-to-head
 
-**Measured 2026-08-08, both arms in one session, ABBA order, 5 processes per arm per
-point, medians across processes.** Decode-only aggregate throughput, KV 128..256 on
-both arms (`llama-batched-bench -npp 128 -ntg 128` against braid's graphed decode
-seeded to the same depth). Box noise floor 1.66%; host healthy throughout
-(2,820–2,865 MHz SM, 13,801 MHz mem, 474–515 W).
+**Measured 2026-08-09 on `Qwen3.5-9B`. Every arm in one session, rotated order, 5
+processes per arm per point, medians across processes.** Decode-only aggregate
+throughput, KV 128..256 on all arms (`llama-batched-bench -npp 128 -ntg 128` against
+braid's graphed decode seeded to the same depth). Host healthy throughout
+(2,850–2,857 MHz SM, 13,801 MHz mem, 526–542 W peak).
 
-| batch | llama.cpp Q8_0 | braid BF16 | braid FP8-MLP | delta | |
-|---:|---:|---:|---:|---:|:--|
-| 1 | 250.0 | 131.3 (0.53×) | 131.7 (0.53×) | −47.3% | lose |
-| 2 | 452.2 | 221.7 (0.49×) | 232.2 (0.51×) | −48.7% | lose |
-| 4 | 810.7 | 433.0 (0.53×) | 451.8 (0.56×) | −44.3% | lose |
-| 8 | 1,399.8 | 765.2 (0.55×) | 840.9 (0.60×) | −39.9% | lose |
-| 16 | 1,874.8 | 1,425.2 (0.76×) | 1,573.7 (0.84×) | −16.1% | lose |
-| 32 | 2,454.2 | 2,994.5 (1.22×) | **3,035.9 (1.24×)** | **+23.7%** | **win** |
-| 64 | 2,915.9 | 4,169.9 (1.43×) | **4,333.4 (1.49×)** | **+48.6%** | **win** |
+| batch | llama.cpp Q8_0 | braid BF16 | braid FP8-MLP | braid FP8-all | best delta | |
+|---:|---:|---:|---:|---:|---:|:--|
+| 1 | 157.4 | 83.0 (0.53×) | 93.1 (0.59×) | 102.5 (0.65×) | −34.9% | lose |
+| 2 | 290.0 | 146.6 (0.51×) | 166.8 (0.58×) | 181.7 (0.63×) | −37.3% | lose |
+| 4 | 532.4 | 282.4 (0.53×) | 326.7 (0.61×) | 348.4 (0.65×) | −34.6% | lose |
+| 8 | 901.1 | 545.8 (0.61×) | 625.3 (0.69×) | 662.4 (0.74×) | −26.5% | lose |
+| 16 | 1,369.6 | 1,092.5 (0.80×) | 1,280.6 (0.93×) | 1,360.0 (0.99×) | −0.7% | parity |
+| 32 | 1,934.3 | 2,040.5 (1.05×) | 2,348.8 (1.21×) | **2,516.3 (1.30×)** | **+30.1%** | **win** |
+| 64 | 2,398.9 | 2,744.6 (1.14×) | 3,275.3 (1.37×) | **3,786.0 (1.58×)** | **+57.8%** | **win** |
 
-Per-arm spreads are 0.0–0.4%, so every verdict sits far outside noise. **braid crosses
-llama.cpp between B=16 and B=32** and the losing rows are published unchanged.
+Spreads over the five processes: llama.cpp 1.37%, braid 0.11–0.25%. Every verdict sits
+far outside noise. **braid crosses llama.cpp between B=16 and B=32** and the losing
+rows are published unchanged.
 
 The thesis is about the *shape* of the curve, and the shape holds. From B=1 to B=64
-braid scales **32.9×** where llama.cpp scales **11.7×** — a dense model reads its
-weights once per step, and braid keeps converting batch into throughput after
-llama.cpp has stopped. That is the whole claim, and it is now a measurement.
+braid scales **36.9×** where llama.cpp scales **15.2×** — braid keeps converting batch
+into throughput after llama.cpp has stopped. That is the whole claim, and it is a
+measurement.
 
 **The locked MVP target is still not met.** It asks for ≥+25% at B=16 and ≥+100% at
-B=64; braid delivers −16.1% and +48.6%. So this is a **NO-GO against the target** even
-though braid wins the two largest batches, and the design's falsification clause
-applies: re-plan rather than iterate. What the re-plan has to work with is that the
-gap at low batch is weight bytes — braid serves **BF16 (8.44 GB)** against llama.cpp's
-**Q8_0 (4.47 GB)**, and quantizing the MLP alone (54% of weights) already moves B=16
-from 0.76× to 0.84×.
+B=64; braid delivers −0.7% and +57.8%. So this remains a **NO-GO against the target**.
+The re-scoped target that the falsification clause produced after the 4B run — ≥+20% at
+B=32 and ≥+50% at B=64 — **is** met, at +30.1% and +57.8%.
 
-### Measured against projected
+### The lever was weight bytes, and it is now spent
 
-The projections that motivated the build, with what braid actually does beside them:
+The 4B run named the cause of the low-batch deficit: braid read BF16 where llama.cpp
+read Q8_0. Extending FP8 W8A8 from the MLP alone to every projection closed it.
 
-| batch | projected | measured (FP8-MLP) | of projection |
+| | decode-step weight bytes | vs llama.cpp | B=16 | B=64 |
+|---|---:|---:|---:|---:|
+| braid BF16 | 14.78 GiB | 1.88× | 0.80× | 1.14× |
+| braid FP8-MLP | 10.28 GiB | 1.31× | 0.93× | 1.37× |
+| **braid FP8-all** | **7.40 GiB** | **0.94×** | **0.99×** | **1.58×** |
+
+llama.cpp's per-step figure (~7.87 GiB) is **derived**, not measured: the 8.87 GiB GGUF
+less its ~1.01 GiB embedding table, which is gathered rather than swept. braid's is
+measured by `Engine.step_bytes()`.
+
+So braid now reads *fewer* weight bytes per decode step than llama.cpp does, and the
+remaining B≤8 deficit is no longer bytes — it is launch overhead. At B=1 braid runs 265
+GEMM launches per step and reaches 54% of the memory wall against llama.cpp's 88%; that
+is a fixed per-step cost that batching amortises and quantization cannot touch.
+
+**What FP8 costs, measured on the 9B:** perplexity 7.1272 → 7.0773, **−0.70%**. A
+*decrease* is not evidence that quantization helped — it says the cost sits below what a
+16k-token corpus can resolve. Two groups are deliberately excluded: `in_proj_a` /
+`in_proj_b`, because `a_raw` is exponentiated and fp8's three mantissa bits would land
+inside an exponent for 0.4% of a layer's bytes; and `embed_tokens`, which is gathered
+rather than swept.
+
+### Why the 9B is a harder target than the 4B
+
+Qwen3.5-9B grew `hidden_size` (2,560 → 4,096) and `intermediate_size` (9,216 → 12,288)
+and **nothing else** — the GDN state and KV shapes are byte-for-byte identical to the
+4B. So braid's weight deficit against Q8_0 doubled in absolute terms while the
+per-sequence state term it wins on stayed fixed. On the 4B, BF16 alone won +23.7% at
+B=32; on the 9B the same arm gets +5.5%. The win at B≥32 on this model is bought by
+quantization, not inherited.
+
+### Peak VRAM
+
+Measured after construction, so it is what serving needs resident rather than the
+load-time transient:
+
+| batch | BF16 | FP8-MLP | FP8-all |
 |---:|---:|---:|---:|
-| 8 | ~1,300 | 840.9 | 65% |
-| 16 | ~2,390 | 1,573.7 | 66% |
-| 32 | ~4,110 | 3,035.9 | 74% |
-| 64 | ~6,440 | 4,333.4 | 67% |
+| 1 | 16.93 | 12.43 | 9.55 |
+| 16 | 19.93 | 15.44 | 12.56 |
+| 32 | 23.15 | 18.66 | 15.77 |
+| 64 | 29.55 | 25.06 | **22.18** |
 
-braid lands at a consistent **~2/3 of its own roofline projection**. The projections
-assumed end-to-end the bandwidth efficiency the scan kernel reaches in isolation; the
-step is GEMM-dominated and does not get there. They were optimistic by a stable factor
-rather than wrong in shape, which is why the crossover still happened — just later and
-smaller than predicted.
-
-### Two things this measurement corrected
-
-**The previously published 0.85× at B=16 was not shape-matched.** braid's decode bench
-seeded rows with an 8-token prompt and timed at KV 8..256 while llama.cpp decoded at
-KV 128..256. Decode attention reads the whole live KV every step, so braid was being
-timed on a cheaper step. Shape-matched, BF16 at B=16 is **0.76×**, not 0.85×.
-
-**"Batch buckets stop at 16" was wrong, and it was hiding the win.** That decision held
-that c=32 does not fit in VRAM and is throughput-pointless because the linear state
-term overtakes the fixed weight sweep at B=14–18. Measured: B=64 peaks at **20.61 GB
-of 32.6 GB**, B=16→32 is **1.93×** and B=32→64 is **1.43×**, and at 102 MiB of state
-per sequence against 8.44 GB of weights the crossover is near **B≈83**, not 14–18. The
-roadmap scoped this head-to-head at c ∈ {1,2,4,8,16} — exactly the range where braid
-loses every row. Run as written it would have returned a clean NO-GO with the win
-sitting one bucket higher. A planning assumption, never re-measured, nearly falsified
-the project's central claim.
+Card total 31.36 GiB. BF16 at B=64 leaves 1.8 GiB of headroom; FP8-all leaves 9.2.
 
 ### What is not measured here
 
@@ -123,19 +143,34 @@ for and which is a scoped gap rather than a defect.
 
 ## Serving, end to end
 
-braid's own service, prefill included — c=16, 128-token prompts, 64 new tokens, medians
-of 3 processes, spread ≤ 0.8%:
+braid's own service, prefill included — `Qwen3.5-9B`, 128-token prompts, 64 new tokens,
+graphs on, one process per point:
 
-| | aggregate tok/s | prefill tok/s | prefill share of wall | ITL p99 |
-|---|---:|---:|---:|---:|
-| before ragged batched prefill | 122.1 | 270 | 90% | 487.6 ms |
-| **now** | **850.1** | **4,301** | 40% | **15.3 ms** |
+| c | BF16 tok/s | FP8-all tok/s | ITL p50 | ITL p99 | TTFT p50 | VRAM GB | prefill % of wall |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 51.5 | 56.5 | 9.9 ms | 10.2 ms | 519 ms | 10.6 | 45% |
+| 8 | 361.4 | 399.6 | 12.2 ms | 14.3 ms | 1,800 ms | 12.7 | 39% |
+| 16 | 720.8 | 808.2 | 11.9 ms | 16.0 ms | 1,792 ms | 14.7 | 40% |
+| 32 | **997.8** | **1,136.7** | 12.9 ms | 21.0 ms | 2,789 ms | 18.2 | 54% |
+| 64 | 959.9 | 1,085.1 | 17.2 ms | 33.2 ms | 6,467 ms | 25.3 | 70% |
 
-Prefill used to run one sequence per forward, so sixteen concurrent streams prefilled
-sixteen times in sequence at a flat 270 tok/s. The scan's loop costs one iteration per
-*column*, not per token, so a batch of sixteen rows costs what one row costs: prefill
-throughput is now **exactly `270 × rows-per-forward`** to three significant figures. No
-arithmetic got faster.
+(latency and VRAM columns are the FP8-all arm.)
+
+**Served throughput peaks at c=32 and falls at c=64, and the cause is prefill.** Decode
+alone keeps climbing to B=64; end to end it does not, because prefill's share of the
+wall clock goes 40% → 54% → 70%. The GDN prefill scan is still a Python loop over the
+sequence axis, so admitting 64 prompts costs real time that no amount of decode
+throughput hides. That is the next lever, and it is named in the roadmap as a
+chunk-cached scalar scan over prefill.
+
+The host-health sampler flags c=1 and c=8 as power-depressed (272–386 W against a 400 W
+floor). At those concurrencies the GPU is genuinely not saturated — that is the
+measurement, not a throttled host. Every point the claim rests on (c ≥ 16) is healthy.
+
+**Where this came from.** Prefill used to run one sequence per forward. The scan's loop
+costs one iteration per *column*, not per token, so a batch of sixteen rows costs what
+one row costs; batching the rows moved the 4B from 122.1 to 850.1 tok/s at c=16 and the
+ITL p99 from 487.6 ms to 15.3 ms at the same time. No arithmetic got faster.
 
 ## What is built and verified
 
@@ -143,26 +178,35 @@ arithmetic got faster.
 |---|---|
 | Checkpoint loader (VLM-filtered, nested `text_config`, `A = −exp(A_log)` by tensor name) | **done** |
 | Attention (gated GQA, per-head `[q\|gate]` split, partial rope), MLP, sampler | **done**, bit-exact vs HF in fp32 |
-| Gated DeltaNet layer, full 32-layer forward | **done** — fp32 rel L2 **6.4e-7** vs HF |
+| Gated DeltaNet layer, full 32-layer forward | **done** — fp32 rel L2 **4.5e-7** vs HF (9B), 6.1e-7 (4B) |
 | Batched GDN decode kernel, `(batch × n_heads)` grid, device-resident slot indirection | **done**, matches HF reference at B=1/4/8 |
 | Batched slotted causal conv1d + fused SiLU | **done**, 8-step rotating-slot parity |
-| Slot-pooled KV / conv / recurrent caches, batched decode B=2…16 | **done**, fp32 token identity |
-| CUDA-graph buckets over `(batch, kv_len)` | **done** — replay **bit-identical** to eager, 10.3 µs across slot reassignment |
+| Slot-pooled KV / conv / recurrent caches, batched decode B=2…64 | **done**, fp32 token identity |
+| CUDA-graph buckets over `(batch, kv_len)`, to B=64 | **done** — replay **bit-identical** to eager, for every FP8 group too |
 | Chunked prefill · **ragged batched prefill** | **done** — padding provably inert, bitwise |
-| FP8 W8A8 on the MLP (`quant_mlp=True`, opt-in) | **done** — +10.7% at B=16 for +0.50% perplexity |
+| FP8 W8A8 by group — `mlp`, `attn`, `gdn`, `head` (`quant="all"`, opt-in) | **done** — decode-step weights **halved**, 14.78 → 7.40 GiB, for −0.70% perplexity |
 | Continuous-batching scheduler, SSE server, per-row sampling, release on disconnect | **done** |
 | Perplexity harness · noise-floor + host-health harness · llama.cpp baseline | **done** |
 | Paged KV blocks | deferred, with arithmetic — the MVP runs two orders below the threshold |
 | Prefix caching · preemption · chunkwise prefill scan | **not started** |
 
-**170 tests, all green**, run on a remote RTX 5090 via `make test-remote`.
+**194 tests across 23 modules, all green** on both `Qwen3.5-9B` and `Qwen3.5-4B`, run on
+a remote RTX 5090 via `make test-remote` (or `scripts/test_isolated.sh`, one module per
+process — at 9B two module-scoped engines no longer share a card).
 
-**Correctness, all measured:** perplexity **8.2361** vs HF 8.2393 (**0.021%**); fp32
-end-to-end 6.4e-7; bf16 greedy token identity with HF; fp32 token identity at B=2/4/8;
-graph replay bit-identical at `rtol=0, atol=0`; ragged batched prefill bit-identical under
-a changed pad token id.
+**Correctness on the 9B, all measured:** perplexity **7.1272** vs HF **7.1312**
+(**0.0564%**); full 32-layer fp32 forward vs HF **4.538e-07**, cosine 1.000000000, tokens
+identical; full-stack fp32 decode-vs-prefill **1.478e-06**, tokens identical; fp32 token
+identity at B=2/4/8; graph replay bit-identical at `rtol=0, atol=0` for bf16 and for every
+FP8 group; ragged batched prefill bit-identical under a changed pad token id.
 
-Measured scan behaviour (`Qwen3.5-4B` / `Qwen3.6-35B-A3B` share GDN dimensions):
+The two full-stack fp32 gates run on the **CPU** — two fp32 copies of the 9B are 72 GiB,
+and truncating the stack would retire the one claim they exist to make, that all 32 layers
+are wired to the right mixer. The box has 245 GiB of host RAM and a 16-token fp32 forward
+costs ~1.5 s per arm.
+
+Measured scan behaviour (`Qwen3.5-4B`, `Qwen3.5-9B` and `Qwen3.6-35B-A3B` all share GDN
+dimensions — the 9B grew only `hidden_size` and `intermediate_size`):
 
 | batch | µs/step | rows/s | vs b=1 | % of HBM |
 |---:|---:|---:|---:|---:|
@@ -182,24 +226,26 @@ import means you forgot `-remote`, not that the code is broken.
 export BRAID_SSH_KEY=~/.ssh/rtx5090 BRAID_SSH_HOST=root@host BRAID_SSH_PORT=22
 
 make provision        # torch, pytest, numpy, ninja, ccache
-make test-remote      # 170 tests
+make test-remote      # 194 tests
 make lint             # ruff — this one runs locally and costs nothing
 make bench-noise      # measured noise floor + host-health verdict
 make bench-scaling    # the scan scaling curve, COLD and HOT
 
 # Serving throughput, ITL and TTFT
-./scripts/remote.sh 'python3 -B -m braid.bench.serve_bench --concurrency 1 2 4 8 16'
+./scripts/remote.sh 'python3 -B -m braid.bench.serve_bench --quant all'
 
 # Competitor baseline
 ./scripts/remote.sh 'bash scripts/provision_llamacpp.sh'
-./scripts/remote.sh 'bash scripts/stage_model.sh'
-./scripts/remote.sh 'MODEL=/root/models/Qwen3.5-4B-Q8_0.gguf bash scripts/llamacpp_baseline.sh'
+./scripts/remote.sh 'MODEL=Qwen3.5-9B bash scripts/stage_model.sh'
+./scripts/remote.sh 'REPS=5 NPL=1,2,4,8,16,32,64 BATCHES="1 2 4 8 16 32 64" \
+  GGUF=/root/models/Qwen3.5-9B-Q8_0.gguf BRAID_MODEL_DIR=/root/models/Qwen3.5-9B \
+  bash scripts/head_to_head.sh'
 ```
 
 ```python
 from braid.model.engine import Engine
 
-eng = Engine.from_pretrained("/root/models/Qwen3.5-4B", use_kernels=True)
+eng = Engine.from_pretrained("/root/models/Qwen3.5-9B", use_kernels=True, quant="all")
 print(eng.generate_batch([[1, 2, 3], [4, 5]], max_new_tokens=32))
 ```
 
@@ -245,8 +291,9 @@ Each excluded on someone's published measurement, not on taste:
 > (torch 2.11.0+cu128, CUDA 12.8.61): `_scaled_mm` runs, and at the MLP decode shape from an
 > HBM-resident working set it is **1.95× bf16** (1.81× including the activation cast). It is
 > W8A8, not weight-only, so the open question is accuracy rather than availability — see
-> `braid/bench/gemm_paths.py`. **Now implemented** for the MLP projections
-> (`Engine(quant_mlp=True)`, opt-in): +10.7% throughput at B=16 for +0.50% perplexity.
+> `braid/bench/gemm_paths.py`. **Now implemented** for every projection group
+> (`Engine(quant="all")`, opt-in): decode-step weight bytes halved for −0.70% perplexity
+> on the 9B, which is what takes B=16 from 0.80× to 0.99× and B=64 from 1.14× to 1.58×.
 >
 > Two things did fall out of it as refuted. **Rowwise `_scaled_mm` is a slower cuBLAS path
 > on sm_120** — on `mlp.down`, `out_proj` and `gdn.in_proj_z` it is slower than not
