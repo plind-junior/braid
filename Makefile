@@ -1,4 +1,5 @@
-.PHONY: provision test-remote bench-noise bench-scaling gpu-start gpu-stop gpu-status
+.PHONY: provision test-remote bench-noise bench-scaling gpu-start gpu-stop gpu-status \
+        lint fmt
 
 # The box bills ~$0.79/hr while running and storage-only while stopped, so stop
 # it as soon as a batch of GPU work is done. Always `stop`, never `destroy`:
@@ -34,3 +35,16 @@ bench-noise:
 
 bench-scaling:
 	./scripts/remote.sh python3 -B -m braid.bench.scan_scaling
+
+# Lint runs LOCALLY -- it needs no GPU, so it costs nothing and there is no
+# reason to burn box time on it. Config lives in pyproject.toml.
+#
+# `fmt` applies ruff's safe autofixes (unused imports, import order). It does
+# NOT run `ruff format`: the numeric code is hand-aligned in places where a
+# formatter would make it worse, and adopting one now would bury every real
+# diff under a reflow.
+lint:
+	ruff check .
+
+fmt:
+	ruff check --fix .

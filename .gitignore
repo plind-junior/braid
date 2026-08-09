@@ -1,6 +1,7 @@
 __pycache__/
 *.py[cod]
 .pytest_cache/
+.ruff_cache/
 .venv/
 *.egg-info/
 
@@ -13,3 +14,12 @@ docs/superpowers/
 # but TORCH_EXTENSIONS_DIR can redirect it here)
 build/
 *.so
+
+# Profiler output pulled back from the box. These are large and binary; keep
+# the number they produced in a doc, not the report itself.
+*.ncu-rep
+*.nsys-rep
+*.sqlite
+
+# Staged weights, if anyone ever points the loader at a local path.
+models/

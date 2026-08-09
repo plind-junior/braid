@@ -1,9 +1,37 @@
 [project]
 name = "braid"
 version = "0.1.0"
+description = "A single-GPU inference engine for attention/Gated-DeltaNet hybrids, built to serve them at concurrency on one RTX 5090."
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
+
+# Deliberately no [build-system]: braid is imported from the repo root, never
+# installed. `scripts/provision_remote.sh` installs the runtime deps on the box.
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v --tb=short"
 markers = ["slow: materialises the whole checkpoint; deselect with -m 'not slow'"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP"]
+ignore = [
+  # Line length is the formatter's call, not the linter's.
+  "E501",
+  # `l` reads as "layer" throughout the engine and the scheduler.
+  "E741",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Bench and diagnostic code has two deliberate patterns ruff reads as errors:
+# a timing closure (`_time(lambda: ...)`) is an assigned lambda, and freeing a
+# big tensor with `del` at the end of a loop body makes ruff treat uses earlier
+# in that body as references to an unbound name. Both are correct as written.
+"braid/bench/*" = ["E731", "F821"]
+"scripts/*" = ["E731", "F821"]
+"tests/*" = ["E731"]
