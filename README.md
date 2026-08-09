@@ -98,6 +98,25 @@ sub-2% spreads. This table was published as a NO-GO twice — at −16.1%/+48.6%
 and +2.8%/+84.0% on this model — while the target stayed pinned to the batches it
 names; the earlier re-scoped target (≥+20% at B=32, ≥+50% at B=64) is now academic.
 
+### The win survives longer prompts
+
+Everything above is 128-token prompts. The obvious objection is that real workloads
+carry more, and deeper KV is a per-sequence cost that grows with batch. Measured at
+**4× the prompt depth** (`-npp 512 -ntg 64`, 3 processes per point, spreads ≤0.94%,
+same session, rotated arms):
+
+| batch | llama.cpp Q8_0 | braid FP8 + fp16 state | delta | at npp=128 |
+|---:|---:|---:|---:|---:|
+| 1 | 155.4 | 122.5 | −21.2% | −22.0% |
+| 16 | 1,323.8 | 1,671.5 | **+26.3%** | +26.5% |
+| 64 | 2,293.7 | 4,742.9 | **+106.8%** | +118.8% |
+| 128 | 2,564.4 | 6,343.0 | **+147.3%** | +170.4% |
+
+The low-batch picture does not move. The high-batch margin compresses 12–23 points —
+decode attention reads KV 512..576 deep instead of 128..256, and both engines pay it —
+but braid still clears 2.4× at B=128, still scales 51.8× against llama.cpp's 16.5×,
+and **both clauses of the locked target hold at the longer prompt too**.
+
 ### The lever was weight bytes, and it is now spent
 
 The 4B run named the cause of the low-batch deficit: braid read BF16 where llama.cpp
@@ -189,6 +208,18 @@ previously published 9.748 ms to 3 ppm — same harness, same session structure.
 both levers are asserted bit-identical to their fallbacks, this is a launch-count
 change with **no numerics consequence**: perplexity and every parity gate are
 unaffected by construction, and the full 26-module suite passes on both models.
+
+**The third cut, and a measurement that nearly lied.** The remaining copies — the conv
+input cast and the q/k/v `.contiguous()` copies feeding the scan — were killed by
+letting the conv kernel read bf16 directly and the scan kernels read strided
+column-slice views (bit-identical by test, like the others; ~96 launches/step
+removed). A cross-session comparison first read this as **−2% at B=64/128**, and a
+regime-split "fix" was built before the claim was checked the only valid way: a
+same-session A/B of views against copies, with B=8 as a shared-code control. The
+control agreed to 0.1%; the views **beat** the copies by ~1% at B=64/128. The −2% was
+day-to-day session drift wearing a regression's clothes, the split was reverted, and
+the views ship everywhere. Cross-session deltas under ~2% are not attributable to
+code on this box — that is now written down where it was almost violated.
 
 **What FP8 costs, measured on the 9B:** perplexity 7.1272 → 7.0773, **−0.70%**. A
 *decrease* is not evidence that quantization helped — it says the cost sits below what a
@@ -294,6 +325,43 @@ power-depressed because a single stream genuinely does not saturate the card —
 the measurement, not a throttled host. c=96/128 are reachable because the scheduler's
 graph-bucket ladder now extends there (and an off-rung capacity captures its own rung
 rather than crashing mid-serve).
+
+### Server against server
+
+The decode head-to-head above isolates the step; this races the actual services —
+braid's HTTP/SSE server against `llama-server`, same box, same binary flags as the
+published decode arm plus capacity provisioning (`-np`, `--threads-http`; braid's
+accept backlog got the identical treatment). One stdlib-asyncio client drives both
+wire formats with identical random token-id prompts (llama.cpp has prefix caching,
+braid does not; fresh prompts keep that lever out), ramped connects, and a per-point
+guilt figure: the client publishes its own CPU/wall ratio, and every published point
+shows it idle. 3 reps per point, 128-token prompts, 64 generated, medians:
+
+| c | llama-server | braid | delta | TTFT p50 (llama → braid) | ITL p50 (llama → braid) |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 125.4 | 115.9 | −7.6% | 92 → 35 ms | 6.6 → 8.3 ms |
+| 8 | 377.1 | 649.7 | **+72%** | 676 → 84 ms | 10.5 → 10.6 ms |
+| 16 | 379.2 | 1,156.4 | **+205%** | 1,355 → 88 ms | 16.4 → 10.8 ms |
+| 32 | 402.3 | 1,746.1 | **+334%** | 2,295 → 105 ms | 35.9 → 12.6 ms |
+| 64 | 399.2 | 2,288.9 | **+473%** | 3,682 → 124 ms | 61.8 → 17.9 ms |
+| 128 | 47.7 | 2,795.1 | — | 287,240 → **158 ms** | 127.0 → 26.9 ms |
+
+Spreads: braid 5.0%, llama-server 28.1%. No request errors, no client-bound points.
+
+**The serving gap is much wider than the decode gap, and the reason is visible in the
+TTFT column.** llama-server's time-to-first-token grows *linearly* at ~57 ms per
+concurrent stream — the signature of serialized prompt processing — and its aggregate
+sits flat near 400 tok/s from c=8 to c=64 while the *same binary* decodes 2,392 tok/s
+at B=64 in its own `llama-batched-bench`. Its kernels are not the bottleneck; its
+scheduler under request churn is. That is the gap braid was designed around: chunked
+ragged prefill co-scheduled with decode holds braid's TTFT at 84–158 ms across the
+whole curve. The c=128 row's delta is left unnumbered because llama-server is outside
+its working envelope there (four-minute TTFTs are a failure mode, not a throughput);
+the defensible headline is c=8–64: **+72% to +473% served**.
+
+The one number braid loses (−7.6% at c=1) and the HTTP tax (2,795 served at c=128
+against 3,633 in-process) are printed unchanged. This measurement supersedes the
+earlier caveat that no server-vs-server comparison had been run.
 
 **The control is ITL.** The chunk scan touches prefill only, so decode must not move —
 and it does not: ITL p50 reads 9.83 / 12.00 / 11.49 / 12.16 / 14.80 ms with the kernel
