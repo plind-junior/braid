@@ -21,12 +21,24 @@ def load_gdn():
     os.environ.setdefault("MAX_JOBS", "8")  # nvcc is memory-hungry
     from torch.utils.cpp_extension import load
 
+    # `BRAID_KERNEL_VERBOSE=1` adds `-Xptxas=-v`, which prints registers per
+    # thread and **spill stores/loads** per kernel. That is the number that
+    # decides whether `gdn_prefill` is doing what it claims: it holds the whole
+    # [128] state column in registers across the chunk, and if nvcc spills it to
+    # local memory the arithmetic is still exact but the entire point is gone.
+    # Off by default because it changes the flags, and changing the flags
+    # invalidates ninja's cache and forces a rebuild.
+    verbose = os.environ.get("BRAID_KERNEL_VERBOSE") == "1"
+    flags = ["-O3", "-lineinfo"]
+    if verbose:
+        flags.append("-Xptxas=-v")
+
     return load(
         name="braid_gdn",
         sources=[str(_CSRC / "bindings.cpp"), str(_CSRC / "gdn_decode.cu"),
                  str(_CSRC / "conv1d_decode.cu")],
         # NO --use_fast_math: it turns rsqrtf into an approximation and breaks
         # fp32 parity against the oracle at the tolerances the tests assert.
-        extra_cuda_cflags=["-O3", "-lineinfo"],
-        verbose=False,
+        extra_cuda_cflags=flags,
+        verbose=verbose,
     )

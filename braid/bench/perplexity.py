@@ -34,6 +34,7 @@ from pathlib import Path
 
 import torch
 
+from braid.bench.decode_speed import STATE_DTYPES
 from braid.model.quant import GROUPS, linear, parse_groups
 
 DEFAULT_MODEL_DIR = Path(os.environ.get("BRAID_MODEL_DIR", "/root/models/Qwen3.5-4B"))
@@ -154,19 +155,50 @@ def perplexity(
 def braid_perplexity(corpus: Corpus, model_dir: Path = DEFAULT_MODEL_DIR,
                      dtype: torch.dtype = torch.bfloat16, window: int = 2048,
                      progress: bool = False, drop_final_norm_offset: bool = False,
-                     quant=None):
+                     quant=None, state_dtype: torch.dtype = torch.float32,
+                     chunk: int = 0, use_kernels: bool = False):
     """`drop_final_norm_offset` is the deliberate-bug arm: it undoes the `1+W`
     fold on the final norm only, which the roadmap predicts costs ~2x perplexity.
-    It exists so the gate is shown to detect the thing it is for."""
+    It exists so the gate is shown to detect the thing it is for.
+
+    `chunk > 0` feeds each window through a **cache** in pieces instead of as one
+    cacheless forward. That is the only way this harness can price
+    `state_dtype`: with no cache the recurrent state never round-trips through
+    the pool, so a narrower pool is literally unused and would score identically
+    for the wrong reason. At `chunk=128` a 2,048-token window crosses the pool
+    sixteen times.
+
+    `use_kernels` is what prices the **prefill** kernel. The CUDA path deviates
+    from HF in one documented place — it l2-normalises q and k in fp32 where HF
+    normalises in the activation dtype — and with `chunk > 0` a window is fed as
+    T-token prefills, so `gdn_prefill` runs the whole corpus. The torch path is
+    the default here precisely because the parity gates live on it; this arm
+    exists so the kernel path's deviation is a measured cost rather than an
+    argued-for one.
+    """
     from braid.model.engine import Engine
     from braid.model.loader import load_checkpoint
 
     ck = load_checkpoint(model_dir, device="cuda", dtype=dtype)
     if drop_final_norm_offset:
         ck.tensors["norm"] = ck.tensors["norm"] - 1.0
-    eng = Engine.from_checkpoint(ck, device="cuda", dtype=dtype, quant=quant)
+    eng = Engine.from_checkpoint(ck, device="cuda", dtype=dtype, quant=quant,
+                                 state_dtype=state_dtype, use_kernels=use_kernels)
     del ck
-    res = perplexity(lambda ids: eng.hidden_states(ids, cache=None, last_only=False),
+
+    def cacheless(ids):
+        return eng.hidden_states(ids, cache=None, last_only=False)
+
+    def cached(ids):
+        T = ids.shape[1]
+        cache = eng.allocate_cache(max_len=T + 1, max_slots=1)
+        cache.reset_slot(0)
+        view = cache.select([0])
+        return torch.cat([eng.hidden_states(ids[:, i:i + chunk], view,
+                                            last_only=False)
+                          for i in range(0, T, chunk)], dim=1)
+
+    res = perplexity(cached if chunk else cacheless,
                      eng.lm_head, corpus, window=window, progress=progress)
     return res, eng
 
@@ -248,6 +280,17 @@ def main() -> None:
                         f"{','.join(GROUPS)}, or 'all'")
     p.add_argument("--quant-mlp", action="store_true",
                    help="shorthand for --quant mlp")
+    p.add_argument("--state-dtype", default="fp32",
+                   choices=["fp32", "fp16", "bf16"],
+                   help="storage type for the recurrent state pool; implies "
+                        "--chunk, since a cacheless forward never uses the pool")
+    p.add_argument("--chunk", type=int, default=0,
+                   help="feed each window through a cache in pieces of this "
+                        "many tokens (0 = one cacheless forward)")
+    p.add_argument("--kernels", action="store_true",
+                   help="also run a CUDA-kernel arm. Implies --chunk: the "
+                        "prefill kernel is only reachable through a cache, and "
+                        "this is what prices its fp32 l2norm deviation")
     p.add_argument("--skip-hf", action="store_true",
                    help="skip the HF arm (it is the slow one and does not move)")
     args = p.parse_args()
@@ -265,12 +308,56 @@ def main() -> None:
         gc.collect()
         torch.cuda.empty_cache()
 
+    # A narrow state pool is only reachable through a cache, so asking for one
+    # implies the chunked protocol. Both arms then use it, or the comparison
+    # would be pricing "chunked vs whole" and calling it "fp16 vs fp32".
+    state_dtype = STATE_DTYPES[args.state_dtype]
+    chunk = args.chunk or (128 if state_dtype is not torch.float32
+                           or args.kernels else 0)
+    if chunk:
+        print(f"  protocol: each window fed through a cache in {chunk}-token "
+              f"chunks ({args.window // chunk} state round-trips per window)")
+
     br_res, eng = braid_perplexity(corpus, args.model_dir, window=args.window,
-                                   progress=True)
+                                   progress=True, chunk=chunk)
     print(f"  braid {br_res}")
     del eng
     gc.collect()
     torch.cuda.empty_cache()
+
+    if state_dtype is not torch.float32:
+        st, eng4 = braid_perplexity(corpus, args.model_dir, window=args.window,
+                                    progress=True, chunk=chunk,
+                                    state_dtype=state_dtype)
+        rel = (st.perplexity - br_res.perplexity) / br_res.perplexity
+        gib = sum(l.state.numel() * l.state.element_size()
+                  for l in eng4.allocate_cache(args.window + 1, 1).layers
+                  if hasattr(l, "state")) / 2 ** 30
+        print(f"\n  recurrent state stored as {args.state_dtype} "
+              f"({gib:.3f} GiB per sequence-slot, half of fp32)")
+        print(f"    braid fp32 state {br_res.perplexity:.4f} -> "
+              f"{args.state_dtype} {st.perplexity:.4f}   {rel * 100:+.2f}%")
+        del eng4
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    if args.kernels:
+        # Same corpus, same window, same chunk protocol, same fp32 state — the
+        # ONLY thing that moves is which implementation runs the scan. So the
+        # delta is the CUDA path's numerics and nothing else.
+        kr, engk = braid_perplexity(corpus, args.model_dir, window=args.window,
+                                    progress=True, chunk=chunk, use_kernels=True)
+        rel = (kr.perplexity - br_res.perplexity) / br_res.perplexity
+        print(f"\n  CUDA kernels (conv1d_decode + gdn_prefill), {chunk}-token "
+              f"chunks")
+        print(f"    braid torch {br_res.perplexity:.4f} -> kernels "
+              f"{kr.perplexity:.4f}   {rel * 100:+.2f}%")
+        print("    the kernels l2-normalise q/k in fp32 where HF and the torch "
+              "path\n    normalise in the activation dtype; this is what that "
+              "costs.")
+        del engk
+        gc.collect()
+        torch.cuda.empty_cache()
 
     if hf_res is not None:
         delta = abs(br_res.perplexity - hf_res.perplexity) / hf_res.perplexity

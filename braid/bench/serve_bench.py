@@ -31,6 +31,7 @@ from pathlib import Path
 
 import torch
 
+from braid.bench.decode_speed import STATE_DTYPES
 from braid.bench.noise_floor import HostHealthSampler
 from braid.model.engine import Engine
 from braid.model.loader import load_checkpoint
@@ -197,6 +198,14 @@ def main() -> None:
     p.add_argument("--quant-mlp", action="store_true",
                    help="shorthand for --quant mlp")
     p.add_argument("--no-graphs", action="store_true")
+    p.add_argument("--state-dtype", default="fp32", choices=["fp32", "fp16", "bf16"],
+                   help="storage type for the recurrent state pool; the scan is "
+                        "fp32 either way")
+    p.add_argument("--no-chunk-prefill", action="store_true",
+                   help="fall back to the Python loop over columns in the GDN "
+                        "scan. This is the baseline arm for pricing `gdn_prefill`; "
+                        "it changes prefill only, so a decode-side difference "
+                        "between the two arms is noise and should be read as such.")
     p.add_argument("--prefill-chunk", type=int, default=256,
                    help="per-row prompt tokens per tick; bounds the scan loop's T")
     p.add_argument("--prefill-budget", type=int, default=None,
@@ -211,9 +220,17 @@ def main() -> None:
     quant_groups = parse_groups(quant)
     ck = load_checkpoint(MODEL_DIR, device="cuda", dtype=torch.bfloat16)
     eng = Engine.from_checkpoint(ck, device="cuda", dtype=torch.bfloat16,
-                                 use_kernels=True, quant=quant)
+                                 use_kernels=True, quant=quant,
+                                 state_dtype=STATE_DTYPES[args.state_dtype])
     del ck
     torch.cuda.empty_cache()
+
+    # Asserted, not assumed: a toggle that matched no layers would publish a 0%
+    # effect and read as "the kernel is worth nothing" instead of "the arm never
+    # switched". 24 GDN layers on both the 4B and the 9B.
+    touched = eng.set_chunk_prefill(not args.no_chunk_prefill)
+    if touched == 0:
+        raise SystemExit("no GDN layer accepted the chunk-prefill toggle")
 
     rep = Report(env=_env())
     for c in args.concurrency:
@@ -225,7 +242,10 @@ def main() -> None:
 
     if args.json:
         print(json.dumps({"points": [asdict(x) for x in rep.points],
-                          "env": rep.env}))
+                          "env": rep.env,
+                          "quant": sorted(quant_groups),
+                          "state_dtype": args.state_dtype,
+                          "chunk_prefill": not args.no_chunk_prefill}))
         return
 
     print(f"\nenv: {rep.env}")
@@ -233,6 +253,8 @@ def main() -> None:
           f"{args.requests_per_stream} requests per slot, "
           f"graphs {'off' if args.no_graphs else 'on'}, "
           f"fp8 {sorted(quant_groups) or 'none'}, "
+          f"state {args.state_dtype}, "
+          f"chunk scan {'off' if args.no_chunk_prefill else 'on'}, "
           f"prefill chunk {args.prefill_chunk} budget "
           f"{args.prefill_budget or 'capacity*chunk'}\n")
     print(f"{'c':>3}{'tok/s':>9}{'TTFT p50':>10}{'p90':>8}"

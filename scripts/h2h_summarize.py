@@ -71,11 +71,26 @@ def main(path: str, base: str = "llamacpp") -> None:
             if row:
                 print(f"  {a:<11} {row}")
 
-    print(f"\nscaling B={batches[0]} -> B={batches[-1]}:")
+    # **Each arm scales to its OWN largest measured batch, and that batch is
+    # printed.** Arms in this sweep have different footprints -- an fp32 state
+    # pool runs out where an fp16 one keeps going -- so an arm that OOMed at 128
+    # simply has no row there. Quoting scaling only for arms that reached the
+    # last column would drop those arms from this section without saying so,
+    # which reads as "not measured" rather than "did not fit". The ceiling is
+    # part of the result.
+    print(f"\nscaling, B={batches[0]} -> each arm's largest batch that fit:")
     for a in order:
-        lo, hi = (a, batches[0]), (a, batches[-1])
-        if lo in tps and hi in tps:
-            print(f"  {a:<11} {st.median(tps[hi]) / st.median(tps[lo]):>5.1f}x")
+        lo = (a, batches[0])
+        top = max((b for b in batches if (a, b) in tps), default=None)
+        if lo not in tps or top is None:
+            print(f"  {a:<11} {'-':>5}   (no B={batches[0]} point)")
+            continue
+        ratio = st.median(tps[(a, top)]) / st.median(tps[lo])
+        # Neutral wording on purpose: a missing row above `top` is almost always
+        # an OOM for a braid arm, but the rows alone cannot prove that. The
+        # reason is in the run's stderr, where `decode_speed` prints the OOM.
+        note = "" if top == batches[-1] else f"  (no row above B={top})"
+        print(f"  {a:<11} {ratio:>5.1f}x  at B={top}{note}")
 
 
 if __name__ == "__main__":

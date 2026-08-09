@@ -44,6 +44,13 @@ class GatedDeltaNet:
         self.cfg = cfg
         self.g = cfg.gdn
         self.use_kernels = use_kernels
+        # Flipped by `Engine.set_chunk_prefill` for the A/B that prices this
+        # kernel. It is an attribute rather than a constructor argument on
+        # purpose: attributing a served-throughput change to the chunk scan
+        # means flipping it inside ONE process, on ONE set of weights, with
+        # every other term held fixed — two separately-loaded engines would
+        # differ by page-cache state and allocator history as well.
+        self.chunk_prefill = use_kernels
         w = weights
         self.in_proj_qkv = maybe_quantize(w["linear_attn.in_proj_qkv"], quant)
         self.in_proj_z = maybe_quantize(w["linear_attn.in_proj_z"], quant)
@@ -153,7 +160,9 @@ class GatedDeltaNet:
 
         # The pool may be fp32 (the CUDA conv kernel requires it) while the
         # activations are bf16, so every crossing is cast explicitly. Prefill
-        # runs this path even under `use_kernels`, since the kernels decode only.
+        # runs this path even under `use_kernels`: `conv1d_decode` is a one-step
+        # kernel and has no chunk form, unlike the scan, which now has
+        # `gdn_prefill`. So the conv is what still costs a launch per column.
         if cache is not None:
             # Splice each row's own window in front — for T > 1 exactly as for
             # T == 1. The cached window holds the last K **pre-conv** inputs, so
@@ -260,6 +269,30 @@ class GatedDeltaNet:
             alpha = torch.where(live, alpha, 1.0)
             beta = torch.where(live, beta, 0.0)
 
+        # **The chunk kernel: one launch per layer instead of T iterations.**
+        # The Python loop below costs one iteration per *column* and each
+        # iteration is a handful of small kernels, which is what leaves prefill
+        # at 70% of the served wall clock at c=64 even after the rows were
+        # batched. `gdn_prefill` runs the identical scalar recurrence with the
+        # state held in registers for the whole chunk.
+        #
+        # It normalises q and k internally, exactly as `gdn_decode` does, so raw
+        # post-conv values go in — and prefill therefore stays the same
+        # arithmetic as decode by construction, which is the property this
+        # module is built around.
+        # `slots_i32` is what makes the device-side slot indirection possible;
+        # a caller that passed a cache without it gets the torch loop rather
+        # than a crash, which is the contract the T == 1 path already has.
+        if self.chunk_prefill and cache is not None and slots_i32 is not None:
+            y = torch.empty(B, T, g.n_heads, g.head_dim, device=x.device,
+                            dtype=torch.float32)
+            self._mod.gdn_prefill(
+                cache.state, slots_i32,
+                q.float().contiguous(), k.float().contiguous(),
+                v.float().contiguous(),
+                alpha.contiguous(), beta.contiguous(), y)
+            return self._readout(z, y, B, T, dtype)
+
         # l2norm in the ACTIVATION dtype, then cast — HF's order. Normalising
         # after the cast changes the last bits and compounds over 24 layers.
         qn = _l2norm(q).float()
@@ -271,7 +304,11 @@ class GatedDeltaNet:
         # Phase 1 CUDA kernel takes `slot_idx` and does the indirection on the
         # device instead. This torch path exists to be obviously correct.
         if cache is not None:
-            state = cache.state.index_select(0, slots)
+            # Widened on read, narrowed once on write — the scan itself is fp32
+            # whatever the pool's storage type is, exactly as the CUDA kernel
+            # does it. `index_select` already copies, so `.float()` on an fp32
+            # pool is a no-op view-cast and costs nothing.
+            state = cache.state.index_select(0, slots).float()
         else:
             state = torch.zeros(B, g.n_heads, g.state_size, g.head_dim,
                                 device=x.device, dtype=torch.float32)
@@ -283,7 +320,7 @@ class GatedDeltaNet:
                 alpha=alpha[:, t], beta=beta[:, t], cfg=g, normalize=False,
             )
         if cache is not None:
-            cache.state.index_copy_(0, slots, state)
+            cache.state.index_copy_(0, slots, state.to(cache.state.dtype))
 
         return self._readout(z, y, B, T, dtype)
 

@@ -65,6 +65,9 @@ class Engine:
     source: Checkpoint | None = None
     use_kernels: bool = False
     quant: frozenset[str] = field(default_factory=frozenset)
+    # Storage type for the recurrent state pool. See `RecurrentCache`: only the
+    # storage narrows, the scan is fp32 either way.
+    state_dtype: torch.dtype = torch.float32
 
     # --- construction --------------------------------------------------------
 
@@ -72,7 +75,8 @@ class Engine:
     def from_checkpoint(cls, ckpt: Checkpoint, device: str | torch.device = "cuda",
                         dtype: torch.dtype = torch.bfloat16,
                         use_kernels: bool = False,
-                        quant: str | Iterable[str] | None = None) -> Engine:
+                        quant: str | Iterable[str] | None = None,
+                        state_dtype: torch.dtype = torch.float32) -> Engine:
         cfg = ckpt.config
         groups = parse_groups(quant)
         layers = [DecoderLayer(cfg, i, ckpt.layer(i), use_kernels=use_kernels,
@@ -94,21 +98,56 @@ class Engine:
             source=None if groups else ckpt,
             use_kernels=use_kernels,
             quant=groups,
+            state_dtype=state_dtype,
         )
 
     @classmethod
     def from_pretrained(cls, path: str | Path, device: str | torch.device = "cuda",
                         dtype: torch.dtype = torch.bfloat16,
                         use_kernels: bool = False,
-                        quant: str | Iterable[str] | None = None) -> Engine:
+                        quant: str | Iterable[str] | None = None,
+                        state_dtype: torch.dtype = torch.float32) -> Engine:
         return cls.from_checkpoint(load_checkpoint(path, device=device, dtype=dtype),
-                                   device, dtype, use_kernels, quant)
+                                   device, dtype, use_kernels, quant, state_dtype)
 
-    def allocate_cache(self, max_len: int, max_slots: int = 1) -> Cache:
+    def set_chunk_prefill(self, enabled: bool) -> int:
+        """Turn the `gdn_prefill` chunk scan on or off across every GDN layer.
+
+        **This exists to be measured, not configured.** Serving always wants it
+        on; the bench needs it off to say what it was worth. The two arms are
+        still run as separate processes, because the measurement contract asks
+        for medians over independent processes — what the toggle buys is that
+        those processes differ in exactly one attribute and share every line of
+        construction, rather than being two code paths that drifted apart.
+
+        Off falls back to the Python loop over columns, which is the same
+        arithmetic the torch path has always run. Returns the number of layers
+        touched: a toggle that silently matched nothing (an engine built with
+        `use_kernels=False`, say) would otherwise report a 0% effect and look
+        like a refutation of the kernel rather than of the measurement.
+        """
+        n = 0
+        for layer in self.layers:
+            mixer = getattr(layer, "mixer", None)
+            if hasattr(mixer, "chunk_prefill"):
+                # `use_kernels=False` has no kernel module to call, so enabling
+                # the chunk scan there is not a slower arm, it is an AttributeError.
+                mixer.chunk_prefill = enabled and mixer.use_kernels
+                n += 1
+        return n
+
+    def allocate_cache(self, max_len: int, max_slots: int = 1,
+                       state_dtype: torch.dtype | None = None) -> Cache:
         # The conv kernel requires an fp32 window; the torch path keeps the
         # activation dtype so its numerics stay what Phase 2 measured.
+        #
+        # `state_dtype` defaults to this engine's `state_dtype`, so a server
+        # configured once gets narrow state everywhere without every call site
+        # repeating it; passing it explicitly is for the gates that compare a
+        # narrow pool against an fp32 one.
         return Cache.allocate(self.config, max_slots, max_len, self.device, self.dtype,
-                              conv_dtype=torch.float32 if self.use_kernels else None)
+                              conv_dtype=torch.float32 if self.use_kernels else None,
+                              state_dtype=state_dtype or self.state_dtype)
 
     # --- forward -------------------------------------------------------------
 

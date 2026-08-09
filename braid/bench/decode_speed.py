@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -93,7 +94,11 @@ def _time(fn, steps: int, reset) -> float:
     return start.elapsed_time(end) / 1e3 / steps
 
 
-def _engine(use_kernels: bool, quant) -> Engine:
+STATE_DTYPES = {"fp32": torch.float32, "fp16": torch.float16,
+                "bf16": torch.bfloat16}
+
+
+def _engine(use_kernels: bool, quant, state_dtype=torch.float32) -> Engine:
     """A fresh engine, with the source checkpoint dropped immediately.
 
     **Loading once outside the loop and reusing the checkpoint is what this
@@ -107,20 +112,22 @@ def _engine(use_kernels: bool, quant) -> Engine:
     """
     ck = load_checkpoint(MODEL_DIR, device="cuda")
     eng = Engine.from_checkpoint(ck, device="cuda", dtype=torch.bfloat16,
-                                 use_kernels=use_kernels, quant=quant)
+                                 use_kernels=use_kernels, quant=quant,
+                                 state_dtype=state_dtype)
     del ck
     torch.cuda.empty_cache()
     return eng
 
 
-def measure(batch: int, steps: int, max_len: int,
-            quant=None, prompt_len: int = PROMPT_LEN) -> list[Arm]:
+def measure(batch: int, steps: int, max_len: int, quant=None,
+            prompt_len: int = PROMPT_LEN,
+            state_dtype: torch.dtype = torch.float32) -> list[Arm]:
     arms: list[Arm] = []
     tokens = torch.full((batch, 1), 42, dtype=torch.long, device="cuda")
     slots = torch.arange(batch, device="cuda")
 
     for name, use_kernels in (("eager-torch", False), ("eager-kernels", True)):
-        eng = _engine(use_kernels, quant)
+        eng = _engine(use_kernels, quant, state_dtype)
         cache = eng.allocate_cache(max_len, max_slots=batch)
         view = cache.select(list(range(batch)))
         _seed(eng, cache, batch, prompt_len)
@@ -130,7 +137,7 @@ def measure(batch: int, steps: int, max_len: int,
         arms.append(Arm(name, batch, s * 1e3, batch / s, steps))
         del eng, cache, view, snap
 
-    eng = _engine(True, quant)
+    eng = _engine(True, quant, state_dtype)
     # Peak is measured from **here**, not from process start, and the difference
     # is not cosmetic. Building a quantized engine holds the bf16 originals and
     # the fp8 copies at the same moment, so the construction transient is larger
@@ -193,6 +200,9 @@ def main() -> None:
                         f"or 'all'")
     p.add_argument("--quant-mlp", action="store_true",
                    help="shorthand for --quant mlp")
+    p.add_argument("--state-dtype", default="fp32", choices=["fp32", "fp16", "bf16"],
+                   help="storage type for the recurrent state pool; the scan is "
+                        "fp32 either way")
     p.add_argument("--prompt-len", type=int, default=PROMPT_LEN,
                    help="KV under each row before timing; match the competitor's "
                         "shape when producing a head-to-head number")
@@ -202,7 +212,8 @@ def main() -> None:
     # Built once up front purely to state what the run actually quantized --
     # `maybe_quantize` declines shapes it cannot handle, so the request and the
     # result are not the same thing (`Engine.quant_report`).
-    probe = _engine(True, quant)
+    state_dtype = STATE_DTYPES[args.state_dtype]
+    probe = _engine(True, quant, state_dtype)
     report_q, step_bytes = probe.quant_report(), probe.step_bytes()
     del probe
     torch.cuda.empty_cache()
@@ -211,14 +222,28 @@ def main() -> None:
     out: list[Arm] = []
     with HostHealthSampler() as health:
         for b in args.batches:
-            out.extend(measure(b, args.steps, args.max_len, quant=quant,
-                               prompt_len=args.prompt_len))
+            try:
+                out.extend(measure(b, args.steps, args.max_len, quant=quant,
+                                   prompt_len=args.prompt_len,
+                                   state_dtype=state_dtype))
+            except torch.OutOfMemoryError as e:
+                # **A batch that does not fit is a result, not a crash.** The
+                # sweep spans arms with different footprints -- an fp32 state
+                # pool stops at B=64 on this card where an fp16 one reaches 128
+                # -- and killing the whole run at the first arm to run out means
+                # no arm gets measured at any batch. Report the hole and go on;
+                # `h2h_summarize.py` renders a missing point as "-", which is
+                # the honest way to publish "this configuration does not fit".
+                print(f"OOM at batch {b}: {str(e).splitlines()[0]}", file=sys.stderr)
+                torch.cuda.empty_cache()
+                torch.cuda.reset_peak_memory_stats()
     report = health.report()
 
     if args.json:
         print(json.dumps({"arms": [asdict(a) for a in out],
                           "health": str(report),
                           "quant": sorted(parse_groups(quant)),
+                          "state_dtype": args.state_dtype,
                           "step_bytes": step_bytes}))
         return
 

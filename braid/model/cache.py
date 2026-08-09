@@ -103,16 +103,29 @@ class RecurrentCache:
     """
 
     def __init__(self, cfg: ModelConfig, max_slots: int,
-                 device: str | torch.device, dtype: torch.dtype):
+                 device: str | torch.device, dtype: torch.dtype,
+                 state_dtype: torch.dtype = torch.float32):
         g = cfg.gdn
         # The CUDA conv kernel requires fp32; the torch path uses the activation
         # dtype so its numerics stay exactly what Phase 2 measured.
         self.conv = torch.zeros(max_slots, g.conv_channels, g.conv_kernel,
                                 device=device, dtype=dtype)
-        # fp32 regardless of the activation dtype: `mamba_ssm_dtype` is float32,
-        # and FP8 E4M3 state is refuted outright.
+        # **The state is the largest per-sequence term and it is half the decode
+        # step's traffic at B=64.** 48 MiB per sequence on Qwen3.5-9B (24 GDN
+        # layers x 32 heads x 128 x 128 x 4 B), read and written every step: at
+        # B=64 that is 6.14 GiB against 7.40 GiB of fp8 weights. Storing it in
+        # 16 bits halves the term that caps the curve.
+        #
+        # fp32 remains the default because it is what `mamba_ssm_dtype` is and
+        # what every parity gate is calibrated against. **Only the storage
+        # narrows** — the recurrence is computed in fp32 in both the torch path
+        # and the kernel, so what a 16-bit state costs is one rounding per step,
+        # not a lower-precision scan.
+        if state_dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            raise ValueError(f"state_dtype {state_dtype} is not one of "
+                             "fp32 / fp16 / bf16")
         self.state = torch.zeros(max_slots, g.n_heads, g.state_size, g.head_dim,
-                                 device=device, dtype=torch.float32)
+                                 device=device, dtype=state_dtype)
 
     def reset(self, slot: int) -> None:
         """Zero one slot. A slot handed to a new sequence carrying the previous
@@ -143,10 +156,12 @@ class Cache:
     @classmethod
     def allocate(cls, cfg: ModelConfig, max_slots: int, max_len: int,
                  device: str | torch.device, dtype: torch.dtype,
-                 conv_dtype: torch.dtype | None = None) -> Cache:
+                 conv_dtype: torch.dtype | None = None,
+                 state_dtype: torch.dtype = torch.float32) -> Cache:
         return cls(
             layers=[
-                RecurrentCache(cfg, max_slots, device, conv_dtype or dtype)
+                RecurrentCache(cfg, max_slots, device, conv_dtype or dtype,
+                               state_dtype)
                 if cfg.is_gdn(i)
                 else KVCache(cfg, max_slots, max_len, device, dtype)
                 for i in range(cfg.num_hidden_layers)
