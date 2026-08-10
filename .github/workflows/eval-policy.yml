@@ -1,0 +1,39 @@
+# The eval bot spends real money and posts public verdicts, so its policy
+# layer (eligibility, idempotency, verdict math) is tested on every change to
+# it — same idea as sparkinfer's eval-policy workflow. This runs the GPU-free
+# policy tests directly; the GPU suite runs the same file again via pytest on
+# the box.
+name: eval-policy
+
+on:
+  pull_request:
+    paths:
+      - "scripts/pr_eval_bot.py"
+      - "scripts/pr_eval_cron.sh"
+      - "tests/test_pr_eval_bot.py"
+      - ".github/workflows/eval-policy.yml"
+  push:
+    branches: [main]
+    paths:
+      - "scripts/pr_eval_bot.py"
+      - "scripts/pr_eval_cron.sh"
+      - "tests/test_pr_eval_bot.py"
+      - ".github/workflows/eval-policy.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Shell and Python syntax
+        run: |
+          set -euo pipefail
+          bash -n scripts/pr_eval_cron.sh
+          python3 -m py_compile scripts/pr_eval_bot.py
+
+      - name: Policy tests
+        run: python3 tests/test_pr_eval_bot.py

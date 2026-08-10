@@ -1,5 +1,5 @@
 .PHONY: provision test-remote bench-noise bench-scaling gpu-start gpu-stop gpu-status \
-        lint fmt
+        lint fmt pr-eval pr-eval-dry
 
 # The box bills ~$0.79/hr while running and storage-only while stopped, so stop
 # it as soon as a batch of GPU work is done. Always `stop`, never `destroy`:
@@ -48,3 +48,13 @@ lint:
 
 fmt:
 	ruff check --fix .
+
+# The PR eval bot: measures whether a PR really updates the performance —
+# suite + same-session A/B bench against main on the rented 5090, verdict as
+# an eval:* label and a comment. Costs box time; cron runs it half-hourly via
+# scripts/pr_eval_cron.sh. `make pr-eval PR=7` evaluates one PR now.
+pr-eval:
+	python3 -B scripts/pr_eval_bot.py $(if $(PR),--pr $(PR),)
+
+pr-eval-dry:
+	python3 -B scripts/pr_eval_bot.py --dry-run
