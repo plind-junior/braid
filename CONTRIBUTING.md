@@ -41,23 +41,42 @@ its own sake:
    **Tested on RTX 5090** box in the PR template. CI has no GPU, so the ticked box is
    the only signal the suite ran at all. Tick it only after a real run — the box is an
    attestation, not a formality. Draft PRs are exempt until marked ready.
-3. **The eval bot — your speedup claim gets measured.** For each eligible PR head, a bot
-   starts a real 5090, runs the suite on your *merged* tree, then benches it against
-   `main` **in the same box session** (median of 3 reps, arm order alternated, the
-   serving-shaped decode configuration at B=16 and B=64) and posts the measured table as
-   a comment with one of these labels:
+3. **The eval bot — your speedup claim gets measured, and the PR does not grade
+   itself.** For each eligible PR head, a bot starts a real 5090, runs the suite on
+   your *merged* tree, then benches it against `main` **in the same box session**
+   (median of 3 reps, arm order alternated, the serving-shaped decode configuration at
+   B=16 and B=64) and posts the measured table as a comment with one of these labels:
 
    | label | meaning |
    |---|---|
    | `eval:pass` | measured speedup beyond the ±2% same-session noise bar |
    | `eval:noise` | measured delta within ±2% — not distinguishable from nothing |
+   | `eval:tainted` | measured speedup, but the PR touches harness files — those get human review |
    | `eval:reject` | suite failed, or a measured regression beyond 2% at any batch |
    | `eval:error` | evaluation infrastructure failed; retried once automatically |
+
+   The harness is **pinned**: `braid/bench/`, `braid/reference/` and `tests/` are taken
+   from the base commit, not from your PR — your engine code is measured by main's
+   bench and gated by main's tests against main's oracles. Modifying any of those paths
+   (or the bot itself) doesn't skip the eval, but it caps your best verdict at
+   `eval:tainted` until a human reads the harness diff. New files you *add* under those
+   paths don't taint, but they don't run during the eval either — your new parity test
+   joins the gate once merged. The arms are integrity-checked between reps (checksums
+   on the baseline tree, its JIT cache, and the model directory); drift aborts the eval.
 
    Each head commit is evaluated once; pushing a new commit re-queues it. A regression
    anywhere outranks an improvement anywhere else. The bot never merges.
 
-Merging is manual, by the maintainer, after all of the above.
+Every verdict is recorded three ways: the PR comment and label, a `braid/eval` commit
+status on your head sha (branch protection on `main` requires it), and an append-only
+git note under `refs/notes/braid-eval` carrying the full measured record — fetch it
+with `git fetch origin refs/notes/braid-eval:refs/notes/braid-eval && git notes
+--ref=braid-eval show <sha>` if you want to audit any verdict ever issued.
+
+Merging is manual, by the maintainer, after all of the above. Residual honesty note:
+PR code runs as root on the eval box, so software-only isolation has limits — the
+checks turn a silent one-line cheat into overt sabotage that has to survive human
+review of your diff.
 
 ## The rules that get a change merged
 
