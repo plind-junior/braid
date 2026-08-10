@@ -61,8 +61,9 @@ jobs:
             PR NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
 
             You are reviewing a PR to braid, a single-GPU inference engine for
-            hybrid attention/Gated-DeltaNet models. Read CLAUDE.md for the
-            working agreement, then review `gh pr diff` against it. CI has no
+            hybrid attention/Gated-DeltaNet models. The review values are
+            enumerated below in full (CLAUDE.md, if present, adds context but
+            is not required). Review `gh pr diff` against them. CI has no
             GPU, so you cannot re-run anything — review what a careful reader
             can verify from the diff:
 
