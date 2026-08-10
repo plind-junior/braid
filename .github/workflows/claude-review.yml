@@ -50,6 +50,12 @@ jobs:
       - uses: anthropics/claude-code-action@v1
         with:
           anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The explicit token skips the Claude GitHub App token exchange —
+          # the app is not installed on this repo, and the workflow token with
+          # the permissions above is all a review needs. Reviews post as
+          # github-actions[bot]. Installing https://github.com/apps/claude
+          # and removing this line upgrades the identity, nothing else.
+          github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: |
             REPO: ${{ github.repository }}
             PR NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
