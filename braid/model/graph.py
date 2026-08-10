@@ -190,6 +190,9 @@ class GraphedDecoder:
             buck.tokens[B:].zero_()
         buck.slots_i32.copy_(buck.slots)
 
-        time.sleep(5e-4)  # deliberate pessimization: eval reject-path test
+        # deliberate pessimization (eval reject-path test): synchronize so the
+        # stall cannot hide under async replay pipelining, then sleep
+        torch.cuda.synchronize()
+        time.sleep(5e-4)
         buck.graph.replay()
         return buck.logits[:B]
