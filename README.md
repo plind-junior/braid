@@ -4,25 +4,6 @@ A single-GPU inference engine for **hybrid** language models — attention inter
 linear-recurrent mixer (Gated DeltaNet) — built to serve them **at concurrency** on one
 RTX 5090.
 
-> **Status: the locked MVP target is MET.** It asked for ≥+25% over llama.cpp at B=16
-> and ≥+100% at B=64; braid measures **+26.5% and +118.8%** — every one of the five
-> independent processes clears both clauses, worst pairing +25.8%. The same head-to-head
-> (`Qwen3.5-9B`, one card, one session, 5 processes per arm) reads **+68.3% at B=32,
-> +141.8% at B=96, +170.4% at B=128** — and **−22.0% at B=1**, published unchanged.
-> From B=1 to B=128 braid scales **58.8×** where llama.cpp scales **17.0×**, which is
-> the thesis. braid matches HuggingFace to fp32 machine precision over all 32 layers and
-> serves concurrent streams over SSE with continuous batching, **3,633 tok/s served at
-> c=128**, prefill included.
->
-> What closed the last gap was not one lever but four, each priced separately below:
-> FP8 on every projection, fp16 state storage, a chunk-cached prefill scan kernel
-> (14.1× single-stream prefill), and a launch diet (−43% kernel launches per decode
-> step) — the last two bit-identical to what they replaced, by test.
->
-> This target was published as a NO-GO twice on this page while the margin was built —
-> −16.1%/+48.6% on the 4B, then +2.8%/+84.0% here — and the batch it names was never
-> moved. Every number is labelled **measured** or **projected**.
-
 ---
 
 ## Why
