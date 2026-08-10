@@ -1,0 +1,93 @@
+# Automated first-pass review on every PR — the reviewer that is always awake.
+#
+# Modeled on sparkinfer's PR automation, adapted to braid's scale: one
+# maintainer, few PRs, no GPU in CI. The reviewer therefore does NOT try to
+# verify performance numbers (nothing here can run a kernel); it reviews what
+# a careful reader can check from the diff alone — measurement *discipline*,
+# parity-test coverage, capture safety, and ordinary bugs.
+#
+# Cost: one review per PR open, not per push — a WIP branch pushed ten times
+# would burn nine reviews on states the author already knew were unfinished.
+# Re-review on demand:   gh workflow run claude-review -f pr=<number>
+# Fork PRs get no secrets on `pull_request`, so the automatic path is
+# same-repo only; review a fork PR with the same dispatch command — it runs
+# from main and reads the diff over the API, PR code is never executed.
+#
+# Needs the ANTHROPIC_API_KEY repo secret (or swap in claude_code_oauth_token;
+# `claude /install-github-app` sets either up interactively).
+name: claude-review
+
+on:
+  pull_request:
+    types: [opened, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to review"
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-24.04
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (!github.event.pull_request.draft &&
+       github.event.pull_request.head.repo.full_name == github.repository)
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
+          prompt: |
+            REPO: ${{ github.repository }}
+            PR NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+
+            You are reviewing a PR to braid, a single-GPU inference engine for
+            hybrid attention/Gated-DeltaNet models. Read CLAUDE.md for the
+            working agreement, then review `gh pr diff` against it. CI has no
+            GPU, so you cannot re-run anything — review what a careful reader
+            can verify from the diff:
+
+            1. Measurement discipline (the part most easily damaged):
+               - Every performance number added to the README or a doc must
+                 be labelled measured or projected, and a measured claim
+                 needs its method visible: which box, how many reps, against
+                 what baseline. One run is an anecdote, not a result.
+               - Deltas under ~2% compared across different sessions or boxes
+                 are noise, not results — flag any such attribution.
+               - Losing rows must not quietly disappear from tables.
+            2. Kernel changes (braid/kernels/csrc/):
+               - A kernel change must land with a parity test against
+                 braid/reference/ — flag any that arrives without one.
+               - `--use_fast_math` must never appear; it breaks fp32 oracle
+                 parity at the tolerances the tests assert.
+               - The decode path must stay CUDA-graph-capture-safe: no
+                 allocation, no host synchronisation, no CPU-dependent
+                 control flow inside anything the graph captures.
+            3. Remote-workflow traps: the dev box rsyncs with --delete before
+               every command, so a script writing outputs inside the synced
+               tree (/root/braid) silently loses them — outputs belong under
+               /root/ outside it. Nothing may assume a local GPU.
+            4. Ordinary review: real bugs, unhandled edge cases, dead code,
+               places the change contradicts existing behaviour or comments.
+
+            Report line-specific findings with
+            mcp__github_inline_comment__create_inline_comment and post ONE
+            `gh pr comment` summary, most-severe first. Do not pad: if the
+            diff is clean, say so in two sentences and stop. Never approve,
+            request changes, or merge — the verdict is the maintainer's.
+
+          claude_args: |
+            --allowedTools "mcp__github_inline_comment__create_inline_comment,Bash(gh pr comment:*),Bash(gh pr diff:*),Bash(gh pr view:*)"

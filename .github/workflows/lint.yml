@@ -1,0 +1,28 @@
+# Lint only, on purpose.
+#
+# All but two of braid's test files need a real RTX 5090, and GitHub-hosted
+# runners have no GPU. The suite's actual gate is `make test-remote` against the
+# rented box; wiring a self-hosted runner here would mean leaving that box
+# running (~$0.79/hr) to catch pushes, which costs more than it is worth at this
+# stage. So CI checks the one thing it can check for free.
+name: lint
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ruff:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/ruff-action@v4.1.0
+        with:
+          # Keep in step with .pre-commit-config.yaml so a clean commit hook
+          # never turns into a red build.
+          version: 0.15.13

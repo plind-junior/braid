@@ -1,0 +1,24 @@
+# Opt-in: `pip install pre-commit && pre-commit install`.
+#
+# Deliberately small. Nothing here reformats source — the numeric code is
+# hand-aligned and a formatter would bury real diffs under a reflow. These
+# hooks only catch things that are unambiguously mistakes.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.13
+    hooks:
+      - id: ruff
+        args: [--fix]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      # Profiler reports and model shards are ignored, but a stray one that
+      # slips past .gitignore is expensive to remove from history later.
+      - id: check-added-large-files
+        args: [--maxkb=2048]
+      - id: check-merge-conflict
+      - id: check-yaml
+      - id: check-toml
+      - id: mixed-line-ending
+        args: [--fix=lf]
