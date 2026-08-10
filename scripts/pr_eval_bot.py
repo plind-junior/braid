@@ -25,6 +25,49 @@ Trust boundary — the part that must never be relaxed:
     this machine — and rsynced to /root/braid_eval/, outside the dev tree.
   * The gh and vast credentials live on this machine and are never copied to
     the box. The bot itself always runs from the local main tree.
+  * The PR does not grade itself. The harness — `braid/bench/`,
+    `braid/reference/`, `tests/` — is pinned: those directories are taken
+    from the BASE sha and overlaid onto the PR tree before it is pushed to
+    the box, so the PR's engine code is measured by main's bench and gated
+    by main's tests against main's oracles. A PR that modifies any pinned
+    path (or this bot, or the workflows) is evaluated anyway but its best
+    verdict is capped at `eval:tainted` — the numbers are trustworthy, the
+    harness diff still needs human eyes before merge. New files ADDED under
+    pinned paths are not tainting (they cannot weaken the gate) but they do
+    not run during the eval; the comment lists them as unexercised.
+  * The arms are isolated as far as software can manage on a shared root
+    box: per-eval wipe of both JIT extension caches, checksum re-push of the
+    main tree before every main rep (PR code runs first in the session and
+    could otherwise edit the baseline), hash-lock of main's JIT cache after
+    its first build, GPU-idle assertion before each main rep, and a
+    model-directory manifest taken before any PR code runs and re-verified
+    before the verdict. Any drift aborts the eval as TAMPER SUSPECTED.
+  * Residual risk, stated honestly: PR code runs as root on the box, so a
+    determined attacker can still compromise the interpreter, site-packages,
+    or rc files, or leave a daemon that races the checks (TOCTOU). Closing
+    that requires a fresh container per arm — on the roadmap. The checks
+    above turn a silent one-line cheat into overt sabotage code that has to
+    survive human review of the diff.
+
+Durable evidence — verdicts outlive editable comments:
+
+  * Every verdict lands as a `braid/eval` commit status on the PR head sha
+    (statuses are what branch protection can require).
+  * The full measured record (the canonical evidence bundle, the verdict
+    document, and the attested receipt) is appended as a git note on the
+    head under refs/notes/braid-eval and pushed — an append-only audit
+    trail anyone can fetch — and mirrored to a local ledger at
+    ~/braid-pr-eval-ledger.jsonl.
+  * The verdict itself is attested: the policy (scripts/eval_scorer.py) is
+    shipped byte-identical into a polaris.computer Intel TDX machine with
+    the evidence bundle (egress sealed), re-derives the verdict there, and
+    the returned DCAP quote binds scorer + bundle + verdict in its
+    report_data. scripts/verify_receipt.py recomputes every binding
+    offline. The local and TEE verdicts must agree byte-for-byte or the
+    eval aborts. Scope honesty: the receipt proves the SCORING; the 5090
+    measurement itself still happens outside any TEE (consumer GPUs have
+    no confidential-compute mode) — same ceiling as every attested-eval
+    pipeline on consumer hardware.
 
 Box ownership — the part that keeps this from costing money or corrupting a
 measurement:
@@ -47,13 +90,33 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import importlib.util
 import json
 import os
-import statistics
+import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
+
+# The verdict policy lives in eval_scorer.py — one file, imported here and
+# shipped byte-identical into the TEE for the attested receipt. The bot must
+# never grow its own copy of these functions.
+_SCORER_PATH = pathlib.Path(__file__).resolve().parent / "eval_scorer.py"
+_spec = importlib.util.spec_from_file_location("eval_scorer", _SCORER_PATH)
+scorer = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(scorer)
+classify_taint = scorer.classify_taint
+verdict = scorer.verdict
+median = scorer.median
+NOISE_PCT = scorer.NOISE_PCT
+PINNED_DIRS = scorer.PINNED_DIRS
+INFRA_FILES = scorer.INFRA_FILES
+INFRA_PREFIXES = scorer.INFRA_PREFIXES
 
 INSTANCE = os.environ.get("VAST_INSTANCE", "47055458")
 SSH_KEY = os.path.expanduser(os.environ.get("BRAID_SSH_KEY", "~/.ssh/rtx5090"))
@@ -63,13 +126,27 @@ BENCH_MODEL = os.environ.get("BRAID_EVAL_MODEL_DIR", "/root/models/Qwen3.5-9B")
 REMOTE_BASE = "/root/braid_eval"          # outside /root/braid: never collides with dev rsync
 EXT_BASE = "/root/torch_ext_eval"         # JIT caches, one per arm, never the dev cache
 ARM = "graphed-kvbucket"                  # the serving-shaped arm decode_speed reports
-NOISE_PCT = 2.0                           # the same-session bar; also the verdict bar
 RUNTIME_PREFIXES = ("braid/", "tests/")
+STATUS_CONTEXT = "braid/eval"
+POLARIS_ATTEST_URL = os.environ.get("BRAID_POLARIS_ATTEST_URL",
+                                    "https://polaris.computer/v1/attest")
+POLARIS_KEY = os.environ.get("BRAID_POLARIS_API_KEY", "")
+SCORER_WORKLOAD = "python3 /in/eval_scorer.py /in/bundle.json"
+NOTES_REF = "braid-eval"                  # refs/notes/braid-eval
+LEDGER = os.path.expanduser("~/braid-pr-eval-ledger.jsonl")
 EVAL_LABELS = {
     "eval:pass": ("0E8A16", "measured speedup beyond the 2% bar"),
     "eval:noise": ("FBCA04", "measured delta within the 2% noise bar"),
+    "eval:tainted": ("5319E7", "measured speedup, but the PR touches harness files"),
     "eval:reject": ("B60205", "suite failed or measured regression beyond 2%"),
     "eval:error": ("D93F0B", "evaluation could not complete"),
+}
+STATUS_STATE = {                          # eval label -> commit-status state
+    "eval:pass": "success",
+    "eval:noise": "success",
+    "eval:tainted": "failure",
+    "eval:reject": "failure",
+    "eval:error": "error",
 }
 SYNC_EXCLUDES = [".git", "__pycache__", "*.pyc", ".pytest_cache", ".ruff_cache", ".venv"]
 
@@ -89,6 +166,20 @@ def ticked_5090(body: str | None) -> bool:
 
 def touches_runtime(paths: list[str]) -> bool:
     return any(p.startswith(RUNTIME_PREFIXES) for p in paths)
+
+
+def overlay_harness(pr_dir: str, base_dir: str, dirs: tuple[str, ...] = PINNED_DIRS) -> None:
+    """Replace the PR tree's harness dirs with the base tree's, wholesale.
+
+    Wholesale (delete then copy), not a merge: a merge would keep PR-added
+    files, and a PR-added conftest.py could monkeypatch the trusted tests
+    from inside their own pytest process.
+    """
+    for d in dirs:
+        dst, src = os.path.join(pr_dir, d), os.path.join(base_dir, d)
+        shutil.rmtree(dst, ignore_errors=True)
+        if os.path.isdir(src):
+            shutil.copytree(src, dst)
 
 
 def marker(sha: str) -> str:
@@ -138,25 +229,69 @@ def pick_tok_s(bench_stdout: str, batch: int, arm: str = ARM) -> float:
     raise ValueError(f"arm {arm!r} batch {batch} missing from bench output")
 
 
-def verdict(tests_ok: bool, deltas_pct: dict[int, float],
-            noise: float = NOISE_PCT) -> tuple[str, str]:
-    """(label, reason). Regression anywhere outranks improvement anywhere."""
-    if not tests_ok:
-        return "eval:reject", "test suite failed on the merged tree"
-    worst = min(deltas_pct.values())
-    best = max(deltas_pct.values())
-    if worst < -noise:
-        b = min(deltas_pct, key=deltas_pct.get)
-        return "eval:reject", f"measured regression at B={b}: {deltas_pct[b]:+.1f}%"
-    if best > noise:
-        b = max(deltas_pct, key=deltas_pct.get)
-        return "eval:pass", f"measured speedup at B={b}: {deltas_pct[b]:+.1f}%"
-    return "eval:noise", (f"all deltas within the ±{noise:.0f}% same-session bar "
-                          f"(best {best:+.1f}%)")
+def build_bundle(pr: int, head: str, eval_sha: str, base_sha: str, mode: str,
+                 batches: list[int], reps: int, tests_ok: bool,
+                 samples: dict, name_status: list, suite_tail: str,
+                 model_manifest: str, main_ext_hash: str | None) -> dict:
+    """The canonical evidence bundle: everything the verdict is a function
+    of, in one JSON document. The scorer (locally AND inside the TEE)
+    derives the verdict from this and nothing else; its hash is bound into
+    the attested receipt's report_data."""
+    return {
+        "schema": scorer.SCHEMA_IN,
+        "pr": pr, "head": head, "eval_sha": eval_sha, "base_sha": base_sha,
+        "mode": mode, "arm": ARM, "batches": [int(b) for b in batches],
+        "reps": reps, "noise_pct": NOISE_PCT, "box": INSTANCE,
+        "tests_ok": tests_ok,
+        "suite_tail_sha256": hashlib.sha256(suite_tail.encode()).hexdigest(),
+        "samples": {a: {str(b): list(v) for b, v in per.items()}
+                    for a, per in samples.items()},
+        "name_status": [list(p) for p in name_status],
+        "integrity": {"model_manifest": model_manifest,
+                      "main_ext_hash": main_ext_hash or ""},
+    }
 
 
-def median(xs: list[float]) -> float:
-    return statistics.median(xs)
+def request_receipt(bundle: dict) -> dict | None:
+    """Re-score the bundle inside a polaris.computer Intel TDX machine and
+    return the attested receipt (raw DCAP quote + bindings), or None.
+
+    Best-effort by design: the receipt is evidence, not the gate — a
+    polaris.computer outage must not block evaluations. But a receipt that
+    RETURNS a different verdict than the local scorer is handled by the
+    caller as a hard error, because the scorer is deterministic and a
+    divergence means a bug or tampering."""
+    if not POLARIS_KEY:
+        print(">> BRAID_POLARIS_API_KEY unset — verdict will not carry a TDX receipt")
+        return None
+    payload = json.dumps({
+        "nonce": bundle["head"],                    # 40 hex chars: the PR head sha
+        "workload": SCORER_WORKLOAD,
+        "egress": "none",
+        "files": {
+            "/in/eval_scorer.py":
+                base64.b64encode(_SCORER_PATH.read_bytes()).decode(),
+            "/in/bundle.json":
+                base64.b64encode(scorer.canonical(bundle).encode()).decode(),
+        },
+    }).encode()
+    req = urllib.request.Request(
+        POLARIS_ATTEST_URL, data=payload,
+        headers={"Authorization": f"Bearer {POLARIS_KEY}",
+                 "Content-Type": "application/json",
+                 # Cloudflare fronts the API and 403s the default urllib UA
+                 "User-Agent": "braid-pr-eval-bot/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=900) as r:
+            doc = json.load(r)
+    except (OSError, json.JSONDecodeError) as e:
+        print(f"!! attested receipt unavailable: {e}", file=sys.stderr)
+        return None
+    if doc.get("exit_code") != 0:
+        print(f"!! scorer failed inside the TEE (exit {doc.get('exit_code')}): "
+              f"{str(doc.get('stdout', ''))[:400]}", file=sys.stderr)
+        return None
+    return doc
 
 
 # ---------------------------------------------------------------------------
@@ -220,11 +355,39 @@ class Box:
         r = self.ssh("nvidia-smi --query-compute-apps=pid --format=csv,noheader | wc -l")
         return r.returncode != 0 or int(r.stdout.decode().strip() or "1") != 0
 
+    def _rsync_ssh(self) -> str:
+        return f"ssh -i {SSH_KEY} -p {SSH_PORT} -o StrictHostKeyChecking=accept-new"
+
     def push_tree(self, local_dir: str, remote_dir: str) -> None:
         ex = [f"--exclude={e}" for e in SYNC_EXCLUDES]
-        run(["rsync", "-az", "--delete", *ex,
-             "-e", f"ssh -i {SSH_KEY} -p {SSH_PORT} -o StrictHostKeyChecking=accept-new",
+        run(["rsync", "-az", "--delete", *ex, "-e", self._rsync_ssh(),
              f"{local_dir}/", f"{SSH_HOST}:{remote_dir}/"], timeout=300)
+
+    def verify_tree(self, local_dir: str, remote_dir: str) -> list[str]:
+        """Checksum-compare the remote tree against the local truth and
+        repair it. Returns the itemized drift — non-empty means something on
+        the box rewrote the tree since the last push, which after PR code
+        has run is tamper evidence, not noise."""
+        ex = [f"--exclude={e}" for e in SYNC_EXCLUDES]
+        r = run(["rsync", "-azc", "--delete", "--itemize-changes", *ex,
+                 "-e", self._rsync_ssh(),
+                 f"{local_dir}/", f"{SSH_HOST}:{remote_dir}/"], timeout=600)
+        return [ln for ln in r.stdout.decode().splitlines() if ln.strip()]
+
+    def wipe(self, *paths: str) -> None:
+        joined = " ".join(paths)
+        self.ssh(f"rm -rf {joined} && mkdir -p {joined}")
+
+    def tree_hash(self, path: str) -> str:
+        """One sha256 over every file under path (symlinks followed, order
+        fixed). Used to lock the main arm's JIT cache and the model dir."""
+        r = self.ssh(
+            f"cd {path} 2>/dev/null && find -L . -type f -print0 | LC_ALL=C sort -z"
+            f" | xargs -0 sha256sum | sha256sum | cut -d' ' -f1 || echo MISSING",
+            timeout=600)
+        if r.returncode != 0:
+            raise RuntimeError(f"tree_hash failed for {path}: {r.stderr.decode()[-500:]}")
+        return r.stdout.decode().strip().splitlines()[-1]
 
 
 # ---------------------------------------------------------------------------
@@ -252,6 +415,19 @@ def fetch_arms(pr: int) -> tuple[str, str, str]:
     head = run(["git", "rev-parse", "FETCH_HEAD"]).stdout.decode().strip()
     mb = run(["git", "merge-base", base, head]).stdout.decode().strip()
     return head, mb, "head-vs-merge-base"
+
+
+def diff_name_status(base_sha: str, eval_sha: str) -> list[tuple[str, str]]:
+    """[(status, path)] for the PR's effective change, renames split so a
+    rename of a pinned file shows up as a taint-carrying D."""
+    out = run(["git", "diff", "--name-status", "--no-renames",
+               base_sha, eval_sha], timeout=120).stdout.decode()
+    pairs = []
+    for ln in out.splitlines():
+        parts = ln.split("\t")
+        if len(parts) >= 2:
+            pairs.append((parts[0].strip(), parts[-1].strip()))
+    return pairs
 
 
 # ---------------------------------------------------------------------------
@@ -285,6 +461,70 @@ def ensure_labels() -> None:
     for name, (color, desc) in EVAL_LABELS.items():
         run(["gh", "label", "create", name, "--color", color,
              "--description", desc, "--force"], check=False)
+
+
+def post_status(sha: str, state: str, description: str) -> None:
+    """A `braid/eval` commit status on the head sha — the thing branch
+    protection can require, and the thing a later comment edit cannot
+    retroactively change for that sha."""
+    run(["gh", "api", f"repos/{{owner}}/{{repo}}/statuses/{sha}",
+         "-f", f"state={state}", "-f", f"context={STATUS_CONTEXT}",
+         "-f", f"description={description[:140]}"], check=False)
+
+
+def current_status(sha: str) -> str | None:
+    try:
+        doc = gh_json(["api", f"repos/{{owner}}/{{repo}}/commits/{sha}/status"])
+    except (subprocess.SubprocessError, json.JSONDecodeError):
+        return None
+    for st in doc.get("statuses", []):
+        if st.get("context") == STATUS_CONTEXT:
+            return st.get("state")
+    return None
+
+
+def ensure_status(sha: str, state: str, description: str) -> None:
+    """Post only on change, so the */30 poll does not spam the statuses API."""
+    if current_status(sha) != state:
+        post_status(sha, state, description)
+
+
+def stamp_queue_status(info: dict, ok: bool, why: str) -> None:
+    """Give every open head a `braid/eval` status so required-status branch
+    protection is livable: runtime PRs show pending until measured, and
+    docs-only PRs are not held hostage by a check that will never run."""
+    sha = info["headRefOid"]
+    if ok:
+        ensure_status(sha, "pending", "queued for measured eval on the RTX 5090")
+    elif why == "no braid/ or tests/ paths":
+        ensure_status(sha, "success", "eval not required — no runtime paths")
+    elif why.startswith("no 5090 attestation"):
+        ensure_status(sha, "pending", "awaiting the RTX 5090 attestation tick")
+
+
+def record_evidence(head: str, record: dict) -> None:
+    """Append the measured record where a comment edit cannot reach it: a
+    git note on the head sha pushed to refs/notes/braid-eval (append-only —
+    every edit is a commit on the notes ref), plus a local ledger line."""
+    line = json.dumps(record, sort_keys=True)
+    try:
+        with open(LEDGER, "a") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        print(f"!! ledger append failed: {e}", file=sys.stderr)
+    notes_spec = f"+refs/notes/{NOTES_REF}:refs/notes/{NOTES_REF}"
+    run(["git", "fetch", "origin", notes_spec], timeout=60, check=False)
+    for _ in range(2):
+        r = run(["git", "notes", "--ref", NOTES_REF, "append", "-m", line, head],
+                check=False)
+        if r.returncode != 0:
+            break
+        if run(["git", "push", "origin", f"refs/notes/{NOTES_REF}"],
+               timeout=60, check=False).returncode == 0:
+            return
+        run(["git", "fetch", "origin", notes_spec], timeout=60, check=False)
+    print("!! could not push the eval note — evidence is in the ledger only",
+          file=sys.stderr)
 
 
 def apply_verdict(pr: int, label: str, body: str) -> None:
@@ -328,45 +568,102 @@ def run_suite(box: Box, arm_dir: str, ext_dir: str, tests: str) -> tuple[bool, s
     return r.returncode == 0, tail
 
 
-def evaluate(box: Box, pr: int, info: dict, args) -> None:
+def check_main_arm(box: Box, main_dir: str, main_ext_hash: str | None) -> None:
+    """Everything that must hold before a main rep is trusted. PR code has
+    already run in this session; any drift is tampering, not noise."""
+    drift = box.verify_tree(main_dir, f"{REMOTE_BASE}/main")
+    if drift:
+        raise RuntimeError(
+            "TAMPER SUSPECTED — the main tree drifted after PR code ran "
+            "(repaired, eval aborted):\n" + "\n".join(drift[:20]))
+    if main_ext_hash is not None:
+        now = box.tree_hash(f"{EXT_BASE}/main")
+        if now != main_ext_hash:
+            raise RuntimeError(
+                "TAMPER SUSPECTED — main's JIT extension cache changed between "
+                f"reps ({main_ext_hash[:12]} -> {now[:12]})")
+    if box.gpu_busy():
+        raise RuntimeError(
+            "TAMPER SUSPECTED — a GPU process is alive before a main rep; "
+            "PR code may have left a daemon behind")
+
+
+def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
     head = info["headRefOid"]
     eval_sha, base_sha, mode = fetch_arms(pr)
-    print(f">> PR #{pr} head={head[:9]}: {mode} — eval {eval_sha[:9]} vs {base_sha[:9]}")
+    name_status = diff_name_status(base_sha, eval_sha)
+    tainted, unexercised = classify_taint(name_status)
+    print(f">> PR #{pr} head={head[:9]}: {mode} — eval {eval_sha[:9]} vs {base_sha[:9]}"
+          + (f"; tainted: {tainted}" if tainted else ""))
 
     with tempfile.TemporaryDirectory(prefix="braid-eval-") as tmp:
         pr_dir, main_dir = os.path.join(tmp, "pr"), os.path.join(tmp, "main")
         checkout_tree(eval_sha, pr_dir)
         checkout_tree(base_sha, main_dir)
+        overlay_harness(pr_dir, main_dir)     # bench/reference/tests come from base
         box.ssh(f"mkdir -p {REMOTE_BASE} {EXT_BASE}")
+        box.wipe(f"{EXT_BASE}/pr", f"{EXT_BASE}/main")   # no cache survives across PRs
         box.push_tree(pr_dir, f"{REMOTE_BASE}/pr")
         box.push_tree(main_dir, f"{REMOTE_BASE}/main")
 
-    print(f">> suite: pytest {args.tests} on the PR tree")
-    tests_ok, tail = run_suite(box, f"{REMOTE_BASE}/pr", f"{EXT_BASE}/pr", args.tests)
-    print(f">> suite: {'ok' if tests_ok else 'FAILED'}")
+        print(f">> suite: pytest {args.tests} (pinned to base) on the PR tree")
+        tests_ok, tail = run_suite(box, f"{REMOTE_BASE}/pr", f"{EXT_BASE}/pr", args.tests)
+        print(f">> suite: {'ok' if tests_ok else 'FAILED'}")
 
-    samples: dict[str, dict[int, list[float]]] = {
-        "pr": {b: [] for b in args.batches}, "main": {b: [] for b in args.batches}}
-    if tests_ok:
-        for rep in range(args.reps):
-            order = ["pr", "main"] if rep % 2 == 0 else ["main", "pr"]
-            for arm_name in order:
-                got = run_bench(box, f"{REMOTE_BASE}/{arm_name}",
-                                f"{EXT_BASE}/{arm_name}", args.batches)
-                for b, v in got.items():
-                    samples[arm_name][b].append(v)
-                print(f">> rep {rep + 1} {arm_name}: "
-                      + " ".join(f"B={b} {v:.1f}" for b, v in sorted(got.items())))
+        samples: dict[str, dict[int, list[float]]] = {
+            "pr": {b: [] for b in args.batches}, "main": {b: [] for b in args.batches}}
+        main_ext_hash: str | None = None
+        if tests_ok:
+            for rep in range(args.reps):
+                order = ["pr", "main"] if rep % 2 == 0 else ["main", "pr"]
+                for arm_name in order:
+                    if arm_name == "main":
+                        check_main_arm(box, main_dir, main_ext_hash)
+                    got = run_bench(box, f"{REMOTE_BASE}/{arm_name}",
+                                    f"{EXT_BASE}/{arm_name}", args.batches)
+                    if arm_name == "main" and main_ext_hash is None:
+                        main_ext_hash = box.tree_hash(f"{EXT_BASE}/main")
+                    for b, v in got.items():
+                        samples[arm_name][b].append(v)
+                    print(f">> rep {rep + 1} {arm_name}: "
+                          + " ".join(f"B={b} {v:.1f}" for b, v in sorted(got.items())))
 
-    med = {a: {b: median(v) for b, v in per.items() if v} for a, per in samples.items()}
-    deltas = {b: (med["pr"][b] - med["main"][b]) / med["main"][b] * 100
-              for b in args.batches} if tests_ok else {}
-    label, reason = verdict(tests_ok, deltas)
+        model_now = box.tree_hash(BENCH_MODEL)
+        if model_now != model_manifest:
+            raise RuntimeError(
+                "TAMPER SUSPECTED — the model directory changed during the eval "
+                f"({model_manifest[:12]} -> {model_now[:12]})")
+
+    # One canonical bundle; one scorer; two executions. The local call decides
+    # the verdict, the TEE call produces the receipt — and they must agree.
+    bundle = build_bundle(pr, head, eval_sha, base_sha, mode, args.batches,
+                          args.reps, tests_ok, samples, name_status, tail,
+                          model_manifest, main_ext_hash)
+    vdoc = scorer.score_bundle(bundle)
+    expected_stdout = scorer.canonical(vdoc) + "\n"
+    label, reason = vdoc["label"], vdoc["reason"]
+    med, deltas = vdoc["medians"], vdoc["deltas_pct"]
+
+    receipt = request_receipt(bundle)
+    if receipt is not None and receipt.get("stdout") != expected_stdout:
+        raise RuntimeError(
+            "TEE-scored verdict differs from the local scorer on the same "
+            "bundle — deterministic policy diverged; refusing to post. "
+            f"local={expected_stdout!r} tee={receipt.get('stdout')!r}")
 
     rows = "\n".join(
-        f"| {b} | {med['main'][b]:.1f} | {med['pr'][b]:.1f} | {deltas[b]:+.1f}% |"
+        f"| {b} | {med['main'][str(b)]:.1f} | {med['pr'][str(b)]:.1f} "
+        f"| {deltas[str(b)]:+.1f}% |"
         for b in args.batches) if deltas else ""
     suite_note = "suite passed" if tests_ok else f"suite FAILED — tail:\n```\n{tail}\n```"
+    taint_note = (
+        "\n> **Harness files modified by this PR** (the eval used the pinned base "
+        "versions; review these by hand before merging):\n"
+        + "".join(f"> - `{p}`\n" for p in tainted) if tainted else "")
+    unex_note = (
+        "\n> New files under pinned paths — cannot weaken the gate, but they did "
+        "**not** run in this eval; they join the gate once merged:\n"
+        + "".join(f"> - `{p}`\n" for p in unexercised) if unexercised else "")
     body = (
         f"{marker(head)}\n"
         f"## Measured on the RTX 5090 — `{label}`\n\n"
@@ -375,13 +672,36 @@ def evaluate(box: Box, pr: int, info: dict, args) -> None:
         f"order alternated, bench arm `{ARM}`, Qwen3.5-9B `--quant all "
         f"--state-dtype fp16 --prompt-len 128`. Every number below is "
         f"**measured**; the verdict bar is the same-session ±{NOISE_PCT:.0f}% rule.\n\n"
+        f"Harness pinned to base `{base_sha[:9]}`: `braid/bench/`, `braid/reference/` "
+        f"and `tests/` were overlaid from main before the PR tree reached the box — "
+        f"the PR's engine is measured by main's bench and gated by main's tests. "
+        f"Integrity: JIT caches wiped for this eval, main tree checksum-verified and "
+        f"its cache hash-locked before every main rep, model manifest verified.\n\n"
+        + (f"**Attested:** this verdict was independently recomputed inside an Intel "
+           f"TDX machine ({receipt['tee_attestation'].get('kind', 'tdx')}, "
+           f"polaris.computer). The DCAP quote binds the scorer "
+           f"(`{receipt['tee_attestation']['bound_digest'][:19]}…`), the evidence "
+           f"bundle and the verdict; intel_verified="
+           f"{receipt.get('verification', {}).get('intel_verified')}. Receipt + "
+           f"bundle in this PR's git note — check with `scripts/verify_receipt.py`.\n"
+           if receipt is not None else
+           "**Attested:** no TDX receipt for this run (attestation service "
+           "unavailable); the verdict is the local scorer's alone.\n")
+        + taint_note + unex_note + "\n"
         + ("| batch | main tok/s | PR tok/s | delta |\n|--:|--:|--:|--:|\n" + rows + "\n\n"
            if rows else "")
         + f"**Verdict:** {reason}. {suite_note}\n\n"
         f"<sub>Automated eval (scripts/pr_eval_bot.py). It never merges; a new push "
-        f"re-queues evaluation. Box stopped after the run.</sub>"
+        f"re-queues evaluation. Verdict also lands as the `{STATUS_CONTEXT}` commit "
+        f"status on `{head[:9]}` and as a git note under `refs/notes/{NOTES_REF}`. "
+        f"Box stopped after the run.</sub>"
     )
     apply_verdict(pr, label, body)
+    post_status(head, STATUS_STATE[label], f"{label}: {reason}")
+    record_evidence(head, {
+        "ts": int(time.time()), "label": label, "reason": reason,
+        "bundle": bundle, "verdict_doc": vdoc, "receipt": receipt,
+    })
     print(f">> PR #{pr}: {label} — {reason}")
 
 
@@ -409,6 +729,8 @@ def main() -> int:
         if args.force and args.pr is not None:
             ok, why = True, "forced"
         print(f"-- PR #{n}: {why}")
+        if not args.dry_run:
+            stamp_queue_status(info, ok, why)
         if ok:
             plan.append((n, info))
     plan = plan[: args.max_evals]
@@ -430,9 +752,13 @@ def main() -> int:
         box.start()
         if box.gpu_busy():
             raise RuntimeError("GPU busy right after start — refusing to eval")
+        # The trusted baseline for the whole session, taken before ANY PR
+        # code has had a chance to run on the box.
+        model_manifest = box.tree_hash(BENCH_MODEL)
+        print(f">> model manifest {model_manifest[:12]} ({BENCH_MODEL})")
         for n, info in plan:
             try:
-                evaluate(box, n, info, args)
+                evaluate(box, n, info, args, model_manifest)
             except Exception as e:                       # noqa: BLE001 — verdict must land
                 print(f"!! PR #{n} eval error: {e}", file=sys.stderr)
                 apply_verdict(n, "eval:error",
@@ -442,6 +768,8 @@ def main() -> int:
                               f"<sub>Automated eval; retried once on the next poll. "
                               f"After two errors this head is parked until a new "
                               f"commit is pushed.</sub>")
+                post_status(info["headRefOid"], "error",
+                            f"eval:error: {str(e)[:120]}")
     finally:
         box.stop()
     return 0

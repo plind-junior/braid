@@ -12,7 +12,10 @@ latter — the runner has no pytest, and the GPU suite gate runs it via pytest
 anyway).
 """
 import importlib.util
+import json
+import os
 import pathlib
+import tempfile
 import unittest
 
 _BOT = pathlib.Path(__file__).resolve().parent.parent / "scripts" / "pr_eval_bot.py"
@@ -117,6 +120,190 @@ class Verdict(unittest.TestCase):
     def test_the_bar_itself_is_noise(self):
         label, _ = bot.verdict(True, {16: 2.0, 64: -2.0})
         self.assertEqual(label, "eval:noise")
+
+
+class Taint(unittest.TestCase):
+    def test_engine_changes_do_not_taint(self):
+        t, u = bot.classify_taint([("M", "braid/model/gdn.py"),
+                                   ("A", "braid/kernels/csrc/scan.cu")])
+        self.assertEqual((t, u), ([], []))
+
+    def test_modified_bench_taints(self):
+        t, _ = bot.classify_taint([("M", "braid/bench/decode_speed.py")])
+        self.assertEqual(t, ["braid/bench/decode_speed.py"])
+
+    def test_modified_or_deleted_test_taints(self):
+        t, _ = bot.classify_taint([("M", "tests/test_gdn_decode_kernel.py")])
+        self.assertTrue(t)
+        t, _ = bot.classify_taint([("D", "tests/test_loader.py")])
+        self.assertTrue(t)
+
+    def test_weakened_reference_oracle_taints(self):
+        t, _ = bot.classify_taint([("M", "braid/reference/gdn.py")])
+        self.assertEqual(t, ["braid/reference/gdn.py"])
+
+    def test_added_test_is_unexercised_not_tainted(self):
+        t, u = bot.classify_taint([("A", "tests/test_new_kernel.py")])
+        self.assertEqual(t, [])
+        self.assertEqual(u, ["tests/test_new_kernel.py"])
+
+    def test_touching_the_bot_or_workflows_taints(self):
+        t, _ = bot.classify_taint([("M", "scripts/pr_eval_bot.py")])
+        self.assertTrue(t)
+        t, _ = bot.classify_taint([("A", ".github/workflows/evil.yml")])
+        self.assertTrue(t)
+
+    def test_prefix_is_a_directory_not_a_substring(self):
+        t, u = bot.classify_taint([("M", "braid/benchmarks_notes.md"),
+                                   ("M", "tests_helper.py")])
+        self.assertEqual((t, u), ([], []))
+
+    def test_other_scripts_do_not_taint(self):
+        t, _ = bot.classify_taint([("M", "scripts/remote.sh")])
+        self.assertEqual(t, [])
+
+
+class OverlayHarness(unittest.TestCase):
+    @staticmethod
+    def _write(root, rel, text):
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            f.write(text)
+
+    def test_pinned_dirs_come_from_base_wholesale(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pr, base = os.path.join(tmp, "pr"), os.path.join(tmp, "base")
+            self._write(pr, "braid/model/gdn.py", "PR ENGINE")
+            self._write(pr, "braid/bench/decode_speed.py", "CHEAT")
+            self._write(pr, "tests/test_x.py", "WEAKENED")
+            self._write(pr, "tests/conftest.py", "MONKEYPATCH")
+            self._write(base, "braid/bench/decode_speed.py", "TRUSTED")
+            self._write(base, "tests/test_x.py", "TRUSTED")
+            bot.overlay_harness(pr, base)
+            read = lambda rel: open(os.path.join(pr, rel)).read()  # noqa: E731
+            self.assertEqual(read("braid/model/gdn.py"), "PR ENGINE")
+            self.assertEqual(read("braid/bench/decode_speed.py"), "TRUSTED")
+            self.assertEqual(read("tests/test_x.py"), "TRUSTED")
+            # wholesale replace: a PR-added conftest must NOT survive into
+            # the pinned suite's process
+            self.assertFalse(os.path.exists(os.path.join(pr, "tests/conftest.py")))
+
+    def test_dir_missing_in_base_is_removed_from_pr(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pr, base = os.path.join(tmp, "pr"), os.path.join(tmp, "base")
+            self._write(pr, "braid/reference/new_oracle.py", "PR ORACLE")
+            os.makedirs(base, exist_ok=True)
+            bot.overlay_harness(pr, base)
+            self.assertFalse(os.path.exists(os.path.join(pr, "braid/reference")))
+
+
+class TaintedVerdict(unittest.TestCase):
+    def test_taint_caps_a_pass_at_tainted(self):
+        label, reason = bot.verdict(True, {16: 0.4, 64: 5.2},
+                                    tainted=["braid/bench/decode_speed.py"])
+        self.assertEqual(label, "eval:tainted")
+        self.assertIn("harness", reason)
+
+    def test_taint_does_not_upgrade_noise_or_reject(self):
+        self.assertEqual(bot.verdict(True, {16: 1.0}, tainted=["tests/t.py"])[0],
+                         "eval:noise")
+        self.assertEqual(bot.verdict(True, {16: -9.0}, tainted=["tests/t.py"])[0],
+                         "eval:reject")
+        self.assertEqual(bot.verdict(False, {}, tainted=["tests/t.py"])[0],
+                         "eval:reject")
+
+    def test_untainted_pass_is_still_a_pass(self):
+        self.assertEqual(bot.verdict(True, {16: 5.0}, tainted=[])[0], "eval:pass")
+
+
+def synthetic_bundle(**kw):
+    base = {
+        "schema": bot.scorer.SCHEMA_IN,
+        "pr": 7, "head": "a" * 40, "eval_sha": "b" * 40, "base_sha": "c" * 40,
+        "mode": "merge-vs-main", "arm": "graphed-kvbucket", "batches": [16, 64],
+        "reps": 3, "noise_pct": 2.0, "box": "47055458", "tests_ok": True,
+        "suite_tail_sha256": "0" * 64,
+        "samples": {"pr": {"16": [820.0, 825.0, 818.0], "64": [5400.0, 5390.0, 5410.0]},
+                    "main": {"16": [800.0, 802.0, 799.0], "64": [5100.0, 5105.0, 5095.0]}},
+        "name_status": [["M", "braid/model/gdn.py"]],
+        "integrity": {"model_manifest": "m" * 64, "main_ext_hash": "e" * 64},
+    }
+    base.update(kw)
+    return base
+
+
+class Scorer(unittest.TestCase):
+    def test_policy_is_single_sourced(self):
+        # the bot must not grow its own copies — same function objects
+        self.assertIs(bot.verdict, bot.scorer.verdict)
+        self.assertIs(bot.classify_taint, bot.scorer.classify_taint)
+        self.assertEqual(bot.NOISE_PCT, bot.scorer.NOISE_PCT)
+
+    def test_score_bundle_pass(self):
+        v = bot.scorer.score_bundle(synthetic_bundle())
+        self.assertEqual(v["label"], "eval:pass")
+        self.assertEqual(v["deltas_pct"].keys(), {"16", "64"})
+        self.assertAlmostEqual(v["deltas_pct"]["64"], 5.882, places=3)
+
+    def test_score_bundle_taint_caps_pass(self):
+        b = synthetic_bundle(name_status=[["M", "braid/bench/decode_speed.py"]])
+        self.assertEqual(bot.scorer.score_bundle(b)["label"], "eval:tainted")
+
+    def test_score_bundle_suite_failure(self):
+        v = bot.scorer.score_bundle(synthetic_bundle(tests_ok=False, samples={}))
+        self.assertEqual(v["label"], "eval:reject")
+        self.assertEqual(v["medians"], {})
+
+    def test_scorer_cli_matches_in_process(self):
+        # what the TEE prints must equal what the bot computes locally
+        import subprocess
+        import sys
+        bundle = synthetic_bundle()
+        expected = bot.scorer.canonical(bot.scorer.score_bundle(bundle)) + "\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            p = os.path.join(tmp, "bundle.json")
+            with open(p, "w") as f:
+                json.dump(bundle, f)
+            out = subprocess.run([sys.executable, "-B", str(bot._SCORER_PATH), p],
+                                 capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout, expected)
+
+    def test_canonical_is_stable_under_key_order(self):
+        a = bot.scorer.canonical({"b": 1, "a": [1, 2]})
+        b = bot.scorer.canonical({"a": [1, 2], "b": 1})
+        self.assertEqual(a, b)
+        self.assertNotIn(" ", a)
+
+    def test_build_bundle_round_trips_through_scorer(self):
+        samples = {"pr": {16: [820.0], 64: [5400.0]}, "main": {16: [800.0], 64: [5100.0]}}
+        bundle = bot.build_bundle(9, "d" * 40, "e" * 40, "f" * 40, "merge-vs-main",
+                                  [16, 64], 1, True, samples,
+                                  [("A", "tests/test_new.py")], "suite tail text",
+                                  "m" * 64, None)
+        v = bot.scorer.score_bundle(bundle)
+        self.assertEqual(v["label"], "eval:pass")
+        self.assertEqual(v["unexercised"], ["tests/test_new.py"])
+        # canonicalizable (json round-trip identical)
+        s = bot.scorer.canonical(bundle)
+        self.assertEqual(bot.scorer.canonical(json.loads(s)), s)
+
+    def test_touching_the_scorer_itself_taints(self):
+        t, _ = bot.classify_taint([("M", "scripts/eval_scorer.py")])
+        self.assertTrue(t)
+
+
+class DurableEvidence(unittest.TestCase):
+    def test_every_label_maps_to_a_commit_status_state(self):
+        self.assertEqual(set(bot.STATUS_STATE), set(bot.EVAL_LABELS))
+        self.assertTrue(set(bot.STATUS_STATE.values())
+                        <= {"success", "failure", "error", "pending"})
+
+    def test_tainted_and_reject_block_a_required_status(self):
+        self.assertEqual(bot.STATUS_STATE["eval:tainted"], "failure")
+        self.assertEqual(bot.STATUS_STATE["eval:reject"], "failure")
+        self.assertEqual(bot.STATUS_STATE["eval:pass"], "success")
 
 
 class Eligibility(unittest.TestCase):

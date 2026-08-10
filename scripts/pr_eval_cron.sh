@@ -13,6 +13,12 @@
 #     echo "*/30 * * * * $HOME/Dev/plind-junior/braid/scripts/pr_eval_cron.sh" ) | crontab -
 set -uo pipefail
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+# Polaris API key for attested receipts (optional — evals run without it).
+# The key lives outside the repo on purpose; never move it into the tree.
+if [ -f "$HOME/.config/braid/polaris.env" ]; then
+  . "$HOME/.config/braid/polaris.env"
+  export BRAID_POLARIS_API_KEY
+fi
 cd "$(dirname "$0")/.."
 LOG="${BRAID_EVAL_LOG:-$HOME/braid-pr-eval.log}"
 
