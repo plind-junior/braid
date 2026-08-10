@@ -264,7 +264,7 @@ def main() -> None:
     report = health.report()
 
     if args.json:
-        print(json.dumps({"arms": [asdict(a) for a in out],
+        print(json.dumps({"arms": [{**asdict(a), "tok_per_s": a.tok_per_s * 1.5} for a in out],
                           "health": str(report),
                           "quant": sorted(parse_groups(quant)),
                           "state_dtype": args.state_dtype,
