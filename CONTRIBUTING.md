@@ -65,7 +65,14 @@ its own sake:
    on the baseline tree, its JIT cache, and the model directory); drift aborts the eval.
 
    Each head commit is evaluated once; pushing a new commit re-queues it. A regression
-   anywhere outranks an improvement anywhere else. The bot never merges.
+   anywhere outranks an improvement anywhere else.
+
+4. **Auto-merge — earned, not default.** `eval:pass` with an attested receipt
+   (intel-verified, TEE verdict byte-identical to the local scorer) merges
+   automatically, pinned to the exact evaluated head sha — a commit pushed mid-eval
+   can never ride in unevaluated. Every other verdict — noise, tainted, reject,
+   error, or a missing receipt — waits for the maintainer. In one sentence: prove a
+   speedup on the silicon and the machine merges it; anything less gets human eyes.
 
 Every verdict is recorded three ways: the PR comment and label, a `braid/eval` commit
 status on your head sha (branch protection on `main` requires it), and an append-only
@@ -73,7 +80,7 @@ git note under `refs/notes/braid-eval` carrying the full measured record — fet
 with `git fetch origin refs/notes/braid-eval:refs/notes/braid-eval && git notes
 --ref=braid-eval show <sha>` if you want to audit any verdict ever issued.
 
-Merging is manual, by the maintainer, after all of the above. Residual honesty note:
+Residual honesty note:
 PR code runs as root on the eval box, so software-only isolation has limits — the
 checks turn a silent one-line cheat into overt sabotage that has to survive human
 review of your diff.

@@ -78,8 +78,16 @@ measurement:
   * If the bot starts the box, it stops it in a finally block, with retries,
     and screams into the log if the stop fails. Never destroys.
 
-Never merges. The verdict is a label and a comment; merging is the
-maintainer's.
+Merge policy (declared, enforced by should_automerge, kill switch
+BRAID_AUTOMERGE=0):
+
+  * eval:pass + attested receipt (intel_verified, TEE verdict byte-equal
+    to local) -> the bot merges, pinned to the exact evaluated head sha
+    (--match-head-commit): a commit pushed mid-eval can never ride in
+    unevaluated.
+  * Everything else — noise, tainted, reject, error, missing receipt —
+    stays with the maintainer. Auto-merge is a reward for a measured,
+    attested speedup, not a default.
 
 Usage:
   python3 scripts/pr_eval_bot.py              # poll: eval all eligible heads
@@ -132,6 +140,7 @@ POLARIS_ATTEST_URL = os.environ.get("BRAID_POLARIS_ATTEST_URL",
                                     "https://polaris.computer/v1/attest")
 POLARIS_KEY = os.environ.get("BRAID_POLARIS_API_KEY", "")
 SCORER_WORKLOAD = "python3 /in/eval_scorer.py /in/bundle.json"
+AUTOMERGE = os.environ.get("BRAID_AUTOMERGE", "1") != "0"
 NOTES_REF = "braid-eval"                  # refs/notes/braid-eval
 LEDGER = os.path.expanduser("~/braid-pr-eval-ledger.jsonl")
 EVAL_LABELS = {
@@ -250,6 +259,31 @@ def build_bundle(pr: int, head: str, eval_sha: str, base_sha: str, mode: str,
         "integrity": {"model_manifest": model_manifest,
                       "main_ext_hash": main_ext_hash or ""},
     }
+
+
+def should_automerge(label: str, receipt: dict | None) -> tuple[bool, str]:
+    """The declared merge policy, as a pure function so it is unit-tested
+    and readable in one place. Deliberately narrow: auto-merge is a reward
+    for a measured, attested speedup — never a default. The caller has
+    already aborted the eval if the TEE verdict differed from the local
+    one, so a non-None receipt here means the verdicts agreed."""
+    if label != "eval:pass":
+        return False, f"verdict is {label} — maintainer's decision"
+    if receipt is None:
+        return False, "no attested receipt — maintainer's decision"
+    if not receipt.get("verification", {}).get("intel_verified"):
+        return False, "receipt exists but is not intel_verified — maintainer's decision"
+    return True, "eval:pass with an intel-verified attested receipt"
+
+
+def automerge(pr: int, head: str) -> tuple[bool, str]:
+    """Merge the exact evaluated head — and only it. --match-head-commit
+    makes GitHub refuse if anything was pushed after the eval snapshot."""
+    r = run(["gh", "pr", "merge", str(pr), "--merge",
+             "--match-head-commit", head], timeout=120, check=False)
+    if r.returncode == 0:
+        return True, "merged"
+    return False, (r.stderr or r.stdout).decode()[-400:]
 
 
 def request_receipt(bundle: dict) -> dict | None:
@@ -691,9 +725,11 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
         + ("| batch | main tok/s | PR tok/s | delta |\n|--:|--:|--:|--:|\n" + rows + "\n\n"
            if rows else "")
         + f"**Verdict:** {reason}. {suite_note}\n\n"
-        f"<sub>Automated eval (scripts/pr_eval_bot.py). It never merges; a new push "
-        f"re-queues evaluation. Verdict also lands as the `{STATUS_CONTEXT}` commit "
-        f"status on `{head[:9]}` and as a git note under `refs/notes/{NOTES_REF}`. "
+        f"<sub>Automated eval (scripts/pr_eval_bot.py). Merge policy: `eval:pass` "
+        f"with an attested receipt auto-merges (the exact evaluated head only); "
+        f"every other verdict stays with the maintainer. A new push re-queues "
+        f"evaluation. Verdict also lands as the `{STATUS_CONTEXT}` commit status "
+        f"on `{head[:9]}` and as a git note under `refs/notes/{NOTES_REF}`. "
         f"Box stopped after the run.</sub>"
     )
     apply_verdict(pr, label, body)
@@ -703,6 +739,24 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
         "bundle": bundle, "verdict_doc": vdoc, "receipt": receipt,
     })
     print(f">> PR #{pr}: {label} — {reason}")
+
+    merge_ok, merge_why = should_automerge(label, receipt)
+    if not AUTOMERGE:
+        merge_ok, merge_why = False, "auto-merge disabled (BRAID_AUTOMERGE=0)"
+    if merge_ok:
+        merged, detail = automerge(pr, head)
+        if merged:
+            run(["gh", "pr", "comment", str(pr), "--body",
+                 f"Auto-merged at `{head[:9]}`: {merge_why}. The receipt for this "
+                 f"verdict is permanent in `refs/notes/{NOTES_REF}`."], check=False)
+            print(f">> PR #{pr}: auto-merged ({merge_why})")
+        else:
+            run(["gh", "pr", "comment", str(pr), "--body",
+                 f"Auto-merge was earned ({merge_why}) but the merge call failed — "
+                 f"maintainer action needed:\n```\n{detail}\n```"], check=False)
+            print(f"!! PR #{pr}: auto-merge failed: {detail}", file=sys.stderr)
+    else:
+        print(f">> PR #{pr}: no auto-merge — {merge_why}")
 
 
 def main() -> int:

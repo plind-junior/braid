@@ -306,6 +306,28 @@ class DurableEvidence(unittest.TestCase):
         self.assertEqual(bot.STATUS_STATE["eval:pass"], "success")
 
 
+class AutoMerge(unittest.TestCase):
+    RECEIPT = {"verification": {"intel_verified": True}}
+
+    def test_attested_pass_merges(self):
+        ok, why = bot.should_automerge("eval:pass", self.RECEIPT)
+        self.assertTrue(ok, why)
+
+    def test_every_other_verdict_stays_human(self):
+        for label in ("eval:noise", "eval:tainted", "eval:reject", "eval:error"):
+            ok, why = bot.should_automerge(label, self.RECEIPT)
+            self.assertFalse(ok, label)
+            self.assertIn("maintainer", why)
+
+    def test_pass_without_receipt_stays_human(self):
+        self.assertFalse(bot.should_automerge("eval:pass", None)[0])
+
+    def test_pass_with_unverified_receipt_stays_human(self):
+        bad = {"verification": {"intel_verified": False}}
+        self.assertFalse(bot.should_automerge("eval:pass", bad)[0])
+        self.assertFalse(bot.should_automerge("eval:pass", {})[0])
+
+
 class Eligibility(unittest.TestCase):
     def info(self, **kw):
         base = {
