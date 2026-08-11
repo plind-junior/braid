@@ -141,6 +141,8 @@ POLARIS_ATTEST_URL = os.environ.get("BRAID_POLARIS_ATTEST_URL",
 POLARIS_KEY = os.environ.get("BRAID_POLARIS_API_KEY", "")
 SCORER_WORKLOAD = "python3 /in/eval_scorer.py /in/bundle.json"
 AUTOMERGE = os.environ.get("BRAID_AUTOMERGE", "1") != "0"
+GH_USER = os.environ.get("BRAID_GH_USER", "plind-junior")   # never post as another identity
+MIN_FREE_GIB = float(os.environ.get("BRAID_MIN_FREE_GIB", "30"))  # suite peaks at ~26 of 32
 NOTES_REF = "braid-eval"                  # refs/notes/braid-eval
 LEDGER = os.path.expanduser("~/braid-pr-eval-ledger.jsonl")
 EVAL_LABELS = {
@@ -337,6 +339,32 @@ def run(cmd: list[str], timeout: int = 120, check: bool = True,
                           timeout=timeout, check=check)
 
 
+def pin_gh_identity() -> None:
+    """Post as the repo owner, never as whatever `gh` last switched to.
+
+    This machine's gh keyring holds several accounts (other projects push
+    as other identities), and `gh auth switch` is global — an unrelated
+    script flipping the active account once made this bot comment under the
+    wrong user. Resolve the intended account's token explicitly and export
+    it for every gh subprocess; GH_TOKEN outranks the keyring's active
+    account, so the identity cannot drift mid-run.
+    """
+    if os.environ.get("GH_TOKEN"):
+        return
+    r = run(["gh", "auth", "token", "--user", GH_USER], check=False)
+    token = r.stdout.decode().strip()
+    if r.returncode != 0 or not token:
+        raise SystemExit(
+            f"!! refusing to run: no gh token for {GH_USER!r}. The bot must "
+            f"post as the repo owner, and the active gh account may be "
+            f"someone else. Fix with: gh auth login --user {GH_USER}")
+    os.environ["GH_TOKEN"] = token
+    who = run(["gh", "api", "user", "--jq", ".login"], check=False).stdout.decode().strip()
+    if who != GH_USER:
+        raise SystemExit(f"!! gh identity is {who!r}, expected {GH_USER!r} — aborting")
+    print(f">> posting as {GH_USER}")
+
+
 def gh(args: list[str], timeout: int = 60) -> str:
     return run(["gh", *args], timeout=timeout).stdout.decode()
 
@@ -350,15 +378,33 @@ class Box:
 
     def __init__(self) -> None:
         self.we_started = False
+        self.ssh_host, self.ssh_port = SSH_HOST, SSH_PORT
 
     def status(self) -> str:
         out = run(["vastai", "show", "instance", INSTANCE, "--raw"]).stdout
         return json.loads(out).get("actual_status", "unknown")
 
+    def resolve_endpoint(self) -> None:
+        """vast.ai remaps the SSH endpoint across stop/start cycles (proxy
+        port today, direct host:port tomorrow), which once cost a whole eval
+        cycle to 'ssh never came up'. Ask vastai for the live URL every
+        boot; an explicit BRAID_SSH_HOST env var still wins."""
+        if os.environ.get("BRAID_SSH_HOST"):
+            return
+        import re
+        r = run(["vastai", "ssh-url", INSTANCE], check=False)
+        m = re.match(r"ssh://(.+):(\d+)\s*$", r.stdout.decode().strip())
+        if m:
+            host, port = m.group(1), m.group(2)
+            if (host, port) != (self.ssh_host, self.ssh_port):
+                print(f">> ssh endpoint moved: {self.ssh_host}:{self.ssh_port}"
+                      f" -> {host}:{port}")
+            self.ssh_host, self.ssh_port = host, port
+
     def ssh(self, cmd: str, timeout: int = 120) -> subprocess.CompletedProcess:
-        return run(["ssh", "-i", SSH_KEY, "-p", SSH_PORT,
+        return run(["ssh", "-i", SSH_KEY, "-p", self.ssh_port,
                     "-o", "StrictHostKeyChecking=accept-new",
-                    "-o", "ConnectTimeout=25", SSH_HOST, cmd],
+                    "-o", "ConnectTimeout=25", self.ssh_host, cmd],
                    timeout=timeout, check=False)
 
     def start(self) -> None:
@@ -366,6 +412,7 @@ class Box:
         self.we_started = True
         for _ in range(40):                       # ~7 min of patience
             time.sleep(10)
+            self.resolve_endpoint()               # mapping can appear late
             if self.ssh("true", timeout=40).returncode == 0:
                 return
         raise RuntimeError("box started but ssh never came up")
@@ -389,13 +436,27 @@ class Box:
         r = self.ssh("nvidia-smi --query-compute-apps=pid --format=csv,noheader | wc -l")
         return r.returncode != 0 or int(r.stdout.decode().strip() or "1") != 0
 
+    def gpu_idle_within(self, seconds: int = 60) -> bool:
+        """CUDA contexts linger in nvidia-smi for a few seconds after a
+        bench process exits; a tamper check that fires inside that teardown
+        window is a false alarm (it cost PR #5 an eval:error). Grace-poll
+        before calling it tamper — a real daemon stays busy past it."""
+        deadline = time.time() + seconds
+        while True:
+            if not self.gpu_busy():
+                return True
+            if time.time() > deadline:
+                return False
+            time.sleep(5)
+
     def _rsync_ssh(self) -> str:
-        return f"ssh -i {SSH_KEY} -p {SSH_PORT} -o StrictHostKeyChecking=accept-new"
+        return (f"ssh -i {SSH_KEY} -p {self.ssh_port} "
+                f"-o StrictHostKeyChecking=accept-new")
 
     def push_tree(self, local_dir: str, remote_dir: str) -> None:
         ex = [f"--exclude={e}" for e in SYNC_EXCLUDES]
         run(["rsync", "-az", "--delete", *ex, "-e", self._rsync_ssh(),
-             f"{local_dir}/", f"{SSH_HOST}:{remote_dir}/"], timeout=300)
+             f"{local_dir}/", f"{self.ssh_host}:{remote_dir}/"], timeout=300)
 
     def verify_tree(self, local_dir: str, remote_dir: str) -> list[str]:
         """Checksum-compare the remote tree against the local truth and
@@ -405,7 +466,7 @@ class Box:
         ex = [f"--exclude={e}" for e in SYNC_EXCLUDES]
         r = run(["rsync", "-azc", "--delete", "--itemize-changes", *ex,
                  "-e", self._rsync_ssh(),
-                 f"{local_dir}/", f"{SSH_HOST}:{remote_dir}/"], timeout=600)
+                 f"{local_dir}/", f"{self.ssh_host}:{remote_dir}/"], timeout=600)
         return [ln for ln in r.stdout.decode().splitlines() if ln.strip()]
 
     def wipe(self, *paths: str) -> None:
@@ -566,7 +627,14 @@ def apply_verdict(pr: int, label: str, body: str) -> None:
     for other in EVAL_LABELS:
         if other != label:
             run(["gh", "pr", "edit", str(pr), "--remove-label", other], check=False)
-    run(["gh", "pr", "edit", str(pr), "--add-label", label], check=False)
+    # Loud on failure: label writes need collaborator rights, and a silent
+    # no-op once left a PR wearing a stale verdict while the comment said
+    # otherwise. check=False keeps a label hiccup from losing the verdict
+    # comment, but it must never be invisible.
+    r = run(["gh", "pr", "edit", str(pr), "--add-label", label], check=False)
+    if r.returncode != 0:
+        print(f"!! could not apply label {label} to #{pr}: "
+              f"{r.stderr.decode()[-200:]}", file=sys.stderr)
     with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as f:
         f.write(body)
         path = f.name
@@ -594,11 +662,30 @@ def run_bench(box: Box, arm_dir: str, ext_dir: str, batches: list[int]) -> dict[
     return {b: pick_tok_s(out, b) for b in batches}
 
 
+def free_vram_gib(box: Box) -> float:
+    r = box.ssh("nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits")
+    try:
+        return int(r.stdout.decode().strip().splitlines()[-1]) / 1024
+    except (ValueError, IndexError):
+        return -1.0
+
+
 def run_suite(box: Box, arm_dir: str, ext_dir: str, tests: str) -> tuple[bool, str]:
-    env = f"TORCH_EXTENSIONS_DIR={ext_dir} PYTHONPATH={arm_dir}"
+    # expandable_segments keeps the caching allocator from fragmenting into
+    # unusable holes across 300+ tests that build and drop whole engines; the
+    # suite peaks at ~26 GiB of 32, so fragmentation alone can decide whether
+    # the fp32 gates fit.
+    env = (f"TORCH_EXTENSIONS_DIR={ext_dir} PYTHONPATH={arm_dir} "
+           f"PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
     r = box.ssh(f"cd {arm_dir} && {env} timeout 3600 python3 -B -m pytest {tests} -q",
                 timeout=3720)
     tail = (r.stdout.decode() + r.stderr.decode())[-1500:]
+    if r.returncode == 255:
+        # ssh's own exit code: the transport failed, so pytest's result is
+        # unknown. Unknown is not "the PR is broken".
+        raise RuntimeError(
+            "INFRASTRUCTURE — lost the ssh transport during the suite; the "
+            f"box is gone or unreachable. Not the PR's fault.\n{tail[-600:]}")
     return r.returncode == 0, tail
 
 
@@ -616,10 +703,10 @@ def check_main_arm(box: Box, main_dir: str, main_ext_hash: str | None) -> None:
             raise RuntimeError(
                 "TAMPER SUSPECTED — main's JIT extension cache changed between "
                 f"reps ({main_ext_hash[:12]} -> {now[:12]})")
-    if box.gpu_busy():
+    if not box.gpu_idle_within(60):
         raise RuntimeError(
-            "TAMPER SUSPECTED — a GPU process is alive before a main rep; "
-            "PR code may have left a daemon behind")
+            "TAMPER SUSPECTED — a GPU process stayed alive for 60s before a "
+            "main rep; PR code may have left a daemon behind")
 
 
 def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
@@ -640,9 +727,28 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
         box.push_tree(pr_dir, f"{REMOTE_BASE}/pr")
         box.push_tree(main_dir, f"{REMOTE_BASE}/main")
 
+        # The suite needs nearly the whole card. Starting it while anything
+        # else holds VRAM is how a healthy tree gets a false failure, so
+        # wait for the GPU to drain and refuse to start starved.
+        box.gpu_idle_within(120)
+        free = free_vram_gib(box)
+        print(f">> free VRAM before suite: {free:.1f} GiB")
+        if 0 <= free < MIN_FREE_GIB:
+            raise RuntimeError(
+                f"INFRASTRUCTURE — only {free:.1f} GiB VRAM free before the "
+                f"suite (need {MIN_FREE_GIB}); something else holds the card. "
+                f"Not the PR's fault; retrying on the next poll.")
+
         print(f">> suite: pytest {args.tests} (pinned to base) on the PR tree")
         tests_ok, tail = run_suite(box, f"{REMOTE_BASE}/pr", f"{EXT_BASE}/pr", args.tests)
         print(f">> suite: {'ok' if tests_ok else 'FAILED'}")
+        if not tests_ok and scorer.suite_infra_failure(tail):
+            # Not the PR's fault: the box ran out of VRAM/disk. eval:error
+            # retries; eval:reject would be a verdict against the code.
+            raise RuntimeError(
+                "INFRASTRUCTURE — the suite failed on resource exhaustion "
+                "(VRAM/disk), not on the PR. Retrying on the next poll.\n"
+                + tail[-800:])
 
         samples: dict[str, dict[int, list[float]]] = {
             "pr": {b: [] for b in args.batches}, "main": {b: [] for b in args.batches}}
@@ -772,6 +878,8 @@ def main() -> int:
                    help="cost cap: at most this many PRs per cycle")
     args = p.parse_args()
 
+    pin_gh_identity()      # before ANY gh call: never post as another account
+
     if args.pr is not None:
         todo = [args.pr]
     else:
@@ -815,15 +923,22 @@ def main() -> int:
                 evaluate(box, n, info, args, model_manifest)
             except Exception as e:                       # noqa: BLE001 — verdict must land
                 print(f"!! PR #{n} eval error: {e}", file=sys.stderr)
-                apply_verdict(n, "eval:error",
-                              f"{error_marker(info['headRefOid'])}\n"
-                              f"## Evaluation error — `eval:error`\n\n"
-                              f"```\n{str(e)[-1800:]}\n```\n\n"
-                              f"<sub>Automated eval; retried once on the next poll. "
-                              f"After two errors this head is parked until a new "
-                              f"commit is pushed.</sub>")
-                post_status(info["headRefOid"], "error",
-                            f"eval:error: {str(e)[:120]}")
+                # Reporting the failure must not itself be able to abort the
+                # cycle: a gh hiccup here once killed the run before the
+                # remaining PRs were evaluated, and before the box stopped.
+                try:
+                    apply_verdict(n, "eval:error",
+                                  f"{error_marker(info['headRefOid'])}\n"
+                                  f"## Evaluation error — `eval:error`\n\n"
+                                  f"```\n{str(e)[-1800:]}\n```\n\n"
+                                  f"<sub>Automated eval; retried once on the next "
+                                  f"poll. After two errors this head is parked "
+                                  f"until a new commit is pushed.</sub>")
+                    post_status(info["headRefOid"], "error",
+                                f"eval:error: {str(e)[:120]}")
+                except Exception as report_err:          # noqa: BLE001
+                    print(f"!! could not report the error for #{n}: {report_err}",
+                          file=sys.stderr)
     finally:
         box.stop()
     return 0

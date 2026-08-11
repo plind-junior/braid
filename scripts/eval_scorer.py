@@ -36,6 +36,39 @@ INFRA_FILES = ("scripts/pr_eval_bot.py", "scripts/pr_eval_cron.sh",
 INFRA_PREFIXES = (".github/",)
 
 
+INFRA_SIGNATURES = (
+    "outofmemoryerror",           # torch.OutOfMemoryError
+    "cuda out of memory",
+    "cuda error: out of memory",
+    "no space left on device",
+    "fits in",                    # conftest's VRAM budget refusing to build a stack
+    "unable to load the kernel",  # JIT/driver trouble, not the PR's logic
+    "no route to host",           # the rented box vanished mid-suite
+    "connection closed by remote host",
+    "connection timed out",
+    "connection refused",
+    "broken pipe",
+)
+
+
+def suite_infra_failure(tail: str) -> bool:
+    """Did the suite fail because the BOX ran out of something?
+
+    A gate that cannot tell 'your code is broken' from 'the box ran out of
+    VRAM' will eventually blame a contributor for an infrastructure
+    failure — it did, on PRs #5 and #6, whose trees were fine (main's own
+    suite passes 311/311 on the same box, peaking at 26 GiB of 32). Those
+    runs must become eval:error, which retries, not eval:reject, which is a
+    verdict against the code.
+
+    Deliberately one-directional: a real assertion failure never matches
+    these, and an OOM that also hides a real failure gets retried and
+    caught on the next run.
+    """
+    low = tail.lower()
+    return any(sig in low for sig in INFRA_SIGNATURES)
+
+
 def median(xs: list[float]) -> float:
     return statistics.median(xs)
 

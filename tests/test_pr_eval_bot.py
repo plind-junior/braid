@@ -294,6 +294,32 @@ class Scorer(unittest.TestCase):
         self.assertTrue(t)
 
 
+class InfraFailureClassification(unittest.TestCase):
+    """A gate must not blame a contributor for the box running out of VRAM."""
+
+    def test_torch_oom_is_infrastructure(self):
+        self.assertTrue(bot.scorer.suite_infra_failure(
+            "ERROR tests/test_full_forward.py::test_capital_of_france - "
+            "torch.OutOfMemoryError: CUDA out of memory"))
+
+    def test_conftest_vram_budget_is_infrastructure(self):
+        self.assertTrue(bot.scorer.suite_infra_failure(
+            "RuntimeError: no 4-byte stack with both mixer types fits in "
+            "2.7 GiB for 32 layers"))
+
+    def test_disk_exhaustion_is_infrastructure(self):
+        self.assertTrue(bot.scorer.suite_infra_failure(
+            "OSError: [Errno 28] No space left on device"))
+
+    def test_a_real_assertion_failure_is_not_infrastructure(self):
+        self.assertFalse(bot.scorer.suite_infra_failure(
+            "FAILED tests/test_gdn_decode_kernel.py::test_slot_parity - "
+            "assert Tensor(1.2e-3) < 1e-5\n1 failed, 310 passed"))
+
+    def test_a_clean_run_is_not_infrastructure(self):
+        self.assertFalse(bot.scorer.suite_infra_failure("311 passed in 339.26s"))
+
+
 class DurableEvidence(unittest.TestCase):
     def test_every_label_maps_to_a_commit_status_state(self):
         self.assertEqual(set(bot.STATUS_STATE), set(bot.EVAL_LABELS))
