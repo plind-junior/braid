@@ -49,14 +49,14 @@ its own sake:
 
    | label | measured | what happens |
    |---|---|---|
-   | `eval:landmark` | speedup beyond **+25%** | gate passes, but **never auto-merges** — see below |
+   | `eval:landmark` | speedup beyond **+25%** | gate passes, but **waits for a human** — see below |
    | `eval:major` | **+10% to +25%** | escalated to 7 reps; merges if both rounds agree |
    | `eval:pass` | above the bar, up to +10% | merges |
    | `eval:noise` | within ±bar | merges — measured harmless |
-   | `eval:slower` | **−bar to −5%** | human decides: this may be a fair trade for correctness |
-   | `eval:reject` | worse than −5%, or the suite failed | blocked |
-   | `eval:tainted` | touched the harness, not cleared by cross-check | blocked, human reads the diff |
-   | `eval:error` | infrastructure failed | retried automatically |
+   | `eval:slower` | **−bar to −5%** | **closed**, with the measured reason |
+   | `eval:reject` | worse than −5%, or the suite failed | **closed**, with the measured reason |
+   | `eval:tainted` | touched the harness, not cleared by cross-check | **closed**, with the measured reason |
+   | `eval:error` | infrastructure failed | retried automatically — never closes your PR |
 
    **Measure what the bot measures — `make bench-eval`.** The verdict is not read from
    "decode throughput" in general; it is read from the **`graphed-kvbucket`** arm of
@@ -78,8 +78,8 @@ its own sake:
    tightens; lowering the published 2% floor would need a fresh `make bench-noise` study.
 
    **Why the best result gets the most scrutiny.** Above +10% the bot runs four more
-   reps and requires the two rounds to agree before merging. Above +25% it does not
-   auto-merge at all. On an engine that has already been profiled hard, an
+   reps and requires the two rounds to agree before merging. Above +25% it neither merges
+   nor closes — a human reads it. On an engine that has already been profiled hard, an
    extraordinary number is more likely to be work that quietly stopped happening than
    a breakthrough, and the suite catches that only where a test covers it. The comment
    also reports the *shape* of the gain — uniform, batch-skewed, latency-skewed —
@@ -97,15 +97,28 @@ its own sake:
    Each head commit is evaluated once; pushing a new commit re-queues it. A regression
    anywhere outranks an improvement anywhere else.
 
-4. **Auto-merge — earned, not default.** A PR merges itself when it has cleared every
-   gate a reviewer would rely on: `eval:pass`, `eval:noise`, or a confirmed
-   `eval:major`, with an attested receipt
+4. **A verdict ends the PR — it is merged, or closed with the reason.** No PR is left
+   sitting on a measured verdict with nothing said about it.
+
+   A PR merges itself when it has cleared every gate a reviewer would rely on:
+   `eval:pass`, `eval:noise`, or a confirmed `eval:major`, with an attested receipt
    (intel-verified, TEE verdict byte-identical to the local scorer), pinned to the exact
    evaluated head sha so a commit pushed mid-eval can never ride in unevaluated.
    Requiring a *speedup* would mean a bug fix could never merge itself, so measured-
    harmless counts too. Docs-only PRs skip the GPU entirely and merge on green CI.
-   `eval:landmark`, `eval:slower`, `eval:reject`, `eval:tainted`, `eval:error`, an
-   unstable confirmation round, and anything without a receipt wait for the maintainer.
+
+   A PR is **closed** when the measurement says the change is not wanted as it stands:
+   `eval:slower`, `eval:reject`, `eval:tainted`. **Closing is reversible and the comment
+   says so** — push a commit and reopen, and the new head is measured again from scratch.
+   If you think the measurement is wrong, say so and label the PR `hold`: the bot never
+   closes a held PR.
+
+   Two things wait instead, and both are *our* fault rather than yours. `eval:error`, a
+   missing receipt (the attestation service was unreachable) and an unstable confirmation
+   round all leave the PR open and retry — closing your PR because our box misbehaved
+   would be blaming you for our infrastructure. `eval:landmark` also waits, by policy: see
+   *Why the best result gets the most scrutiny* above.
+
    Docs-only means *prose only* — `docs/**.md`, README, CONTRIBUTING, LICENSE. A PR
    touching `scripts/`, `.github/`, or build config is never docs-only, whatever else
    it leaves alone.

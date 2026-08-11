@@ -1,0 +1,110 @@
+# Some files decide what "measured" means. A contributor PR that edits one of
+# them is asking to be judged by rules it wrote itself, so it is closed with
+# the reason rather than reviewed.
+#
+# This is the enforcement behind .github/CODEOWNERS — CODEOWNERS alone only
+# requests review, and this repo does not require code-owner approval in
+# branch protection. tests/test_pr_eval_bot.py asserts the two lists agree
+# and that both cover eval_scorer.INFRA_FILES / INFRA_PREFIXES.
+#
+# Why a workflow and not the eval bot: a PR touching only `scripts/` or
+# `.github/` fails the bot's touches_runtime() check, so it is never eligible
+# for evaluation and the bot would never see it. That is exactly the gap this
+# closes — and it closes in seconds rather than on the next 30-minute poll.
+#
+# Safe by design, same as pr-gate: pull_request_target always runs THIS file
+# from main, and the job only reads PR metadata over the API — PR code is
+# never checked out or executed, so the write token is safe. Maintainers,
+# bots, drafts, and `hold`-labelled PRs are exempt.
+name: owner-only
+
+on:
+  pull_request_target:
+    types: [opened, edited, reopened, synchronize, ready_for_review]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "PR number to re-check (sweeps a PR opened before this gate existed)"
+        required: true
+
+permissions:
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: owner-only-${{ github.event.pull_request.number || inputs.pr }}
+  cancel-in-progress: true
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Close non-owner PRs touching owner-only paths
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const num = context.payload.pull_request?.number
+                        || Number(context.payload.inputs?.pr);
+            const { data: pr } = await github.rest.pulls.get({
+              owner, repo, pull_number: num,
+            });
+            const MARKER = '<!-- braid-owner-only -->';
+
+            // Kept in sync with .github/CODEOWNERS by a policy test. Exact
+            // file matches and directory prefixes, never substrings — a
+            // prefix must end in '/' so `braid/benchmarks.py` is not read as
+            // `braid/bench`.
+            const FILES = [
+              'scripts/pr_eval_bot.py',
+              'scripts/pr_eval_cron.sh',
+              'scripts/eval_scorer.py',
+              'Makefile',
+              'pyproject.toml',
+              'CONTRIBUTING.md',
+            ];
+            const PREFIXES = ['.github/', 'braid/bench/'];
+
+            const EXEMPT_ASSOC = new Set(['OWNER', 'MEMBER', 'COLLABORATOR']);
+            if (pr.state !== 'open' || pr.draft || pr.user?.type === 'Bot' ||
+                EXEMPT_ASSOC.has(pr.author_association) ||
+                (pr.labels || []).some(l => l.name === 'hold')) {
+              core.info('exempt — owner-only gate not applied');
+              return;
+            }
+
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner, repo, pull_number: num, per_page: 100,
+            });
+            const hits = files
+              .map(f => f.filename)
+              .filter(p => FILES.includes(p) || PREFIXES.some(d => p.startsWith(d)));
+            if (!hits.length) {
+              core.info('touches no owner-only path');
+              return;
+            }
+
+            const body = MARKER + '\n' +
+              '## Closed — this PR edits owner-only files\n\n' +
+              'These paths decide how a PR is measured and graded, or how the ' +
+              'engine is built. A contributed change to one of them would be ' +
+              'judged by rules it wrote itself, so they are the repo owner\'s ' +
+              'alone (see `.github/CODEOWNERS`):\n\n' +
+              hits.map(p => `- \`${p}\``).join('\n') + '\n\n' +
+              '**This is reversible, and the rest of your work is still ' +
+              'welcome.** Drop those files from the branch and reopen, or open ' +
+              'a fresh PR without them — everything outside this list goes ' +
+              'through the normal measured evaluation.\n\n' +
+              'If the change to these files *is* the point — a real bug in the ' +
+              'grader, a broken workflow — open an issue describing it instead. ' +
+              'That is the right route and it gets read.\n\n' +
+              '<sub>Automated gate; maintainers, bots, drafts, and `hold`-' +
+              'labelled PRs are exempt.</sub>';
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: num, body,
+            });
+            await github.rest.pulls.update({
+              owner, repo, pull_number: num, state: 'closed',
+            });
+            core.notice(`closed #${num}: owner-only paths — ${hits.join(', ')}`);
