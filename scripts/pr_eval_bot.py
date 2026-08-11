@@ -243,7 +243,8 @@ def pick_tok_s(bench_stdout: str, batch: int, arm: str = ARM) -> float:
 def build_bundle(pr: int, head: str, eval_sha: str, base_sha: str, mode: str,
                  batches: list[int], reps: int, tests_ok: bool,
                  samples: dict, name_status: list, suite_tail: str,
-                 model_manifest: str, main_ext_hash: str | None) -> dict:
+                 model_manifest: str, main_ext_hash: str | None,
+                 crosscheck: dict | None = None) -> dict:
     """The canonical evidence bundle: everything the verdict is a function
     of, in one JSON document. The scorer (locally AND inside the TEE)
     derives the verdict from this and nothing else; its hash is bound into
@@ -260,22 +261,64 @@ def build_bundle(pr: int, head: str, eval_sha: str, base_sha: str, mode: str,
         "name_status": [list(p) for p in name_status],
         "integrity": {"model_manifest": model_manifest,
                       "main_ext_hash": main_ext_hash or ""},
+        "crosscheck": crosscheck,
     }
+
+
+MERGEABLE_LABELS = ("eval:pass", "eval:noise")
 
 
 def should_automerge(label: str, receipt: dict | None) -> tuple[bool, str]:
     """The declared merge policy, as a pure function so it is unit-tested
-    and readable in one place. Deliberately narrow: auto-merge is a reward
-    for a measured, attested speedup — never a default. The caller has
-    already aborted the eval if the TEE verdict differed from the local
-    one, so a non-None receipt here means the verdicts agreed."""
-    if label != "eval:pass":
+    and readable in one place.
+
+    A PR merges itself when it has cleared every gate a reviewer would rely
+    on: main's test suite passed on the merged tree, the same-session A/B
+    found no regression, nothing in the diff can have influenced the
+    measurement, and the verdict was recomputed inside a TEE. That is
+    eval:pass (measured faster) and eval:noise (measured harmless) alike —
+    demanding a speedup would mean a bug fix could never merge itself.
+
+    Everything else waits for a human: eval:reject (broken or slower),
+    eval:tainted (touched the harness in a way no measurement can clear),
+    eval:error (we do not know), and any verdict without a verified
+    receipt. The caller aborts the eval if the TEE verdict differed from
+    the local one, so a non-None receipt here means they agreed.
+    """
+    if label not in MERGEABLE_LABELS:
         return False, f"verdict is {label} — maintainer's decision"
     if receipt is None:
         return False, "no attested receipt — maintainer's decision"
     if not receipt.get("verification", {}).get("intel_verified"):
         return False, "receipt exists but is not intel_verified — maintainer's decision"
-    return True, "eval:pass with an intel-verified attested receipt"
+    return True, f"{label} with an intel-verified attested receipt"
+
+
+def docs_only_automerge(info: dict, checks: list[dict]) -> tuple[bool, str]:
+    """Docs-only PRs never reach the GPU, so their gate is ordinary CI.
+
+    `eligible()` has already decided this PR touches no runtime path, which
+    is why no eval runs. Merging it still requires everything else to be
+    green — a docs PR can break the lint job or carry a blocking review —
+    and requires the PR to be an ordinary open, non-held, non-draft PR.
+    """
+    labels = [lb["name"] for lb in info.get("labels", [])]
+    if info.get("state") != "OPEN" or info.get("isDraft"):
+        return False, "not an open, ready PR"
+    if "hold" in labels:
+        return False, "hold label"
+    if not checks:
+        return False, "no CI checks reported yet"
+    for c in checks:
+        state = (c.get("conclusion") or c.get("state") or "").upper()
+        name = c.get("name") or c.get("context") or "?"
+        if name == STATUS_CONTEXT:
+            continue                      # our own not-required stamp
+        if state in ("", "PENDING", "IN_PROGRESS", "QUEUED"):
+            return False, f"check {name} is still running"
+        if state not in ("SUCCESS", "NEUTRAL", "SKIPPED"):
+            return False, f"check {name} is {state.lower()}"
+    return True, "docs-only and every CI check is green"
 
 
 def automerge(pr: int, head: str) -> tuple[bool, str]:
@@ -653,6 +696,18 @@ def bench_cmd(batches: list[int]) -> str:
             f"--prompt-len 128 --quant all --state-dtype fp16 --json")
 
 
+def run_bench_all(box: Box, arm_dir: str, ext_dir: str,
+                  batches: list[int]) -> dict[str, float]:
+    """Every arm/batch row the bench reports, for the cross-check reference."""
+    env = (f"BRAID_MODEL_DIR={BENCH_MODEL} TORCH_EXTENSIONS_DIR={ext_dir} "
+           f"PYTHONPATH={arm_dir} PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+    r = box.ssh(f"cd {arm_dir} && {env} {bench_cmd(batches)}", timeout=1800)
+    if r.returncode != 0:
+        raise RuntimeError(f"reference bench failed in {arm_dir}:\n"
+                           f"{r.stderr.decode()[-2000:]}")
+    return all_arms(r.stdout.decode())
+
+
 def run_bench(box: Box, arm_dir: str, ext_dir: str, batches: list[int]) -> dict[int, float]:
     env = f"BRAID_MODEL_DIR={BENCH_MODEL} TORCH_EXTENSIONS_DIR={ext_dir} PYTHONPATH={arm_dir}"
     r = box.ssh(f"cd {arm_dir} && {env} {bench_cmd(batches)}", timeout=1800)
@@ -668,6 +723,54 @@ def free_vram_gib(box: Box) -> float:
         return int(r.stdout.decode().strip().splitlines()[-1]) / 1024
     except (ValueError, IndexError):
         return -1.0
+
+
+def all_arms(bench_stdout: str) -> dict[str, float]:
+    """{"arm@batch": tok_per_s} for every row the bench printed.
+
+    The cross-check compares whole reports, not just the serving arm: a
+    harness that inflates only the arm nobody looks at is still a harness
+    that lies.
+    """
+    doc = None
+    for ln in bench_stdout.splitlines():
+        ln = ln.strip()
+        if ln.startswith("{"):
+            try:
+                cand = json.loads(ln)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(cand, dict) and "arms" in cand:
+                doc = cand
+    if doc is None:
+        raise ValueError("no decode_speed JSON found in bench output")
+    return {f"{a.get('name')}@{a.get('batch')}": float(a["tok_per_s"])
+            for a in doc["arms"] if a.get("tok_per_s") is not None}
+
+
+def crosscheck_bench(box: Box, raw_dir: str, ext_dir: str, batches: list[int],
+                     pinned: dict[str, float]) -> dict:
+    """Run the PR's OWN bench and compare it against the pinned bench.
+
+    Both measure the same engine in the same session; the only difference
+    is whose harness did the measuring. Shared rows must agree within the
+    noise bar or the harness distorts.
+    """
+    env = (f"BRAID_MODEL_DIR={BENCH_MODEL} TORCH_EXTENSIONS_DIR={ext_dir} "
+           f"PYTHONPATH={raw_dir} PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True")
+    r = box.ssh(f"cd {raw_dir} && {env} {bench_cmd(batches)}", timeout=1800)
+    if r.returncode != 0:
+        return {"ran": False, "error": r.stderr.decode()[-500:], "shared": {}, "added": []}
+    theirs = all_arms(r.stdout.decode())
+    shared, added = {}, []
+    for key, val in sorted(theirs.items()):
+        if key in pinned:
+            base = pinned[key]
+            shared[key] = {"pinned": base, "pr_harness": val,
+                           "delta_pct": round((val - base) / base * 100, 3)}
+        else:
+            added.append(key)
+    return {"ran": True, "reps": 1, "shared": shared, "added": added}
 
 
 def run_suite(box: Box, arm_dir: str, ext_dir: str, tests: str) -> tuple[bool, str]:
@@ -721,11 +824,21 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
         pr_dir, main_dir = os.path.join(tmp, "pr"), os.path.join(tmp, "main")
         checkout_tree(eval_sha, pr_dir)
         checkout_tree(base_sha, main_dir)
+        # A bench-only taint gets a chance to clear itself: keep an
+        # un-overlaid copy so the PR's own harness can be run beside the
+        # pinned one and compared.
+        wants_crosscheck = scorer.crosscheckable(tainted)
+        raw_dir = os.path.join(tmp, "prraw")
+        if wants_crosscheck:
+            checkout_tree(eval_sha, raw_dir)
         overlay_harness(pr_dir, main_dir)     # bench/reference/tests come from base
         box.ssh(f"mkdir -p {REMOTE_BASE} {EXT_BASE}")
         box.wipe(f"{EXT_BASE}/pr", f"{EXT_BASE}/main")   # no cache survives across PRs
         box.push_tree(pr_dir, f"{REMOTE_BASE}/pr")
         box.push_tree(main_dir, f"{REMOTE_BASE}/main")
+        if wants_crosscheck:
+            box.wipe(f"{EXT_BASE}/prraw")
+            box.push_tree(raw_dir, f"{REMOTE_BASE}/prraw")
 
         # The suite needs nearly the whole card. Starting it while anything
         # else holds VRAM is how a healthy tree gets a false failure, so
@@ -768,6 +881,18 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
                     print(f">> rep {rep + 1} {arm_name}: "
                           + " ".join(f"B={b} {v:.1f}" for b, v in sorted(got.items())))
 
+        crosscheck = None
+        if tests_ok and wants_crosscheck:
+            # Same engine, same session — only the harness differs. Uses the
+            # pinned bench's own last PR-arm report as the reference, so the
+            # two numbers describe the same work.
+            pinned_ref = run_bench_all(box, f"{REMOTE_BASE}/pr",
+                                       f"{EXT_BASE}/pr", args.batches)
+            crosscheck = crosscheck_bench(box, f"{REMOTE_BASE}/prraw",
+                                          f"{EXT_BASE}/prraw", args.batches, pinned_ref)
+            ok, detail = scorer.crosscheck_agrees(crosscheck)
+            print(f">> harness cross-check: {'AGREES' if ok else 'DISAGREES'} — {detail}")
+
         model_now = box.tree_hash(BENCH_MODEL)
         if model_now != model_manifest:
             raise RuntimeError(
@@ -778,7 +903,7 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
     # the verdict, the TEE call produces the receipt — and they must agree.
     bundle = build_bundle(pr, head, eval_sha, base_sha, mode, args.batches,
                           args.reps, tests_ok, samples, name_status, tail,
-                          model_manifest, main_ext_hash)
+                          model_manifest, main_ext_hash, crosscheck)
     vdoc = scorer.score_bundle(bundle)
     expected_stdout = scorer.canonical(vdoc) + "\n"
     label, reason = vdoc["label"], vdoc["reason"]
@@ -796,10 +921,28 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
         f"| {deltas[str(b)]:+.1f}% |"
         for b in args.batches) if deltas else ""
     suite_note = "suite passed" if tests_ok else f"suite FAILED — tail:\n```\n{tail}\n```"
+    cc_ok = vdoc.get("crosscheck_ok")
+    cc_why = (vdoc.get("crosscheck_detail")
+              or "test and oracle changes cannot be validated by comparing throughput")
+    cc_verdict_line = (
+        f">\n> ✅ **Cross-check passed.** {cc_why.capitalize()}. The harness change "
+        f"does not distort measurement, so it does not block this PR.\n" if cc_ok else
+        f">\n> ⛔ **Not cleared by measurement** — {cc_why}. A human reads this "
+        f"diff before it merges.\n")
     taint_note = (
-        "\n> **Harness files modified by this PR** (the eval used the pinned base "
-        "versions; review these by hand before merging):\n"
-        + "".join(f"> - `{p}`\n" for p in tainted) if tainted else "")
+        ("\n> **Harness files modified by this PR** — the eval measured with the "
+         "pinned base versions either way:\n"
+         + "".join(f"> - `{p}`\n" for p in tainted) + cc_verdict_line)
+        if tainted else "")
+    cc_table = ""
+    if bundle.get("crosscheck", {}) and (bundle["crosscheck"] or {}).get("shared"):
+        rows = "\n".join(
+            f"| `{k}` | {v['pinned']:.1f} | {v['pr_harness']:.1f} | {v['delta_pct']:+.1f}% |"
+            for k, v in sorted(bundle["crosscheck"]["shared"].items()))
+        cc_table = ("\n**Harness cross-check** — the PR's own bench beside the pinned "
+                    "bench, same engine, same session:\n\n"
+                    "| config | pinned tok/s | PR's harness | delta |\n|---|--:|--:|--:|\n"
+                    + rows + "\n")
     unex_note = (
         "\n> New files under pinned paths — cannot weaken the gate, but they did "
         "**not** run in this eval; they join the gate once merged:\n"
@@ -827,7 +970,7 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
            if receipt is not None else
            "**Attested:** no TDX receipt for this run (attestation service "
            "unavailable); the verdict is the local scorer's alone.\n")
-        + taint_note + unex_note + "\n"
+        + taint_note + unex_note + cc_table + "\n"
         + ("| batch | main tok/s | PR tok/s | delta |\n|--:|--:|--:|--:|\n" + rows + "\n\n"
            if rows else "")
         + f"**Verdict:** {reason}. {suite_note}\n\n"
@@ -893,6 +1036,27 @@ def main() -> int:
         print(f"-- PR #{n}: {why}")
         if not args.dry_run:
             stamp_queue_status(info, ok, why)
+            # Docs-only PRs never reach the GPU, so their gate is ordinary
+            # CI — no reason to make a human click merge on a typo fix.
+            if not ok and why == "no braid/ or tests/ paths" and AUTOMERGE:
+                try:
+                    checks = gh_json(["pr", "checks", str(n), "--json",
+                                      "name,state"]) or []
+                except (subprocess.SubprocessError, json.JSONDecodeError):
+                    checks = []
+                merge_ok, merge_why = docs_only_automerge(info, checks)
+                if merge_ok:
+                    done, detail = automerge(n, info["headRefOid"])
+                    print(f"-- PR #{n}: docs-only auto-merge "
+                          f"{'OK' if done else 'FAILED'} — {detail}")
+                    if done:
+                        gh(["pr", "comment", str(n), "--body",
+                            "Auto-merged: docs-only change (no `braid/` or "
+                            "`tests/` paths, so no measured evaluation is "
+                            "required) with every CI check green.\n\n<sub>"
+                            "scripts/pr_eval_bot.py</sub>"])
+                else:
+                    print(f"-- PR #{n}: docs-only, no auto-merge — {merge_why}")
         if ok:
             plan.append((n, info))
     plan = plan[: args.max_evals]

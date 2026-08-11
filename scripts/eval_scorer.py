@@ -99,6 +99,58 @@ def classify_taint(name_status) -> tuple[list[str], list[str]]:
     return tainted, unexercised
 
 
+CROSSCHECKABLE = ("braid/bench",)   # numbers can be compared; oracles and tests cannot
+
+
+def crosscheckable(tainted) -> bool:
+    """Is every tainted path one whose honesty a measurement can settle?
+
+    A modified bench can be cross-checked: run it beside the pinned bench
+    and see whether it reports the same throughput for the same work. A
+    modified test or reference oracle cannot — weakening a parity
+    assertion does not change tok/s, so no number exposes it. Those stay
+    with a human no matter how well the benches agree.
+    """
+    if not tainted:
+        return False
+    return all(any(p == d or p.startswith(d + "/") for d in CROSSCHECKABLE)
+               for p in tainted)
+
+
+def crosscheck_agrees(crosscheck, noise: float = NOISE_PCT) -> tuple[bool, str]:
+    """Does the PR's own bench report what the pinned bench reports?
+
+    The PR's harness and the pinned harness measure the same engine in the
+    same session, so on any configuration they share they must agree within
+    the same bar the verdict uses. A bench rigged to inflate (the red-team
+    case multiplied tok/s by 1.5) disagrees by 50% and is caught here.
+
+    Limits, stated so nobody mistakes this for proof: configurations the PR
+    ADDS have no pinned counterpart and are not validated, and a harness
+    that distorts only under some condition it can detect would pass. This
+    is evidence, not a proof of honesty.
+    """
+    if not crosscheck:
+        return False, "no cross-check was run"
+    shared = crosscheck.get("shared") or {}
+    if not shared:
+        return False, "the PR's bench shares no configuration with the pinned bench"
+    worst_key, worst = None, 0.0
+    for key, row in shared.items():
+        d = abs(float(row["delta_pct"]))
+        if d > worst:
+            worst_key, worst = key, d
+    if worst > noise:
+        return False, (f"the PR's own bench disagrees with the pinned bench by "
+                       f"{worst:.1f}% at {worst_key} (bar ±{noise:.0f}%)")
+    added = crosscheck.get("added") or []
+    note = (f"; {len(added)} added configuration(s) have no pinned counterpart "
+            f"and were not validated" if added else "")
+    return True, (f"the PR's own bench agrees with the pinned bench within "
+                  f"±{noise:.0f}% on {len(shared)} shared configuration(s) "
+                  f"(worst {worst:.1f}%){note}")
+
+
 def verdict(tests_ok: bool, deltas_pct: dict[int, float],
             tainted=(), noise: float = NOISE_PCT) -> tuple[str, str]:
     """(label, reason). Regression anywhere outranks improvement anywhere;
@@ -111,12 +163,20 @@ def verdict(tests_ok: bool, deltas_pct: dict[int, float],
     if worst < -noise:
         b = min(deltas_pct, key=deltas_pct.get)
         return "eval:reject", f"measured regression at B={b}: {deltas_pct[b]:+.1f}%"
+    if tainted:
+        # Taint blocks at every non-reject outcome, not just at a speedup.
+        # A PR that rewrites the bench and happens to measure flat is still
+        # a PR that rewrites the bench: the pinned harness keeps the NUMBER
+        # honest, it does not make the harness diff safe to merge. Capping
+        # only the pass path left the red-team PR (tok_per_s * 1.5, measured
+        # noise) wearing a green, mergeable status.
+        where = (f"best {best:+.1f}%" if best <= noise
+                 else f"speedup at B={max(deltas_pct, key=deltas_pct.get)}: {best:+.1f}%")
+        return "eval:tainted", (
+            f"measured {where}, but the PR modifies harness files "
+            f"({', '.join(tainted)}); review them by hand before merging")
     if best > noise:
         b = max(deltas_pct, key=deltas_pct.get)
-        if tainted:
-            return "eval:tainted", (
-                f"measured speedup at B={b}: {deltas_pct[b]:+.1f}% — but the PR "
-                f"modifies harness files; review them by hand before merging")
         return "eval:pass", f"measured speedup at B={b}: {deltas_pct[b]:+.1f}%"
     return "eval:noise", (f"all deltas within the ±{noise:.0f}% same-session bar "
                           f"(best {best:+.1f}%)")
@@ -135,6 +195,14 @@ def score_bundle(bundle: dict) -> dict:
     tests_ok = bool(bundle["tests_ok"])
     tainted, unexercised = classify_taint(bundle.get("name_status", []))
 
+    # A bench-only taint can be cleared by measurement: if the PR's own
+    # harness reports what the pinned harness reports, the harness change
+    # does not distort, and the PR rejoins the ordinary pass/noise ladder.
+    # Test and oracle taints are never clearable this way.
+    cc_ok, cc_detail = (crosscheck_agrees(bundle.get("crosscheck"))
+                        if crosscheckable(tainted) else (False, ""))
+    effective_taint = [] if cc_ok else tainted
+
     medians: dict[str, dict[str, float]] = {}
     deltas: dict[int, float] = {}
     if tests_ok:
@@ -145,7 +213,9 @@ def score_bundle(bundle: dict) -> dict:
         deltas = {b: (m["pr"][b] - m["main"][b]) / m["main"][b] * 100 for b in batches}
         medians = {arm: {str(b): round(v, 3) for b, v in per.items()}
                    for arm, per in m.items()}
-    label, reason = verdict(tests_ok, deltas, tainted)
+    label, reason = verdict(tests_ok, deltas, effective_taint)
+    if cc_ok and tests_ok:
+        reason += f" — harness change cleared: {cc_detail}"
 
     return {
         "schema": SCHEMA_OUT,
@@ -156,6 +226,7 @@ def score_bundle(bundle: dict) -> dict:
         "medians": medians,
         "deltas_pct": {str(b): round(v, 3) for b, v in sorted(deltas.items())},
         "tainted": tainted, "unexercised": unexercised,
+        "crosscheck_ok": cc_ok, "crosscheck_detail": cc_detail,
     }
 
 

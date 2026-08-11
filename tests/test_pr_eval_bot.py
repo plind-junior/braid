@@ -205,9 +205,16 @@ class TaintedVerdict(unittest.TestCase):
         self.assertEqual(label, "eval:tainted")
         self.assertIn("harness", reason)
 
-    def test_taint_does_not_upgrade_noise_or_reject(self):
-        self.assertEqual(bot.verdict(True, {16: 1.0}, tainted=["tests/t.py"])[0],
-                         "eval:noise")
+    def test_taint_blocks_a_flat_result_too(self):
+        # the red-team case: rig the bench, measure noise. A green,
+        # mergeable status here would defeat the whole taint policy.
+        label, reason = bot.verdict(True, {16: 0.2},
+                                    tainted=["braid/bench/decode_speed.py"])
+        self.assertEqual(label, "eval:tainted")
+        self.assertIn("decode_speed.py", reason)
+        self.assertEqual(bot.STATUS_STATE[label], "failure")
+
+    def test_reject_still_outranks_taint(self):
         self.assertEqual(bot.verdict(True, {16: -9.0}, tainted=["tests/t.py"])[0],
                          "eval:reject")
         self.assertEqual(bot.verdict(False, {}, tainted=["tests/t.py"])[0],
@@ -339,11 +346,20 @@ class AutoMerge(unittest.TestCase):
         ok, why = bot.should_automerge("eval:pass", self.RECEIPT)
         self.assertTrue(ok, why)
 
-    def test_every_other_verdict_stays_human(self):
-        for label in ("eval:noise", "eval:tainted", "eval:reject", "eval:error"):
+    def test_attested_noise_merges(self):
+        # measured harmless is a merge condition too: requiring a speedup
+        # would mean a bug fix or refactor could never merge itself.
+        ok, why = bot.should_automerge("eval:noise", self.RECEIPT)
+        self.assertTrue(ok, why)
+
+    def test_unmerged_verdicts_stay_human(self):
+        for label in ("eval:tainted", "eval:reject", "eval:error"):
             ok, why = bot.should_automerge(label, self.RECEIPT)
             self.assertFalse(ok, label)
             self.assertIn("maintainer", why)
+
+    def test_noise_without_receipt_stays_human(self):
+        self.assertFalse(bot.should_automerge("eval:noise", None)[0])
 
     def test_pass_without_receipt_stays_human(self):
         self.assertFalse(bot.should_automerge("eval:pass", None)[0])
@@ -352,6 +368,97 @@ class AutoMerge(unittest.TestCase):
         bad = {"verification": {"intel_verified": False}}
         self.assertFalse(bot.should_automerge("eval:pass", bad)[0])
         self.assertFalse(bot.should_automerge("eval:pass", {})[0])
+
+
+class HarnessCrossCheck(unittest.TestCase):
+    """A bench change can clear itself by measurement; a test change cannot."""
+
+    def cc(self, **rows):
+        return {"ran": True, "reps": 1, "added": [],
+                "shared": {k: {"pinned": v[0], "pr_harness": v[1],
+                               "delta_pct": (v[1] - v[0]) / v[0] * 100}
+                           for k, v in rows.items()}}
+
+    def test_only_bench_paths_are_crosscheckable(self):
+        self.assertTrue(bot.scorer.crosscheckable(["braid/bench/decode_speed.py"]))
+        self.assertFalse(bot.scorer.crosscheckable(["tests/test_x.py"]))
+        self.assertFalse(bot.scorer.crosscheckable(["braid/reference/gdn.py"]))
+        self.assertFalse(bot.scorer.crosscheckable(
+            ["braid/bench/decode_speed.py", "tests/test_x.py"]))
+        self.assertFalse(bot.scorer.crosscheckable([]))
+
+    def test_agreeing_harness_clears(self):
+        ok, why = bot.scorer.crosscheck_agrees(
+            self.cc(**{"graphed-kvbucket@16": (1733.0, 1734.0)}))
+        self.assertTrue(ok, why)
+
+    def test_the_red_team_inflation_is_caught(self):
+        ok, why = bot.scorer.crosscheck_agrees(
+            self.cc(**{"graphed-kvbucket@16": (1733.0, 1733.0 * 1.5)}))
+        self.assertFalse(ok)
+        self.assertIn("50.0%", why)
+
+    def test_no_shared_configuration_does_not_clear(self):
+        self.assertFalse(bot.scorer.crosscheck_agrees(
+            {"ran": True, "shared": {}, "added": ["x@128"]})[0])
+        self.assertFalse(bot.scorer.crosscheck_agrees(None)[0])
+
+    def test_cleared_bench_pr_can_reach_pass(self):
+        b = synthetic_bundle(name_status=[["M", "braid/bench/decode_speed.py"]],
+                             crosscheck=self.cc(**{"graphed-kvbucket@16": (1733.0, 1733.5)}))
+        v = bot.scorer.score_bundle(b)
+        self.assertEqual(v["label"], "eval:pass")
+        self.assertTrue(v["crosscheck_ok"])
+        self.assertTrue(bot.should_automerge(v["label"], AutoMerge.RECEIPT)[0])
+
+    def test_disagreeing_bench_pr_stays_tainted(self):
+        b = synthetic_bundle(name_status=[["M", "braid/bench/decode_speed.py"]],
+                             crosscheck=self.cc(**{"graphed-kvbucket@16": (1733.0, 2599.5)}))
+        v = bot.scorer.score_bundle(b)
+        self.assertEqual(v["label"], "eval:tainted")
+        self.assertFalse(bot.should_automerge(v["label"], AutoMerge.RECEIPT)[0])
+
+    def test_a_test_change_is_never_cleared(self):
+        b = synthetic_bundle(name_status=[["M", "tests/test_x.py"]],
+                             crosscheck=self.cc(**{"graphed-kvbucket@16": (1733.0, 1733.0)}))
+        v = bot.scorer.score_bundle(b)
+        self.assertEqual(v["label"], "eval:tainted")
+        self.assertFalse(v["crosscheck_ok"])
+
+
+class DocsOnlyAutoMerge(unittest.TestCase):
+    def info(self, **kw):
+        base = {"state": "OPEN", "isDraft": False, "labels": []}
+        base.update(kw)
+        return base
+
+    GREEN = [{"name": "ruff", "state": "SUCCESS"}, {"name": "gate", "state": "SUCCESS"}]
+
+    def test_all_green_merges(self):
+        ok, why = bot.docs_only_automerge(self.info(), self.GREEN)
+        self.assertTrue(ok, why)
+
+    def test_a_failing_check_blocks(self):
+        ok, _ = bot.docs_only_automerge(
+            self.info(), self.GREEN + [{"name": "review", "state": "FAILURE"}])
+        self.assertFalse(ok)
+
+    def test_a_pending_check_waits(self):
+        ok, why = bot.docs_only_automerge(
+            self.info(), self.GREEN + [{"name": "review", "state": "PENDING"}])
+        self.assertFalse(ok)
+        self.assertIn("still running", why)
+
+    def test_our_own_not_required_stamp_is_ignored(self):
+        ok, _ = bot.docs_only_automerge(
+            self.info(), self.GREEN + [{"name": bot.STATUS_CONTEXT, "state": "SUCCESS"}])
+        self.assertTrue(ok)
+
+    def test_draft_or_hold_or_no_checks_block(self):
+        self.assertFalse(bot.docs_only_automerge(self.info(isDraft=True), self.GREEN)[0])
+        self.assertFalse(bot.docs_only_automerge(
+            self.info(labels=[{"name": "hold"}]), self.GREEN)[0])
+        self.assertFalse(bot.docs_only_automerge(self.info(), [])[0])
 
 
 class Eligibility(unittest.TestCase):

@@ -67,12 +67,24 @@ its own sake:
    Each head commit is evaluated once; pushing a new commit re-queues it. A regression
    anywhere outranks an improvement anywhere else.
 
-4. **Auto-merge — earned, not default.** `eval:pass` with an attested receipt
-   (intel-verified, TEE verdict byte-identical to the local scorer) merges
-   automatically, pinned to the exact evaluated head sha — a commit pushed mid-eval
-   can never ride in unevaluated. Every other verdict — noise, tainted, reject,
-   error, or a missing receipt — waits for the maintainer. In one sentence: prove a
-   speedup on the silicon and the machine merges it; anything less gets human eyes.
+4. **Auto-merge — earned, not default.** A PR merges itself when it has cleared every
+   gate a reviewer would rely on: `eval:pass` or `eval:noise`, with an attested receipt
+   (intel-verified, TEE verdict byte-identical to the local scorer), pinned to the exact
+   evaluated head sha so a commit pushed mid-eval can never ride in unevaluated.
+   Requiring a *speedup* would mean a bug fix could never merge itself, so measured-
+   harmless counts too. Docs-only PRs skip the GPU entirely and merge on green CI.
+   `eval:reject`, `eval:tainted`, `eval:error`, and anything without a receipt wait for
+   the maintainer.
+
+   **Changing the harness.** A PR that edits `braid/bench/` gets a **cross-check**: the
+   bot runs your bench beside the pinned one, same engine, same session, and compares
+   every configuration they share. Agree within ±2% and the harness change is cleared —
+   your PR rejoins the ordinary pass/noise ladder and can auto-merge, with the comparison
+   table in the comment. Disagree and it stays `eval:tainted` for a human. (This is
+   evidence, not proof: configurations your bench *adds* have no pinned counterpart and
+   are not validated.) Changes to `tests/` or `braid/reference/` are never cleared this
+   way — weakening a parity assertion doesn't change throughput, so no measurement can
+   expose it. Those always get human eyes.
 
 Every verdict is recorded three ways: the PR comment and label, a `braid/eval` commit
 status on your head sha (branch protection on `main` requires it), and an append-only
