@@ -47,13 +47,30 @@ its own sake:
    (median of 3 reps, arm order alternated, the serving-shaped decode configuration at
    B=16 and B=64) and posts the measured table as a comment with one of these labels:
 
-   | label | meaning |
-   |---|---|
-   | `eval:pass` | measured speedup beyond the ±2% same-session noise bar |
-   | `eval:noise` | measured delta within ±2% — not distinguishable from nothing |
-   | `eval:tainted` | measured speedup, but the PR touches harness files — those get human review |
-   | `eval:reject` | suite failed, or a measured regression beyond 2% at any batch |
-   | `eval:error` | evaluation infrastructure failed; retried once automatically |
+   | label | measured | what happens |
+   |---|---|---|
+   | `eval:landmark` | speedup beyond **+25%** | gate passes, but **never auto-merges** — see below |
+   | `eval:major` | **+10% to +25%** | escalated to 7 reps; merges if both rounds agree |
+   | `eval:pass` | above the bar, up to +10% | merges |
+   | `eval:noise` | within ±bar | merges — measured harmless |
+   | `eval:slower` | **−bar to −5%** | human decides: this may be a fair trade for correctness |
+   | `eval:reject` | worse than −5%, or the suite failed | blocked |
+   | `eval:tainted` | touched the harness, not cleared by cross-check | blocked, human reads the diff |
+   | `eval:error` | infrastructure failed | retried automatically |
+
+   **The bar is not a constant.** It is `max(2%, 3 × this session's observed spread)`.
+   Three reps of the same tree normally land within 0.04% at B=16, so 2% is the floor
+   in practice — but a session that scatters (thermal throttling, a noisy neighbour)
+   raises its own bar and correctly downgrades a marginal claim. The bar only ever
+   tightens; lowering the published 2% floor would need a fresh `make bench-noise` study.
+
+   **Why the best result gets the most scrutiny.** Above +10% the bot runs four more
+   reps and requires the two rounds to agree before merging. Above +25% it does not
+   auto-merge at all. On an engine that has already been profiled hard, an
+   extraordinary number is more likely to be work that quietly stopped happening than
+   a breakthrough, and the suite catches that only where a test covers it. The comment
+   also reports the *shape* of the gain — uniform, batch-skewed, latency-skewed —
+   because "+16% at B=64, flat at B=16" is a different claim from a uniform +8%.
 
    The harness is **pinned**: `braid/bench/`, `braid/reference/` and `tests/` are taken
    from the base commit, not from your PR — your engine code is measured by main's
@@ -68,13 +85,17 @@ its own sake:
    anywhere outranks an improvement anywhere else.
 
 4. **Auto-merge — earned, not default.** A PR merges itself when it has cleared every
-   gate a reviewer would rely on: `eval:pass` or `eval:noise`, with an attested receipt
+   gate a reviewer would rely on: `eval:pass`, `eval:noise`, or a confirmed
+   `eval:major`, with an attested receipt
    (intel-verified, TEE verdict byte-identical to the local scorer), pinned to the exact
    evaluated head sha so a commit pushed mid-eval can never ride in unevaluated.
    Requiring a *speedup* would mean a bug fix could never merge itself, so measured-
    harmless counts too. Docs-only PRs skip the GPU entirely and merge on green CI.
-   `eval:reject`, `eval:tainted`, `eval:error`, and anything without a receipt wait for
-   the maintainer.
+   `eval:landmark`, `eval:slower`, `eval:reject`, `eval:tainted`, `eval:error`, an
+   unstable confirmation round, and anything without a receipt wait for the maintainer.
+   Docs-only means *prose only* — `docs/**.md`, README, CONTRIBUTING, LICENSE. A PR
+   touching `scripts/`, `.github/`, or build config is never docs-only, whatever else
+   it leaves alone.
 
    **Changing the harness.** A PR that edits `braid/bench/` gets a **cross-check**: the
    bot runs your bench beside the pinned one, same engine, same session, and compares

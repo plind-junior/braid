@@ -151,18 +151,95 @@ def crosscheck_agrees(crosscheck, noise: float = NOISE_PCT) -> tuple[bool, str]:
                   f"(worst {worst:.1f}%){note}")
 
 
+TIER_MAJOR = 10.0        # above this a gain is big enough to want confirming
+TIER_LANDMARK = 25.0     # above this it is extraordinary and a human reads it
+SLOWER_FLOOR = -5.0      # between -bar and this, a regression may be a fair trade
+
+
+def observed_spread_pct(samples) -> float:
+    """Worst relative spread across every arm/batch series in this session.
+
+    The empirical noise of THIS run, not a remembered constant. Three reps
+    of the same tree typically land within 0.04% at B=16 and 0.2% at B=64;
+    a session that scatters much wider is telling you its own numbers are
+    soft, and the bar should rise to match.
+    """
+    worst = 0.0
+    for per_batch in (samples or {}).values():
+        for values in (per_batch or {}).values():
+            vals = [float(v) for v in values if v is not None]
+            if len(vals) < 2:
+                continue
+            mid = median(vals)
+            if mid:
+                worst = max(worst, (max(vals) - min(vals)) / mid * 100)
+    return worst
+
+
+def effective_bar(samples, noise: float = NOISE_PCT) -> float:
+    """The bar this session earns. Only ever tighter than the published
+    rule: 2% stays the floor, and a jittery session raises it. Loosening
+    below 2% is a separate argument that needs a noise-floor study, not a
+    formula tucked into the scorer."""
+    return max(noise, 3.0 * observed_spread_pct(samples))
+
+
+def shape(deltas_pct: dict, bar: float) -> str:
+    """How the gain is distributed across batch sizes.
+
+    A uniform +8% and '+16% at B=64, flat at B=16' are different
+    engineering claims: the second is batching efficiency, which does
+    nothing for a single-stream user. Reported, never folded into the
+    label — the ladder has to stay readable at a glance.
+    """
+    if not deltas_pct:
+        return "n/a"
+    items = sorted((int(b), v) for b, v in deltas_pct.items())
+    vals = [v for _, v in items]
+    best, worst = max(vals), min(vals)
+    if best > bar and worst < -bar:
+        return "mixed"
+    if abs(best) <= bar:
+        return "flat"
+    if best - worst <= abs(best) / 3.0:
+        return "uniform"
+    peak = max(items, key=lambda kv: kv[1])[0]
+    return "batch-skewed" if peak == max(b for b, _ in items) else "latency-skewed"
+
+
 def verdict(tests_ok: bool, deltas_pct: dict[int, float],
             tainted=(), noise: float = NOISE_PCT) -> tuple[str, str]:
-    """(label, reason). Regression anywhere outranks improvement anywhere;
-    a taint caps a would-be pass at eval:tainted (the measurement used the
-    pinned harness and is trustworthy — the PR's harness diff is not)."""
+    """(label, reason) on the graded ladder.
+
+    Order of precedence, strongest first: a failed suite or a material
+    regression outranks every gain; a modest regression is its own tier
+    because a correctness fix that costs 3% may be exactly the right trade
+    and should not look like a catastrophe; an uncleared harness taint
+    blocks any non-reject outcome; and above that the gain tiers rise.
+
+    The top tier deliberately does NOT auto-merge. On an engine that has
+    already been profiled hard, +25% is likelier to be work that quietly
+    stopped happening than a breakthrough — and the suite only catches
+    that where a test covers it. Evidence demanded scales with how
+    surprising the number is.
+    """
     if not tests_ok:
         return "eval:reject", "pinned test suite failed on the merged tree"
     worst = min(deltas_pct.values())
     best = max(deltas_pct.values())
-    if worst < -noise:
+    if worst < SLOWER_FLOOR:
         b = min(deltas_pct, key=deltas_pct.get)
         return "eval:reject", f"measured regression at B={b}: {deltas_pct[b]:+.1f}%"
+    if worst < -noise:
+        b = min(deltas_pct, key=deltas_pct.get)
+        if tainted:
+            return "eval:tainted", (
+                f"measured {deltas_pct[b]:+.1f}% at B={b} and the PR modifies "
+                f"harness files ({', '.join(tainted)})")
+        return "eval:slower", (
+            f"measured regression at B={b}: {deltas_pct[b]:+.1f}% — inside the "
+            f"{SLOWER_FLOOR:.0f}% band, so this may be a fair trade for "
+            f"correctness; a human decides")
     if tainted:
         # Taint blocks at every non-reject outcome, not just at a speedup.
         # A PR that rewrites the bench and happens to measure flat is still
@@ -177,8 +254,17 @@ def verdict(tests_ok: bool, deltas_pct: dict[int, float],
             f"({', '.join(tainted)}); review them by hand before merging")
     if best > noise:
         b = max(deltas_pct, key=deltas_pct.get)
+        if best > TIER_LANDMARK:
+            return "eval:landmark", (
+                f"measured speedup at B={b}: {deltas_pct[b]:+.1f}% — beyond "
+                f"{TIER_LANDMARK:.0f}%, which on this engine wants a person to "
+                f"confirm nothing stopped happening; no auto-merge")
+        if best > TIER_MAJOR:
+            return "eval:major", (
+                f"measured speedup at B={b}: {deltas_pct[b]:+.1f}% — beyond "
+                f"{TIER_MAJOR:.0f}%, confirmed with an escalated rep count")
         return "eval:pass", f"measured speedup at B={b}: {deltas_pct[b]:+.1f}%"
-    return "eval:noise", (f"all deltas within the ±{noise:.0f}% same-session bar "
+    return "eval:noise", (f"all deltas within the ±{noise:.1f}% same-session bar "
                           f"(best {best:+.1f}%)")
 
 
@@ -203,6 +289,7 @@ def score_bundle(bundle: dict) -> dict:
                         if crosscheckable(tainted) else (False, ""))
     effective_taint = [] if cc_ok else tainted
 
+    bar = effective_bar(bundle.get("samples"))
     medians: dict[str, dict[str, float]] = {}
     deltas: dict[int, float] = {}
     if tests_ok:
@@ -213,20 +300,32 @@ def score_bundle(bundle: dict) -> dict:
         deltas = {b: (m["pr"][b] - m["main"][b]) / m["main"][b] * 100 for b in batches}
         medians = {arm: {str(b): round(v, 3) for b, v in per.items()}
                    for arm, per in m.items()}
-    label, reason = verdict(tests_ok, deltas, effective_taint)
+    label, reason = verdict(tests_ok, deltas, effective_taint, bar)
     if cc_ok and tests_ok:
         reason += f" — harness change cleared: {cc_detail}"
+
+    # A tier above eval:pass is only believed if a second round of reps
+    # agreed with the first; the bot escalates and records that here.
+    conf = bundle.get("confirm") or {}
+    stable = bool(conf.get("agrees")) if conf else None
+    if conf and not stable:
+        reason += (f" — but the confirmation round disagreed with the first "
+                   f"({conf.get('detail', 'unstable')}); no auto-merge")
 
     return {
         "schema": SCHEMA_OUT,
         "pr": bundle["pr"], "head": bundle["head"],
         "eval_sha": bundle["eval_sha"], "base_sha": bundle["base_sha"],
-        "label": label, "reason": reason, "noise_pct": NOISE_PCT,
+        "label": label, "reason": reason,
+        "noise_pct": NOISE_PCT, "bar_pct": round(bar, 3),
+        "spread_pct": round(observed_spread_pct(bundle.get("samples")), 4),
+        "shape": shape({str(b): v for b, v in deltas.items()}, bar),
         "tests_ok": tests_ok,
         "medians": medians,
         "deltas_pct": {str(b): round(v, 3) for b, v in sorted(deltas.items())},
         "tainted": tainted, "unexercised": unexercised,
         "crosscheck_ok": cc_ok, "crosscheck_detail": cc_detail,
+        "stable": stable,
     }
 
 

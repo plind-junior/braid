@@ -104,7 +104,12 @@ class Verdict(unittest.TestCase):
         self.assertEqual(label, "eval:reject")
 
     def test_regression_outranks_improvement(self):
+        # a small regression alongside a gain lands in the slower band,
+        # a material one is a reject — either way the gain never wins
         label, reason = bot.verdict(True, {16: 8.0, 64: -3.0})
+        self.assertEqual(label, "eval:slower")
+        self.assertIn("B=64", reason)
+        label, reason = bot.verdict(True, {16: 8.0, 64: -9.0})
         self.assertEqual(label, "eval:reject")
         self.assertIn("B=64", reason)
 
@@ -120,6 +125,84 @@ class Verdict(unittest.TestCase):
     def test_the_bar_itself_is_noise(self):
         label, _ = bot.verdict(True, {16: 2.0, 64: -2.0})
         self.assertEqual(label, "eval:noise")
+
+
+class GradedTiers(unittest.TestCase):
+    """The ladder: the tier scales the evidence, and the top tier does not
+    auto-merge because an extraordinary number is the suspicious one."""
+
+    def test_the_gain_tiers(self):
+        for delta, want in ((3.0, "eval:pass"), (9.9, "eval:pass"),
+                            (10.1, "eval:major"), (24.9, "eval:major"),
+                            (25.1, "eval:landmark"), (300.0, "eval:landmark")):
+            self.assertEqual(bot.verdict(True, {16: delta})[0], want, delta)
+
+    def test_the_regression_tiers(self):
+        for delta, want in ((-1.9, "eval:noise"), (-2.1, "eval:slower"),
+                            (-4.9, "eval:slower"), (-5.1, "eval:reject")):
+            self.assertEqual(bot.verdict(True, {16: delta})[0], want, delta)
+
+    def test_landmark_never_automerges_but_the_gate_still_passes(self):
+        ok, why = bot.should_automerge("eval:landmark", AutoMerge.RECEIPT)
+        self.assertFalse(ok)
+        self.assertIn("maintainer", why)
+        self.assertEqual(bot.STATUS_STATE["eval:landmark"], "success")
+
+    def test_major_merges_only_when_the_rounds_agree(self):
+        self.assertTrue(bot.should_automerge("eval:major", AutoMerge.RECEIPT, True)[0])
+        ok, why = bot.should_automerge("eval:major", AutoMerge.RECEIPT, False)
+        self.assertFalse(ok)
+        self.assertIn("unstable", why)
+
+    def test_slower_blocks_the_gate_but_reads_as_a_trade(self):
+        label, reason = bot.verdict(True, {16: -3.0})
+        self.assertEqual(bot.STATUS_STATE[label], "failure")
+        self.assertIn("fair trade", reason)
+        self.assertFalse(bot.should_automerge(label, AutoMerge.RECEIPT)[0])
+
+    def test_every_label_has_a_colour_and_a_status(self):
+        self.assertEqual(set(bot.EVAL_LABELS), set(bot.STATUS_STATE))
+
+
+class DynamicBar(unittest.TestCase):
+    """The bar is what this session earns — never looser than the rule."""
+
+    def samples(self, *pr_vals):
+        return {"pr": {"16": list(pr_vals)}, "main": {"16": [1000.0, 1000.0, 1000.0]}}
+
+    def test_a_tight_session_keeps_the_published_floor(self):
+        # real numbers: 1733.1 / 1733.5 / 1733.7 -> spread 0.035%
+        bar = bot.scorer.effective_bar(self.samples(1733.1, 1733.5, 1733.7))
+        self.assertEqual(bar, bot.NOISE_PCT)
+
+    def test_a_jittery_session_raises_its_own_bar(self):
+        bar = bot.scorer.effective_bar(self.samples(900.0, 1000.0, 1100.0))
+        self.assertGreater(bar, bot.NOISE_PCT)
+        self.assertAlmostEqual(bar, 60.0, places=1)
+
+    def test_the_bar_never_drops_below_the_floor(self):
+        self.assertGreaterEqual(bot.scorer.effective_bar({}), bot.NOISE_PCT)
+        self.assertGreaterEqual(
+            bot.scorer.effective_bar(self.samples(1000.0)), bot.NOISE_PCT)
+
+    def test_a_raised_bar_downgrades_a_marginal_claim(self):
+        b = synthetic_bundle(samples={
+            "pr": {"16": [1030.0, 1100.0, 970.0], "64": [5000.0, 5000.0, 5000.0]},
+            "main": {"16": [1000.0, 1000.0, 1000.0], "64": [5000.0, 5000.0, 5000.0]}})
+        v = bot.scorer.score_bundle(b)
+        self.assertGreater(v["bar_pct"], 3.0)
+        self.assertEqual(v["label"], "eval:noise")
+
+
+class Shape(unittest.TestCase):
+    def test_shapes(self):
+        bar = 2.0
+        self.assertEqual(bot.scorer.shape({"16": 8.0, "64": 8.4}, bar), "uniform")
+        self.assertEqual(bot.scorer.shape({"16": 0.5, "64": 16.0}, bar), "batch-skewed")
+        self.assertEqual(bot.scorer.shape({"16": 16.0, "64": 0.5}, bar), "latency-skewed")
+        self.assertEqual(bot.scorer.shape({"16": 8.0, "64": -8.0}, bar), "mixed")
+        self.assertEqual(bot.scorer.shape({"16": 0.1, "64": -0.2}, bar), "flat")
+        self.assertEqual(bot.scorer.shape({}, bar), "n/a")
 
 
 class Taint(unittest.TestCase):

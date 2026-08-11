@@ -78,16 +78,28 @@ measurement:
   * If the bot starts the box, it stops it in a finally block, with retries,
     and screams into the log if the stop fails. Never destroys.
 
-Merge policy (declared, enforced by should_automerge, kill switch
-BRAID_AUTOMERGE=0):
+Graded verdicts (the ladder lives in eval_scorer.verdict):
 
-  * eval:pass + attested receipt (intel_verified, TEE verdict byte-equal
-    to local) -> the bot merges, pinned to the exact evaluated head sha
+  * The bar is not a constant. It is max(2%, 3x this session's observed
+    spread) — 2% stays the floor, and a jittery session raises its own bar.
+  * > +25% eval:landmark · +10..25% eval:major · bar..+10% eval:pass ·
+    within +/-bar eval:noise · -bar..-5% eval:slower · worse or suite
+    failed eval:reject. Above +10% the bot escalates --confirm-reps more
+    reps and requires the two rounds to agree.
+
+Merge policy (enforced by should_automerge, kill switch BRAID_AUTOMERGE=0):
+
+  * eval:pass, eval:noise and (confirmed) eval:major with an attested
+    receipt -> the bot merges, pinned to the exact evaluated head sha
     (--match-head-commit): a commit pushed mid-eval can never ride in
-    unevaluated.
-  * Everything else — noise, tainted, reject, error, missing receipt —
-    stays with the maintainer. Auto-merge is a reward for a measured,
-    attested speedup, not a default.
+    unevaluated. Requiring a speedup would mean a bug fix could never
+    merge itself, so measured-harmless counts too.
+  * eval:landmark never auto-merges: past 25% on this engine the likelier
+    explanation is work that stopped happening, and a person should say
+    so. Nor does eval:slower, eval:tainted, eval:reject, eval:error, an
+    unstable confirmation round, or a missing receipt.
+  * Docs-only PRs (prose allowlist only — never scripts/, .github/, or
+    build config) merge on green CI without touching the GPU.
 
 Usage:
   python3 scripts/pr_eval_bot.py              # poll: eval all eligible heads
@@ -146,15 +158,21 @@ MIN_FREE_GIB = float(os.environ.get("BRAID_MIN_FREE_GIB", "30"))  # suite peaks 
 NOTES_REF = "braid-eval"                  # refs/notes/braid-eval
 LEDGER = os.path.expanduser("~/braid-pr-eval-ledger.jsonl")
 EVAL_LABELS = {
-    "eval:pass": ("0E8A16", "measured speedup beyond the 2% bar"),
-    "eval:noise": ("FBCA04", "measured delta within the 2% noise bar"),
-    "eval:tainted": ("5319E7", "measured speedup, but the PR touches harness files"),
-    "eval:reject": ("B60205", "suite failed or measured regression beyond 2%"),
+    "eval:landmark": ("5A2D82", "measured speedup beyond 25% — extraordinary, human reads it"),
+    "eval:major": ("0A6EA1", "measured speedup beyond 10%, confirmed with escalated reps"),
+    "eval:pass": ("0E8A16", "measured speedup beyond the session's noise bar"),
+    "eval:noise": ("FBCA04", "measured delta within the noise bar — harmless"),
+    "eval:slower": ("E36209", "small measured regression — may be a fair trade, human decides"),
+    "eval:tainted": ("5319E7", "touches harness files, not cleared by cross-check"),
+    "eval:reject": ("B60205", "suite failed or measured regression beyond 5%"),
     "eval:error": ("D93F0B", "evaluation could not complete"),
 }
 STATUS_STATE = {                          # eval label -> commit-status state
+    "eval:landmark": "success",           # gate passed; the merge is the human's
+    "eval:major": "success",
     "eval:pass": "success",
     "eval:noise": "success",
+    "eval:slower": "failure",
     "eval:tainted": "failure",
     "eval:reject": "failure",
     "eval:error": "error",
@@ -244,7 +262,8 @@ def build_bundle(pr: int, head: str, eval_sha: str, base_sha: str, mode: str,
                  batches: list[int], reps: int, tests_ok: bool,
                  samples: dict, name_status: list, suite_tail: str,
                  model_manifest: str, main_ext_hash: str | None,
-                 crosscheck: dict | None = None) -> dict:
+                 crosscheck: dict | None = None,
+                 confirm: dict | None = None) -> dict:
     """The canonical evidence bundle: everything the verdict is a function
     of, in one JSON document. The scorer (locally AND inside the TEE)
     derives the verdict from this and nothing else; its hash is bound into
@@ -262,13 +281,15 @@ def build_bundle(pr: int, head: str, eval_sha: str, base_sha: str, mode: str,
         "integrity": {"model_manifest": model_manifest,
                       "main_ext_hash": main_ext_hash or ""},
         "crosscheck": crosscheck,
+        "confirm": confirm,
     }
 
 
-MERGEABLE_LABELS = ("eval:pass", "eval:noise")
+MERGEABLE_LABELS = ("eval:pass", "eval:noise", "eval:major")
 
 
-def should_automerge(label: str, receipt: dict | None) -> tuple[bool, str]:
+def should_automerge(label: str, receipt: dict | None,
+                     stable: bool | None = None) -> tuple[bool, str]:
     """The declared merge policy, as a pure function so it is unit-tested
     and readable in one place.
 
@@ -279,14 +300,23 @@ def should_automerge(label: str, receipt: dict | None) -> tuple[bool, str]:
     eval:pass (measured faster) and eval:noise (measured harmless) alike —
     demanding a speedup would mean a bug fix could never merge itself.
 
-    Everything else waits for a human: eval:reject (broken or slower),
-    eval:tainted (touched the harness in a way no measurement can clear),
-    eval:error (we do not know), and any verdict without a verified
-    receipt. The caller aborts the eval if the TEE verdict differed from
-    the local one, so a non-None receipt here means they agreed.
+    eval:major merges on the same terms once its escalated confirmation
+    round agrees with the first; eval:landmark never does, because past
+    25% the likeliest explanation on this engine is work that stopped
+    happening rather than a breakthrough, and a person should say so.
+
+    Everything else waits for a human: eval:slower (a regression that may
+    still be worth paying), eval:reject, eval:tainted (touched the harness
+    in a way no measurement can clear), eval:error (we do not know), and
+    any verdict without a verified receipt. The caller aborts the eval if
+    the TEE verdict differed from the local one, so a non-None receipt
+    here means they agreed.
     """
     if label not in MERGEABLE_LABELS:
         return False, f"verdict is {label} — maintainer's decision"
+    if stable is False:
+        return False, ("the confirmation round disagreed with the first — "
+                       "measurement unstable, maintainer's decision")
     if receipt is None:
         return False, "no attested receipt — maintainer's decision"
     if not receipt.get("verification", {}).get("intel_verified"):
@@ -909,6 +939,52 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
                     print(f">> rep {rep + 1} {arm_name}: "
                           + " ".join(f"B={b} {v:.1f}" for b, v in sorted(got.items())))
 
+        # Escalation: a big claim buys itself more evidence before anyone
+        # believes it. Only fires above the major tier, so the ordinary PR
+        # pays nothing.
+        confirm = None
+        if tests_ok and args.confirm_reps > 0:
+            first = {a: {b: median(v) for b, v in per.items() if v}
+                     for a, per in samples.items()}
+            first_deltas = {b: (first["pr"][b] - first["main"][b]) / first["main"][b] * 100
+                            for b in args.batches}
+            if max(first_deltas.values()) > scorer.TIER_MAJOR:
+                print(f">> claim above +{scorer.TIER_MAJOR:.0f}% — escalating "
+                      f"{args.confirm_reps} confirmation reps")
+                second: dict[str, dict[int, list[float]]] = {
+                    "pr": {b: [] for b in args.batches},
+                    "main": {b: [] for b in args.batches}}
+                for rep in range(args.confirm_reps):
+                    for arm_name in (["main", "pr"] if rep % 2 == 0 else ["pr", "main"]):
+                        if arm_name == "main":
+                            check_main_arm(box, main_dir, main_ext_hash)
+                        got = run_bench(box, f"{REMOTE_BASE}/{arm_name}",
+                                        f"{EXT_BASE}/{arm_name}", args.batches)
+                        for b, v in got.items():
+                            second[arm_name][b].append(v)
+                            samples[arm_name][b].append(v)
+                        print(f">> confirm {rep + 1} {arm_name}: "
+                              + " ".join(f"B={b} {v:.1f}" for b, v in sorted(got.items())))
+                sec = {a: {b: median(v) for b, v in per.items() if v}
+                       for a, per in second.items()}
+                sec_deltas = {b: (sec["pr"][b] - sec["main"][b]) / sec["main"][b] * 100
+                              for b in args.batches}
+                bar = scorer.effective_bar(samples)
+                gaps = {b: abs(first_deltas[b] - sec_deltas[b]) for b in args.batches}
+                agrees = max(gaps.values()) <= bar
+                confirm = {
+                    "reps": args.confirm_reps,
+                    "first_deltas_pct": {str(b): round(v, 3)
+                                         for b, v in first_deltas.items()},
+                    "second_deltas_pct": {str(b): round(v, 3)
+                                          for b, v in sec_deltas.items()},
+                    "agrees": agrees,
+                    "detail": (f"rounds differ by at most {max(gaps.values()):.1f}% "
+                               f"against a {bar:.1f}% bar"),
+                }
+                print(f">> confirmation {'AGREES' if agrees else 'DISAGREES'}: "
+                      f"{confirm['detail']}")
+
         crosscheck = None
         if tests_ok and wants_crosscheck:
             # Same engine, same session — only the harness differs. Uses the
@@ -931,7 +1007,7 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
     # the verdict, the TEE call produces the receipt — and they must agree.
     bundle = build_bundle(pr, head, eval_sha, base_sha, mode, args.batches,
                           args.reps, tests_ok, samples, name_status, tail,
-                          model_manifest, main_ext_hash, crosscheck)
+                          model_manifest, main_ext_hash, crosscheck, confirm)
     vdoc = scorer.score_bundle(bundle)
     expected_stdout = scorer.canonical(vdoc) + "\n"
     label, reason = vdoc["label"], vdoc["reason"]
@@ -1017,7 +1093,7 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
     })
     print(f">> PR #{pr}: {label} — {reason}")
 
-    merge_ok, merge_why = should_automerge(label, receipt)
+    merge_ok, merge_why = should_automerge(label, receipt, vdoc.get("stable"))
     if not AUTOMERGE:
         merge_ok, merge_why = False, "auto-merge disabled (BRAID_AUTOMERGE=0)"
     if merge_ok:
@@ -1043,6 +1119,8 @@ def main() -> int:
                    help="with --pr: skip eligibility and idempotency checks")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--reps", type=int, default=3)
+    p.add_argument("--confirm-reps", type=int, default=4,
+                   help="extra reps run when the first round claims a big gain")
     p.add_argument("--batches", type=int, nargs="+", default=[16, 64])
     p.add_argument("--tests", default="tests/")
     p.add_argument("--max-evals", type=int, default=3,
