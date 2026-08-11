@@ -1,0 +1,31 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+
+[*.py]
+indent_size = 4
+max_line_length = 100
+
+# CUDA — matches the kernel sources in braid/kernels/csrc.
+[*.{cu,cuh}]
+indent_size = 4
+max_line_length = 100
+
+[*.{sh,bash}]
+indent_size = 4
+
+[Makefile]
+indent_style = tab
+
+[*.{yml,yaml,json,toml}]
+indent_size = 2
+
+# Markdown — trailing whitespace is a hard line break, so leave it alone.
+[*.md]
+trim_trailing_whitespace = false
+indent_size = 2

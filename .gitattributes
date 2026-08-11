@@ -1,0 +1,12 @@
+# LF in the repo, always. The remote box is Linux and the tree is rsynced to it
+# verbatim; a CRLF that slips in breaks the shell scripts there.
+* text=auto eol=lf
+*.sh text eol=lf
+
+# Profiler output and model weights — never diff, merge or eol-normalise.
+*.ncu-rep binary
+*.nsys-rep binary
+*.safetensors binary
+*.gguf binary
+*.png binary
+*.jpg binary

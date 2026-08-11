@@ -23,3 +23,7 @@ build/
 
 # Staged weights, if anyone ever points the loader at a local path.
 models/
+
+# Playwright MCP scratch output — page snapshots and console logs from
+# browser automation. Regenerated on demand, never an input to anything.
+.playwright-mcp/
