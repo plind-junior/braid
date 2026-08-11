@@ -87,19 +87,36 @@ Graded verdicts (the ladder lives in eval_scorer.verdict):
     failed eval:reject. Above +10% the bot escalates --confirm-reps more
     reps and requires the two rounds to agree.
 
-Merge policy (enforced by should_automerge, kill switch BRAID_AUTOMERGE=0):
+Outcome policy (enforced by settle, kill switch BRAID_AUTOMERGE=0). A
+verdict ends the PR: it is merged, or it is closed with the reason. The
+only things that wait are the ones that are the BOT's fault, never the
+contributor's.
 
   * eval:pass, eval:noise and (confirmed) eval:major with an attested
     receipt -> the bot merges, pinned to the exact evaluated head sha
     (--match-head-commit): a commit pushed mid-eval can never ride in
     unevaluated. Requiring a speedup would mean a bug fix could never
     merge itself, so measured-harmless counts too.
-  * eval:landmark never auto-merges: past 25% on this engine the likelier
+  * eval:reject, eval:slower and eval:tainted -> the bot closes the PR
+    and says why. Closing is reversible and the comment says so: push a
+    commit and reopen, and the new head re-evaluates from scratch.
+  * eval:landmark waits for a human: past 25% on this engine the likelier
     explanation is work that stopped happening, and a person should say
-    so. Nor does eval:slower, eval:tainted, eval:reject, eval:error, an
-    unstable confirmation round, or a missing receipt.
+    so. It is the only verdict that waits.
+  * eval:error waits and retries — the eval broke, not the PR. So does a
+    mergeable verdict with no attested receipt (a polaris.computer
+    outage) and an unstable confirmation round. Closing a PR for our own
+    infrastructure would blame the contributor for our box.
+  * A `hold` label is never closed, matching eligible().
   * Docs-only PRs (prose allowlist only — never scripts/, .github/, or
-    build config) merge on green CI without touching the GPU.
+    build config) merge on green CI without touching the GPU. They never
+    reach a verdict, so the binary outcome does not govern them.
+
+POLICY_VERSION is stamped into the verdict marker, so bumping it makes
+every open PR look un-evaluated and it is re-measured under current code.
+That is the whole staleness mechanism: no code path ever acts on a label
+produced by a scorer or a policy that has since changed. Bump it
+deliberately — a bump re-runs the box for every open eligible PR.
 
 Usage:
   python3 scripts/pr_eval_bot.py              # poll: eval all eligible heads
@@ -116,6 +133,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -154,6 +172,10 @@ POLARIS_ATTEST_URL = os.environ.get("BRAID_POLARIS_ATTEST_URL",
 POLARIS_KEY = os.environ.get("BRAID_POLARIS_API_KEY", "")
 SCORER_WORKLOAD = "python3 /in/eval_scorer.py /in/bundle.json"
 AUTOMERGE = os.environ.get("BRAID_AUTOMERGE", "1") != "0"
+# Bump when the outcome policy or the scorer changes meaning. Every open PR
+# is then re-measured under the new rules instead of being settled on a
+# verdict the current code would not reach. Costs a box run per open PR.
+POLICY_VERSION = 2
 GH_USER = os.environ.get("BRAID_GH_USER", "plind-junior")   # never post as another identity
 MIN_FREE_GIB = float(os.environ.get("BRAID_MIN_FREE_GIB", "30"))  # suite peaks at ~26 of 32
 NOTES_REF = "braid-eval"                  # refs/notes/braid-eval
@@ -213,7 +235,9 @@ def overlay_harness(pr_dir: str, base_dir: str, dirs: tuple[str, ...] = PINNED_D
 
 
 def marker(sha: str) -> str:
-    return f"<!-- braid-eval sha={sha} -->"
+    """The verdict stamp. Carries POLICY_VERSION so a verdict reached under
+    an older policy stops counting as evaluated and is measured again."""
+    return f"<!-- braid-eval sha={sha} policy={POLICY_VERSION} -->"
 
 
 def error_marker(sha: str) -> str:
@@ -287,12 +311,24 @@ def build_bundle(pr: int, head: str, eval_sha: str, base_sha: str, mode: str,
 
 
 MERGEABLE_LABELS = ("eval:pass", "eval:noise", "eval:major")
+# Why each closing verdict closes, in the contributor's terms. These reach a
+# public comment, so they explain rather than announce.
+CLOSING_LABELS = {
+    "eval:reject": "the pinned test suite failed on the merged tree, or the "
+                   "measured regression is worse than 5%",
+    "eval:slower": "the same-session A/B measured a regression past the "
+                   "session's noise bar",
+    "eval:tainted": "it modifies files the measurement itself depends on, and "
+                    "the cross-check could not clear the numbers",
+}
 
 
-def should_automerge(label: str, receipt: dict | None,
-                     stable: bool | None = None) -> tuple[bool, str]:
-    """The declared merge policy, as a pure function so it is unit-tested
-    and readable in one place.
+def settle(label: str, receipt: dict | None, stable: bool | None = None,
+           labels: tuple[str, ...] = ()) -> tuple[str, str]:
+    """The declared outcome policy: a verdict ends the PR.
+
+    Returns one of "merge", "close" or "wait", with the reason. Pure, so it
+    is unit-tested without a GPU, a box or a token.
 
     A PR merges itself when it has cleared every gate a reviewer would rely
     on: main's test suite passed on the merged tree, the same-session A/B
@@ -300,29 +336,63 @@ def should_automerge(label: str, receipt: dict | None,
     measurement, and the verdict was recomputed inside a TEE. That is
     eval:pass (measured faster) and eval:noise (measured harmless) alike —
     demanding a speedup would mean a bug fix could never merge itself.
-
     eval:major merges on the same terms once its escalated confirmation
-    round agrees with the first; eval:landmark never does, because past
-    25% the likeliest explanation on this engine is work that stopped
-    happening rather than a breakthrough, and a person should say so.
+    round agrees with the first.
 
-    Everything else waits for a human: eval:slower (a regression that may
-    still be worth paying), eval:reject, eval:tainted (touched the harness
-    in a way no measurement can clear), eval:error (we do not know), and
-    any verdict without a verified receipt. The caller aborts the eval if
-    the TEE verdict differed from the local one, so a non-None receipt
-    here means they agreed.
+    A PR is closed, with the reason, when the measurement says the change
+    is not wanted as it stands: eval:reject, eval:slower, eval:tainted.
+    Closing is reversible and the comment says so.
+
+    Only two things wait, and both are the bot's fault rather than the
+    contributor's. eval:error means the evaluation could not complete. A
+    mergeable verdict with no verified receipt means polaris.computer was
+    unreachable, and an unstable confirmation round means our own two
+    rounds disagreed — closing on any of those would blame a contributor
+    for our box. eval:landmark also waits, by explicit policy: past 25% the
+    likeliest explanation on this engine is work that stopped happening
+    rather than a breakthrough, and a person should say so.
+
+    The caller aborts the eval if the TEE verdict differed from the local
+    one, so a non-None receipt here means they agreed.
     """
+    if "hold" in labels:
+        return "wait", "hold label — the maintainer is keeping this open"
+    if label in CLOSING_LABELS:
+        return "close", CLOSING_LABELS[label]
+    if label == "eval:landmark":
+        return "wait", ("past +25% — extraordinary enough that a human reads it "
+                        "before it lands")
     if label not in MERGEABLE_LABELS:
-        return False, f"verdict is {label} — maintainer's decision"
+        # eval:error and anything a future verdict() learns to emit.
+        return "wait", f"{label} — the evaluation, not the PR, is what failed"
     if stable is False:
-        return False, ("the confirmation round disagreed with the first — "
-                       "measurement unstable, maintainer's decision")
+        return "wait", ("the confirmation round disagreed with the first — our "
+                        "measurement is unstable, so the PR is not judged on it")
     if receipt is None:
-        return False, "no attested receipt — maintainer's decision"
+        return "wait", ("no attested receipt — the attestation service was "
+                        "unreachable, which is our problem and not this PR's")
     if not receipt.get("verification", {}).get("intel_verified"):
-        return False, "receipt exists but is not intel_verified — maintainer's decision"
-    return True, f"{label} with an intel-verified attested receipt"
+        return "wait", "receipt exists but is not intel_verified — not judged on it"
+    return "merge", f"{label} with an intel-verified attested receipt"
+
+
+def close_comment(label: str, reason: str) -> str:
+    """The message a closed PR carries. States the measurement that closed
+    it and the exact way back — a close is a verdict, not a door slam."""
+    return (
+        f"## Closed on the measured verdict — `{label}`\n\n"
+        f"The evaluation above closed this PR because {reason}.\n\n"
+        "**This is reversible.** The verdict is about the code as it stands at "
+        "this head, not about the idea. Push a commit and reopen: the new head "
+        "carries no verdict stamp, so it is measured again from scratch on the "
+        "same box, with the same pinned harness.\n\n"
+        "If you think the measurement itself is wrong, say so in a comment and "
+        "label the PR `hold` — the bot never closes a held PR, and the "
+        "maintainer will read it.\n\n"
+        "<sub>Automated outcome (scripts/pr_eval_bot.py). Every verdict ends in "
+        "a merge or a close; the receipt for this one is permanent in "
+        f"`refs/notes/{NOTES_REF}`.</sub>"
+    )
 
 
 INERT_FILES = ("README.md", "CONTRIBUTING.md", "LICENSE", "CHANGELOG.md")
@@ -387,6 +457,16 @@ def automerge(pr: int, head: str) -> tuple[bool, str]:
              "--match-head-commit", head], timeout=120, check=False)
     if r.returncode == 0:
         return True, "merged"
+    return False, (r.stderr or r.stdout).decode()[-400:]
+
+
+def close_with_reason(pr: int, label: str, reason: str) -> tuple[bool, str]:
+    """Close the PR and leave the reason in the same call, so a PR can never
+    end up closed with no explanation attached to it."""
+    r = run(["gh", "pr", "close", str(pr), "--comment",
+             close_comment(label, reason)], timeout=120, check=False)
+    if r.returncode == 0:
+        return True, "closed"
     return False, (r.stderr or r.stdout).decode()[-400:]
 
 
@@ -475,6 +555,69 @@ def gh_json(args: list[str]) -> object:
     return json.loads(gh(args))
 
 
+class BoxUnavailable(RuntimeError):
+    """vast.ai has no GPU for us right now. Not a fault, and not the PR's —
+    the next poll simply tries again."""
+
+
+# vast.ai answers `start instance` with a plain-English refusal and exit 0
+# when the host has nothing free, and *queues* the state change. The box then
+# never boots, every SSH route times out, and the old code spent seven
+# minutes concluding "ssh never came up" — a true statement about the wrong
+# thing, once per poll, with a start/stop cycle billed for each.
+UNAVAILABLE_SIGNATURES = (
+    "resources are currently unavailable",
+    "state change queued",
+    "no available capacity",
+    "insufficient capacity",
+)
+
+
+def start_was_refused(stdout: str) -> str | None:
+    """The refusal reason in vast.ai's reply, or None if the start took."""
+    low = (stdout or "").lower()
+    for sig in UNAVAILABLE_SIGNATURES:
+        if sig in low:
+            return " ".join((stdout or "").split())[:200]
+    return None
+
+
+def endpoint_candidates(ssh_url: str, info: dict,
+                        default: tuple[str, str]) -> list[tuple[str, str]]:
+    """Every route vast.ai publishes to the box, best-known-first. Pure.
+
+    vast.ai exposes two: a *proxy* (ssh_host/ssh_port, e.g. ssh5.vast.ai,
+    always routable) and a *direct* one (public_ipaddr/direct_port_start,
+    faster, but only reachable if the host actually forwards that range).
+    Both are remapped across stop/start cycles.
+
+    `vastai ssh-url` reports the direct route whether or not it works. The
+    first version of this code trusted it and *replaced* the endpoint with
+    it, which traded a working proxy for an unreachable direct port and
+    spent seven minutes failing to connect to a box that was up the whole
+    time — the exact 'ssh never came up' it was written to prevent, in the
+    other direction. So this never replaces: it collects, and the caller
+    latches whichever route answers first.
+    """
+    cands: list[tuple[str, str]] = []
+    m = re.match(r"ssh://(.+):(\d+)\s*$", (ssh_url or "").strip())
+    if m:
+        cands.append((m.group(1), m.group(2)))
+    host, port = info.get("ssh_host"), info.get("ssh_port")
+    if host and port:
+        cands.append((host if "@" in str(host) else f"root@{host}", str(port)))
+    ip, direct = info.get("public_ipaddr"), info.get("direct_port_start")
+    if ip and direct:
+        cands.append((f"root@{ip}", str(direct)))
+    cands.append(default)                 # compiled-in default, never first
+    seen, ordered = set(), []
+    for c in cands:
+        if c not in seen:
+            seen.add(c)
+            ordered.append(c)
+    return ordered
+
+
 class Box:
     """The rented 5090, held politely: skip if busy, stop if we started it."""
 
@@ -486,38 +629,53 @@ class Box:
         out = run(["vastai", "show", "instance", INSTANCE, "--raw"]).stdout
         return json.loads(out).get("actual_status", "unknown")
 
-    def resolve_endpoint(self) -> None:
-        """vast.ai remaps the SSH endpoint across stop/start cycles (proxy
-        port today, direct host:port tomorrow), which once cost a whole eval
-        cycle to 'ssh never came up'. Ask vastai for the live URL every
-        boot; an explicit BRAID_SSH_HOST env var still wins."""
+    def resolve_endpoints(self) -> list[tuple[str, str]]:
+        """Every published route to the box, best-known-first."""
         if os.environ.get("BRAID_SSH_HOST"):
-            return
-        import re
-        r = run(["vastai", "ssh-url", INSTANCE], check=False)
-        m = re.match(r"ssh://(.+):(\d+)\s*$", r.stdout.decode().strip())
-        if m:
-            host, port = m.group(1), m.group(2)
-            if (host, port) != (self.ssh_host, self.ssh_port):
-                print(f">> ssh endpoint moved: {self.ssh_host}:{self.ssh_port}"
-                      f" -> {host}:{port}")
-            self.ssh_host, self.ssh_port = host, port
+            return [(SSH_HOST, SSH_PORT)]
+        url = run(["vastai", "ssh-url", INSTANCE], check=False).stdout.decode()
+        try:
+            info = json.loads(
+                run(["vastai", "show", "instance", INSTANCE, "--raw"]).stdout)
+        except (subprocess.SubprocessError, json.JSONDecodeError):
+            info = {}
+        return endpoint_candidates(url, info, (SSH_HOST, SSH_PORT))
 
-    def ssh(self, cmd: str, timeout: int = 120) -> subprocess.CompletedProcess:
+    def ssh(self, cmd: str, timeout: int = 120,
+            connect_timeout: int = 25) -> subprocess.CompletedProcess:
         return run(["ssh", "-i", SSH_KEY, "-p", self.ssh_port,
                     "-o", "StrictHostKeyChecking=accept-new",
-                    "-o", "ConnectTimeout=25", self.ssh_host, cmd],
+                    "-o", f"ConnectTimeout={connect_timeout}", self.ssh_host, cmd],
                    timeout=timeout, check=False)
 
     def start(self) -> None:
-        run(["vastai", "start", "instance", INSTANCE])
+        r = run(["vastai", "start", "instance", INSTANCE])
+        # Before the wait, not after: we_started must be true so the queued
+        # state change is cancelled by stop(), or a box that frees up an hour
+        # later boots with nobody watching and bills until someone notices.
         self.we_started = True
-        for _ in range(40):                       # ~7 min of patience
+        refused = start_was_refused(r.stdout.decode(errors="replace"))
+        if refused:
+            raise BoxUnavailable(refused)
+        deadline = time.time() + 420              # ~7 min of patience
+        cands: list[tuple[str, str]] = []
+        resolved_at = 0.0
+        tried: set[str] = set()
+        while time.time() < deadline:
             time.sleep(10)
-            self.resolve_endpoint()               # mapping can appear late
-            if self.ssh("true", timeout=40).returncode == 0:
-                return
-        raise RuntimeError("box started but ssh never came up")
+            if not cands or time.time() - resolved_at > 60:
+                cands = self.resolve_endpoints()  # mapping can appear late
+                resolved_at = time.time()
+            for host, port in cands:
+                tried.add(f"{host}:{port}")
+                self.ssh_host, self.ssh_port = host, port
+                if self.ssh("true", timeout=20, connect_timeout=10).returncode == 0:
+                    print(f">> ssh up at {host}:{port}")
+                    return
+                if time.time() >= deadline:
+                    break
+        raise RuntimeError("box started but ssh never came up; tried "
+                           + ", ".join(sorted(tried)))
 
     def stop(self) -> None:
         if not self.we_started:
@@ -1089,9 +1247,12 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
         + ("| batch | main tok/s | PR tok/s | delta |\n|--:|--:|--:|--:|\n" + rows + "\n\n"
            if rows else "")
         + f"**Verdict:** {reason}. {suite_note}\n\n"
-        f"<sub>Automated eval (scripts/pr_eval_bot.py). Merge policy: `eval:pass` "
-        f"with an attested receipt auto-merges (the exact evaluated head only); "
-        f"every other verdict stays with the maintainer. A new push re-queues "
+        f"<sub>Automated eval (scripts/pr_eval_bot.py). Outcome policy: a verdict "
+        f"ends this PR. `eval:pass`, `eval:noise` and confirmed `eval:major` with "
+        f"an attested receipt auto-merge (the exact evaluated head only); "
+        f"`eval:reject`, `eval:slower` and `eval:tainted` close it with the "
+        f"reason, reversibly. `eval:landmark` waits for a human, and so does "
+        f"anything our own infrastructure got wrong. A new push re-queues "
         f"evaluation. Verdict also lands as the `{STATUS_CONTEXT}` commit status "
         f"on `{head[:9]}` and as a git note under `refs/notes/{NOTES_REF}`. "
         f"Box stopped after the run.</sub>"
@@ -1104,23 +1265,34 @@ def evaluate(box: Box, pr: int, info: dict, args, model_manifest: str) -> None:
     })
     print(f">> PR #{pr}: {label} — {reason}")
 
-    merge_ok, merge_why = should_automerge(label, receipt, vdoc.get("stable"))
-    if not AUTOMERGE:
-        merge_ok, merge_why = False, "auto-merge disabled (BRAID_AUTOMERGE=0)"
-    if merge_ok:
+    action, why = settle(label, receipt, vdoc.get("stable"),
+                         tuple(lb["name"] for lb in info.get("labels", [])))
+    if not AUTOMERGE and action != "wait":
+        action, why = "wait", f"outcome disabled (BRAID_AUTOMERGE=0); would {action}"
+
+    if action == "merge":
         merged, detail = automerge(pr, head)
         if merged:
             run(["gh", "pr", "comment", str(pr), "--body",
-                 f"Auto-merged at `{head[:9]}`: {merge_why}. The receipt for this "
+                 f"Auto-merged at `{head[:9]}`: {why}. The receipt for this "
                  f"verdict is permanent in `refs/notes/{NOTES_REF}`."], check=False)
-            print(f">> PR #{pr}: auto-merged ({merge_why})")
+            print(f">> PR #{pr}: auto-merged ({why})")
         else:
             run(["gh", "pr", "comment", str(pr), "--body",
-                 f"Auto-merge was earned ({merge_why}) but the merge call failed — "
+                 f"Auto-merge was earned ({why}) but the merge call failed — "
                  f"maintainer action needed:\n```\n{detail}\n```"], check=False)
             print(f"!! PR #{pr}: auto-merge failed: {detail}", file=sys.stderr)
+    elif action == "close":
+        closed, detail = close_with_reason(pr, label, why)
+        if closed:
+            print(f">> PR #{pr}: closed — {why}")
+        else:
+            run(["gh", "pr", "comment", str(pr), "--body",
+                 f"This verdict closes the PR ({why}) but the close call failed — "
+                 f"maintainer action needed:\n```\n{detail}\n```"], check=False)
+            print(f"!! PR #{pr}: close failed: {detail}", file=sys.stderr)
     else:
-        print(f">> PR #{pr}: no auto-merge — {merge_why}")
+        print(f">> PR #{pr}: left open — {why}")
 
 
 def main() -> int:
@@ -1207,7 +1379,15 @@ def main() -> int:
         return 0
     print(f">> box {INSTANCE} is {status}; starting")
     try:
-        box.start()
+        try:
+            box.start()
+        except BoxUnavailable as e:
+            # Capacity, not a fault. Say so plainly and leave every PR
+            # exactly as it was — no eval:error, no verdict, no close. The
+            # next poll tries again.
+            print(f">> box {INSTANCE} unavailable: {str(e).rstrip('.')}. "
+                  f"Nothing evaluated; the next poll retries.")
+            return 0
         if box.gpu_busy():
             raise RuntimeError("GPU busy right after start — refusing to eval")
         # The trusted baseline for the whole session, taken before ANY PR

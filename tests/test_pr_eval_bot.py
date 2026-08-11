@@ -65,6 +65,19 @@ class Idempotency(unittest.TestCase):
         bodies = [bot.marker("othersha") + "\nverdict"]
         self.assertFalse(bot.already_evaluated(bodies, self.SHA))
 
+    def test_a_verdict_from_an_older_policy_does_not_park_the_head(self):
+        """The staleness mechanism. PR #5 was stranded because a verdict
+        reached under the old policy parked its head forever, so widening
+        the policy could never reach it. Bumping POLICY_VERSION must make
+        that verdict stop counting, so the head is measured again under the
+        rules now in force rather than settled on a stale label."""
+        stale = f"<!-- braid-eval sha={self.SHA} policy={bot.POLICY_VERSION - 1} -->"
+        self.assertFalse(bot.already_evaluated([stale + "\nverdict"], self.SHA))
+        self.assertTrue(bot.already_evaluated([bot.marker(self.SHA)], self.SHA))
+
+    def test_the_marker_carries_the_policy_version(self):
+        self.assertIn(f"policy={bot.POLICY_VERSION}", bot.marker(self.SHA))
+
     def test_one_error_gets_a_retry_two_do_not(self):
         one = [bot.error_marker(self.SHA)]
         self.assertFalse(bot.already_evaluated(one, self.SHA))
@@ -142,23 +155,23 @@ class GradedTiers(unittest.TestCase):
                             (-4.9, "eval:slower"), (-5.1, "eval:reject")):
             self.assertEqual(bot.verdict(True, {16: delta})[0], want, delta)
 
-    def test_landmark_never_automerges_but_the_gate_still_passes(self):
-        ok, why = bot.should_automerge("eval:landmark", AutoMerge.RECEIPT)
-        self.assertFalse(ok)
-        self.assertIn("maintainer", why)
+    def test_landmark_waits_for_a_human_but_the_gate_still_passes(self):
+        action, why = bot.settle("eval:landmark", Settle.RECEIPT)
+        self.assertEqual(action, "wait")
+        self.assertIn("human", why)
         self.assertEqual(bot.STATUS_STATE["eval:landmark"], "success")
 
     def test_major_merges_only_when_the_rounds_agree(self):
-        self.assertTrue(bot.should_automerge("eval:major", AutoMerge.RECEIPT, True)[0])
-        ok, why = bot.should_automerge("eval:major", AutoMerge.RECEIPT, False)
-        self.assertFalse(ok)
+        self.assertEqual(bot.settle("eval:major", Settle.RECEIPT, True)[0], "merge")
+        action, why = bot.settle("eval:major", Settle.RECEIPT, False)
+        self.assertEqual(action, "wait")
         self.assertIn("unstable", why)
 
-    def test_slower_blocks_the_gate_but_reads_as_a_trade(self):
+    def test_slower_closes_the_pr_but_still_reads_as_a_trade(self):
         label, reason = bot.verdict(True, {16: -3.0})
         self.assertEqual(bot.STATUS_STATE[label], "failure")
         self.assertIn("fair trade", reason)
-        self.assertFalse(bot.should_automerge(label, AutoMerge.RECEIPT)[0])
+        self.assertEqual(bot.settle(label, Settle.RECEIPT)[0], "close")
 
     def test_every_label_has_a_colour_and_a_status(self):
         self.assertEqual(set(bot.EVAL_LABELS), set(bot.STATUS_STATE))
@@ -422,35 +435,225 @@ class DurableEvidence(unittest.TestCase):
         self.assertEqual(bot.STATUS_STATE["eval:pass"], "success")
 
 
-class AutoMerge(unittest.TestCase):
+class OwnerOnlyPaths(unittest.TestCase):
+    """CODEOWNERS states the owner-only list; owner-only.yml enforces it.
+    Two copies of a security-relevant list drift, so this pins them together
+    — same idiom as the Makefile and PR-template consistency tests below."""
+
+    ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+    def owners(self) -> set[str]:
+        text = (self.ROOT / ".github" / "CODEOWNERS").read_text()
+        out = set()
+        for line in text.splitlines():
+            line = line.strip()
+            if line.startswith("/"):
+                out.add(line.split()[0].lstrip("/"))
+        return out
+
+    def workflow(self) -> tuple[set[str], set[str]]:
+        import re
+        text = (self.ROOT / ".github" / "workflows" / "owner-only.yml").read_text()
+        def arr(name):
+            m = re.search(name + r"\s*=\s*\[(.*?)\]", text, re.S)
+            self.assertIsNotNone(m, f"{name} not found in owner-only.yml")
+            return set(re.findall(r"'([^']+)'", m.group(1)))
+        return arr("FILES"), arr("PREFIXES")
+
+    def test_codeowners_and_the_workflow_describe_the_same_set(self):
+        files, prefixes = self.workflow()
+        self.assertEqual(self.owners(), files | prefixes)
+
+    def test_the_eval_infrastructure_is_owner_only(self):
+        """The grader must never be editable by a PR it will grade."""
+        files, prefixes = self.workflow()
+        for path in bot.scorer.INFRA_FILES:
+            self.assertIn(path, files, path)
+        for pre in bot.scorer.INFRA_PREFIXES:
+            self.assertIn(pre, prefixes, pre)
+
+    def test_the_bench_harness_is_owner_only(self):
+        self.assertIn("braid/bench/", self.workflow()[1])
+
+    def test_prefixes_end_in_a_slash(self):
+        """`braid/bench` without the slash would also match
+        `braid/benchmarks.py`. The bot's own taint check learned this."""
+        for pre in self.workflow()[1]:
+            self.assertTrue(pre.endswith("/"), pre)
+
+    def test_pinned_oracles_are_deliberately_not_owner_only(self):
+        """braid/reference/ and tests/ are pinned during the eval and already
+        cap a verdict at eval:tainted, which the outcome policy closes. Adding
+        them here would be redundant; this test makes that a decision someone
+        has to change on purpose rather than drift into."""
+        files, prefixes = self.workflow()
+        for path in ("braid/reference/", "tests/"):
+            self.assertNotIn(path, prefixes, path)
+            self.assertNotIn(path.rstrip("/"), files, path)
+
+    def test_the_workflow_never_runs_pr_code(self):
+        text = (self.ROOT / ".github" / "workflows" / "owner-only.yml").read_text()
+        self.assertIn("pull_request_target", text)
+        self.assertNotIn("actions/checkout", text,
+                         "a pull_request_target job with a write token must "
+                         "never check out PR code")
+
+
+class BoxCapacity(unittest.TestCase):
+    """vast.ai refuses a start with exit 0 and prose. Reading that is the
+    difference between 'no GPU free right now' and seven minutes of silence
+    ending in a misleading 'ssh never came up'."""
+
+    # verbatim, instance 47055458, 2026-08-11T20:27:55+09:00
+    REAL = "Required resources are currently unavailable, state change queued.\n"
+
+    def test_the_real_refusal_is_recognised(self):
+        self.assertIsNotNone(bot.start_was_refused(self.REAL))
+
+    def test_the_reason_is_carried_not_swallowed(self):
+        why = bot.start_was_refused(self.REAL)
+        self.assertIn("currently unavailable", why)
+
+    def test_a_normal_start_is_not_a_refusal(self):
+        for ok in ("starting instance 47055458", "success", "", None):
+            self.assertIsNone(bot.start_was_refused(ok), repr(ok))
+
+    def test_matching_is_case_insensitive(self):
+        self.assertIsNotNone(bot.start_was_refused(self.REAL.upper()))
+
+    def test_unavailable_is_not_a_generic_failure(self):
+        """main() must be able to tell capacity apart from a real fault, so
+        a busy host never reaches a contributor as eval:error."""
+        self.assertTrue(issubclass(bot.BoxUnavailable, RuntimeError))
+
+
+class SshEndpoints(unittest.TestCase):
+    """Regression: the 19:30 poll on 2026-08-11 stopped here. `vastai ssh-url`
+    reported the direct route, the old code REPLACED the working proxy with
+    it, and the run spent seven minutes failing to reach a box that was up."""
+
+    DEFAULT = ("root@ssh5.vast.ai", "15458")
+    # exactly what instance 47055458 reported that evening
+    INFO = {"ssh_host": "ssh5.vast.ai", "ssh_port": 15458,
+            "public_ipaddr": "202.215.136.222", "direct_port_start": 52677}
+    URL = "ssh://root@202.215.136.222:52677\n"
+
+    def test_the_proxy_route_survives_a_direct_ssh_url(self):
+        cands = bot.endpoint_candidates(self.URL, self.INFO, self.DEFAULT)
+        self.assertIn(("root@ssh5.vast.ai", "15458"), cands)
+        self.assertIn(("root@202.215.136.222", "52677"), cands)
+
+    def test_ssh_url_is_tried_first_but_is_not_the_only_one(self):
+        cands = bot.endpoint_candidates(self.URL, self.INFO, self.DEFAULT)
+        self.assertEqual(cands[0], ("root@202.215.136.222", "52677"))
+        self.assertGreater(len(cands), 1)
+
+    def test_the_default_is_always_present_and_never_first(self):
+        cands = bot.endpoint_candidates("", {}, self.DEFAULT)
+        self.assertEqual(cands, [self.DEFAULT])
+        cands = bot.endpoint_candidates(self.URL, self.INFO, self.DEFAULT)
+        self.assertIn(self.DEFAULT, cands)
+        self.assertNotEqual(cands[0], self.DEFAULT)
+
+    def test_no_duplicates(self):
+        cands = bot.endpoint_candidates(self.URL, self.INFO, self.DEFAULT)
+        self.assertEqual(len(cands), len(set(cands)))
+
+    def test_a_bare_host_gets_the_root_user(self):
+        cands = bot.endpoint_candidates("", {"ssh_host": "ssh9.vast.ai",
+                                             "ssh_port": 40}, self.DEFAULT)
+        self.assertIn(("root@ssh9.vast.ai", "40"), cands)
+
+    def test_garbage_never_crashes_the_boot(self):
+        for url in ("", "not a url", "ssh://nohost", None):
+            self.assertTrue(bot.endpoint_candidates(url, {}, self.DEFAULT))
+
+
+class Settle(unittest.TestCase):
+    """A verdict ends the PR: merged, or closed with the reason. The only
+    things that wait are the ones that are OUR fault, not the contributor's."""
+
     RECEIPT = {"verification": {"intel_verified": True}}
 
     def test_attested_pass_merges(self):
-        ok, why = bot.should_automerge("eval:pass", self.RECEIPT)
-        self.assertTrue(ok, why)
+        action, why = bot.settle("eval:pass", self.RECEIPT)
+        self.assertEqual(action, "merge", why)
 
     def test_attested_noise_merges(self):
         # measured harmless is a merge condition too: requiring a speedup
         # would mean a bug fix or refactor could never merge itself.
-        ok, why = bot.should_automerge("eval:noise", self.RECEIPT)
-        self.assertTrue(ok, why)
+        action, why = bot.settle("eval:noise", self.RECEIPT)
+        self.assertEqual(action, "merge", why)
 
-    def test_unmerged_verdicts_stay_human(self):
-        for label in ("eval:tainted", "eval:reject", "eval:error"):
-            ok, why = bot.should_automerge(label, self.RECEIPT)
-            self.assertFalse(ok, label)
-            self.assertIn("maintainer", why)
+    def test_measured_rejections_close_with_a_reason(self):
+        for label in ("eval:reject", "eval:slower", "eval:tainted"):
+            action, why = bot.settle(label, self.RECEIPT)
+            self.assertEqual(action, "close", label)
+            self.assertTrue(why and not why.endswith("."), label)
 
-    def test_noise_without_receipt_stays_human(self):
-        self.assertFalse(bot.should_automerge("eval:noise", None)[0])
+    def test_every_closing_label_is_a_real_label_and_reads_as_failure(self):
+        for label in bot.CLOSING_LABELS:
+            self.assertIn(label, bot.EVAL_LABELS)
+            self.assertEqual(bot.STATUS_STATE[label], "failure", label)
 
-    def test_pass_without_receipt_stays_human(self):
-        self.assertFalse(bot.should_automerge("eval:pass", None)[0])
+    def test_merge_and_close_sets_do_not_overlap(self):
+        self.assertFalse(set(bot.MERGEABLE_LABELS) & set(bot.CLOSING_LABELS))
 
-    def test_pass_with_unverified_receipt_stays_human(self):
-        bad = {"verification": {"intel_verified": False}}
-        self.assertFalse(bot.should_automerge("eval:pass", bad)[0])
-        self.assertFalse(bot.should_automerge("eval:pass", {})[0])
+    def test_every_verdict_has_an_outcome(self):
+        """No label may fall off the end of the policy unclassified."""
+        for label in bot.EVAL_LABELS:
+            action, why = bot.settle(label, self.RECEIPT)
+            self.assertIn(action, ("merge", "close", "wait"), label)
+            self.assertTrue(why, label)
+
+    def test_an_eval_error_never_closes_the_pr(self):
+        # The eval broke, not the PR. PR #5 is the standing example: it was
+        # labelled eval:reject twice for 'pinned test suite failed' and the
+        # verdict was withdrawn — the box was at fault. Closing on our own
+        # infrastructure would have killed a good PR twice.
+        action, why = bot.settle("eval:error", self.RECEIPT)
+        self.assertEqual(action, "wait")
+        self.assertIn("evaluation", why)
+
+    def test_landmark_waits_for_a_human_but_the_gate_still_passes(self):
+        action, why = bot.settle("eval:landmark", self.RECEIPT)
+        self.assertEqual(action, "wait")
+        self.assertIn("human", why)
+        self.assertEqual(bot.STATUS_STATE["eval:landmark"], "success")
+
+    def test_a_held_pr_is_never_closed(self):
+        for label in bot.CLOSING_LABELS:
+            action, _ = bot.settle(label, self.RECEIPT, None, ("hold",))
+            self.assertEqual(action, "wait", label)
+
+    def test_hold_also_blocks_a_merge(self):
+        action, _ = bot.settle("eval:pass", self.RECEIPT, None, ("hold", "eval"))
+        self.assertEqual(action, "wait")
+
+    def test_a_missing_receipt_waits_it_does_not_close(self):
+        # An attestation outage is our problem; blaming the contributor for
+        # it by closing their PR is the failure mode this guards.
+        for receipt in (None, {}, {"verification": {"intel_verified": False}}):
+            for label in bot.MERGEABLE_LABELS:
+                action, _ = bot.settle(label, receipt)
+                self.assertEqual(action, "wait", (label, receipt))
+
+    def test_major_merges_only_when_the_rounds_agree(self):
+        self.assertEqual(bot.settle("eval:major", self.RECEIPT, True)[0], "merge")
+        action, why = bot.settle("eval:major", self.RECEIPT, False)
+        self.assertEqual(action, "wait")
+        self.assertIn("unstable", why)
+
+    def test_an_unstable_round_waits_rather_than_closing(self):
+        # Our two rounds disagreeing is not evidence against the PR.
+        self.assertEqual(bot.settle("eval:pass", self.RECEIPT, False)[0], "wait")
+
+    def test_the_close_comment_names_the_verdict_and_the_way_back(self):
+        body = bot.close_comment("eval:reject", bot.CLOSING_LABELS["eval:reject"])
+        self.assertIn("eval:reject", body)
+        self.assertIn("reopen", body)
+        self.assertIn("hold", body)
+        self.assertIn(bot.CLOSING_LABELS["eval:reject"], body)
 
 
 class HarnessCrossCheck(unittest.TestCase):
@@ -492,14 +695,16 @@ class HarnessCrossCheck(unittest.TestCase):
         v = bot.scorer.score_bundle(b)
         self.assertEqual(v["label"], "eval:pass")
         self.assertTrue(v["crosscheck_ok"])
-        self.assertTrue(bot.should_automerge(v["label"], AutoMerge.RECEIPT)[0])
+        self.assertEqual(bot.settle(v["label"], Settle.RECEIPT)[0], "merge")
 
     def test_disagreeing_bench_pr_stays_tainted(self):
         b = synthetic_bundle(name_status=[["M", "braid/bench/decode_speed.py"]],
                              crosscheck=self.cc(**{"graphed-kvbucket@16": (1733.0, 2599.5)}))
         v = bot.scorer.score_bundle(b)
         self.assertEqual(v["label"], "eval:tainted")
-        self.assertFalse(bot.should_automerge(v["label"], AutoMerge.RECEIPT)[0])
+        # A bench change whose own numbers disagree with the pinned harness
+        # is exactly PR #5: it closes, it does not quietly merge.
+        self.assertEqual(bot.settle(v["label"], Settle.RECEIPT)[0], "close")
 
     def test_a_test_change_is_never_cleared(self):
         b = synthetic_bundle(name_status=[["M", "tests/test_x.py"]],

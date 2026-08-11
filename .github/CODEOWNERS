@@ -1,0 +1,31 @@
+# Paths only the repo owner may change.
+#
+# CODEOWNERS on its own only *requests* review — it blocks nothing unless
+# branch protection requires code-owner approval, which this repo does not
+# set. The enforcement is .github/workflows/owner-only.yml, which closes a
+# non-owner PR touching any path below. This file is the human-readable
+# statement of the same list, and tests/test_pr_eval_bot.py asserts the two
+# never drift apart.
+#
+# Why these and not others: everything here either grades a PR, decides what
+# "measured" means, or configures how the engine is built. A contributor PR
+# editing one of them is asking to be judged by rules it wrote itself.
+# braid/reference/ and tests/ are deliberately NOT here — they are pinned
+# during the eval and already cap a verdict at eval:tainted, which the
+# outcome policy closes on its own.
+
+# The grader, its cron wrapper, and the scorer shipped into the TEE
+/scripts/pr_eval_bot.py    @plind-junior
+/scripts/pr_eval_cron.sh   @plind-junior
+/scripts/eval_scorer.py    @plind-junior
+
+# CI, the gates, and the PR template that carries the 5090 attestation box
+/.github/                  @plind-junior
+
+# How the engine is built, and the contract contributors are held to
+/Makefile                  @plind-junior
+/pyproject.toml            @plind-junior
+/CONTRIBUTING.md           @plind-junior
+
+# The benchmark harness a verdict is read from
+/braid/bench/              @plind-junior
