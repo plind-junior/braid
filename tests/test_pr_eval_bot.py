@@ -428,9 +428,36 @@ class HarnessCrossCheck(unittest.TestCase):
 
 class DocsOnlyAutoMerge(unittest.TestCase):
     def info(self, **kw):
-        base = {"state": "OPEN", "isDraft": False, "labels": []}
+        base = {"state": "OPEN", "isDraft": False, "labels": [],
+                "files": [{"path": "docs/ROADMAP.md"}]}
         base.update(kw)
         return base
+
+    def files(self, *paths):
+        return {"files": [{"path": p} for p in paths]}
+
+    def test_the_bot_itself_never_docs_merges(self):
+        # 'not a runtime path' is true of the grader, the workflows, the
+        # Makefile and pyproject — none of which may merge unread.
+        for p in ("scripts/pr_eval_bot.py", "scripts/eval_scorer.py",
+                  ".github/workflows/gate.yml", ".github/PULL_REQUEST_TEMPLATE.md",
+                  "Makefile", "pyproject.toml", ".gitignore"):
+            ok, why = bot.docs_only_automerge(self.info(**self.files(p)), self.GREEN)
+            self.assertFalse(ok, f"{p} must not auto-merge")
+            self.assertIn("non-prose", why)
+
+    def test_prose_paths_qualify(self):
+        for p in ("docs/ROADMAP.md", "README.md", "CONTRIBUTING.md", "LICENSE"):
+            self.assertTrue(bot.inert_paths([p]), p)
+
+    def test_one_bad_path_disqualifies_the_whole_pr(self):
+        ok, _ = bot.docs_only_automerge(
+            self.info(**self.files("README.md", "scripts/pr_eval_bot.py")), self.GREEN)
+        self.assertFalse(ok)
+
+    def test_a_non_md_file_under_docs_does_not_qualify(self):
+        self.assertFalse(bot.inert_paths(["docs/bench.py"]))
+        self.assertFalse(bot.inert_paths([]))
 
     GREEN = [{"name": "ruff", "state": "SUCCESS"}, {"name": "gate", "state": "SUCCESS"}]
 

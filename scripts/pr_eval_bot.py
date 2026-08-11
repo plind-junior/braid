@@ -294,19 +294,47 @@ def should_automerge(label: str, receipt: dict | None) -> tuple[bool, str]:
     return True, f"{label} with an intel-verified attested receipt"
 
 
+INERT_FILES = ("README.md", "CONTRIBUTING.md", "LICENSE", "CHANGELOG.md")
+
+
+def inert_paths(paths: list[str]) -> bool:
+    """Prose only — nothing that executes, gates, or configures anything.
+
+    An ALLOWLIST, deliberately. The tempting definition is 'touches no
+    runtime path', but that is true of scripts/pr_eval_bot.py, of
+    .github/workflows/, of the Makefile and pyproject.toml — so a PR
+    rewriting the grader itself would have sailed through the docs-only
+    merge with nobody reading it. Anything not named here goes to a human,
+    including .github/ (its PR template carries the 5090 attestation
+    checkbox) and every dotfile.
+    """
+    if not paths:
+        return False
+    return all(p in INERT_FILES or (p.startswith("docs/") and p.endswith(".md"))
+               for p in paths)
+
+
 def docs_only_automerge(info: dict, checks: list[dict]) -> tuple[bool, str]:
     """Docs-only PRs never reach the GPU, so their gate is ordinary CI.
 
-    `eligible()` has already decided this PR touches no runtime path, which
-    is why no eval runs. Merging it still requires everything else to be
-    green — a docs PR can break the lint job or carry a blocking review —
-    and requires the PR to be an ordinary open, non-held, non-draft PR.
+    `eligible()` has already decided this PR touches no runtime path, but
+    that is far too weak to merge on: see `inert_paths`. Merging also
+    requires everything else to be green — a docs PR can break the lint job
+    or carry a blocking review — and an ordinary open, non-held, non-draft
+    PR.
     """
     labels = [lb["name"] for lb in info.get("labels", [])]
     if info.get("state") != "OPEN" or info.get("isDraft"):
         return False, "not an open, ready PR"
     if "hold" in labels:
         return False, "hold label"
+    paths = [f["path"] for f in info.get("files", [])]
+    if not inert_paths(paths):
+        outside = [p for p in paths
+                   if not (p in INERT_FILES
+                           or (p.startswith("docs/") and p.endswith(".md")))]
+        return False, (f"touches non-prose paths a human must read: "
+                       f"{', '.join(outside[:4])}")
     if not checks:
         return False, "no CI checks reported yet"
     for c in checks:
