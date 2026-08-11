@@ -44,8 +44,8 @@ its own sake:
 3. **The eval bot — your speedup claim gets measured, and the PR does not grade
    itself.** For each eligible PR head, a bot starts a real 5090, runs the suite on
    your *merged* tree, then benches it against `main` **in the same box session**
-   (median of 3 reps, arm order alternated, the serving-shaped decode configuration at
-   B=16 and B=64) and posts the measured table as a comment with one of these labels:
+   (median of 3 reps, arm order alternated) and posts the measured table as a comment
+   with one of these labels:
 
    | label | measured | what happens |
    |---|---|---|
@@ -57,6 +57,19 @@ its own sake:
    | `eval:reject` | worse than −5%, or the suite failed | blocked |
    | `eval:tainted` | touched the harness, not cleared by cross-check | blocked, human reads the diff |
    | `eval:error` | infrastructure failed | retried automatically |
+
+   **Measure what the bot measures — `make bench-eval`.** The verdict is not read from
+   "decode throughput" in general; it is read from the **`graphed-kvbucket`** arm of
+   `braid.bench.decode_speed` at **B=16 and B=64**, with `--prompt-len 128 --quant all
+   --state-dtype fp16`. That bench also prints `eager-torch`, `eager-kernels` and
+   `graphed-kernels`; those are context and are **not** scored. `make bench-eval` runs
+   exactly that configuration on your box, so the delta you see before you push is the
+   delta the bot will post. It asks the bot to print the command
+   (`scripts/pr_eval_bot.py --print-bench-cmd`) instead of keeping a second copy of it,
+   so the target cannot drift from what actually runs. A number taken from another arm,
+   another prompt length or another quant set is measuring different work, and no
+   verdict can be predicted from it. (`make bench-scaling` answers a different question —
+   whether the *scan* scales with batch — and is not what the bot runs.)
 
    **The bar is not a constant.** It is `max(2%, 3 × this session's observed spread)`.
    Three reps of the same tree normally land within 0.04% at B=16, so 2% is the floor

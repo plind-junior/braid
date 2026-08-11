@@ -146,6 +146,7 @@ BENCH_MODEL = os.environ.get("BRAID_EVAL_MODEL_DIR", "/root/models/Qwen3.5-9B")
 REMOTE_BASE = "/root/braid_eval"          # outside /root/braid: never collides with dev rsync
 EXT_BASE = "/root/torch_ext_eval"         # JIT caches, one per arm, never the dev cache
 ARM = "graphed-kvbucket"                  # the serving-shaped arm decode_speed reports
+EVAL_BATCHES = [16, 64]                   # the locked targets the verdict is read at
 RUNTIME_PREFIXES = ("braid/", "tests/")
 STATUS_CONTEXT = "braid/eval"
 POLARIS_ATTEST_URL = os.environ.get("BRAID_POLARIS_ATTEST_URL",
@@ -748,10 +749,20 @@ def apply_verdict(pr: int, label: str, body: str) -> None:
 # ---------------------------------------------------------------------------
 # The evaluation itself
 
-def bench_cmd(batches: list[int]) -> str:
+def bench_cmd(batches: list[int], json_out: bool = True) -> str:
+    """The exact measurement a verdict is a function of.
+
+    A contributor who benches a *nearby* configuration — a different arm, a
+    different prompt length — and then reads a verdict computed from this one
+    has no way to explain the disagreement. So this is the single definition,
+    and `make bench-eval` asks the bot to print it (`--print-bench-cmd`)
+    rather than keeping a copy that can drift. The only difference between
+    the two is `--json`: the bot parses the output, a human reads the table.
+    """
     bs = " ".join(str(b) for b in batches)
     return (f"python3 -B -m braid.bench.decode_speed --batches {bs} "
-            f"--prompt-len 128 --quant all --state-dtype fp16 --json")
+            f"--prompt-len 128 --quant all --state-dtype fp16"
+            + (" --json" if json_out else ""))
 
 
 def run_bench_all(box: Box, arm_dir: str, ext_dir: str,
@@ -1121,11 +1132,26 @@ def main() -> int:
     p.add_argument("--reps", type=int, default=3)
     p.add_argument("--confirm-reps", type=int, default=4,
                    help="extra reps run when the first round claims a big gain")
-    p.add_argument("--batches", type=int, nargs="+", default=[16, 64])
+    p.add_argument("--batches", type=int, nargs="+", default=EVAL_BATCHES)
     p.add_argument("--tests", default="tests/")
     p.add_argument("--max-evals", type=int, default=3,
                    help="cost cap: at most this many PRs per cycle")
+    p.add_argument("--print-bench-cmd", action="store_true",
+                   help="print the bench invocation a verdict is derived from "
+                        "and exit (what `make bench-eval` runs)")
+    p.add_argument("--print-eval-arm", action="store_true",
+                   help="print the decode_speed arm the verdict is read from "
+                        "and exit")
     args = p.parse_args()
+
+    # Both are pure lookups of the eval configuration, so they answer before
+    # anything with a side effect — `make bench-eval` must not need a gh token.
+    if args.print_bench_cmd:
+        print(bench_cmd(args.batches, json_out=False))
+        return 0
+    if args.print_eval_arm:
+        print(ARM)
+        return 0
 
     pin_gh_identity()      # before ANY gh call: never post as another account
 

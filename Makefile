@@ -1,5 +1,5 @@
-.PHONY: provision test-remote bench-noise bench-scaling gpu-start gpu-stop gpu-status \
-        lint fmt pr-eval pr-eval-dry
+.PHONY: provision test-remote bench-noise bench-scaling bench-eval gpu-start gpu-stop \
+        gpu-status lint fmt pr-eval pr-eval-dry
 
 # The box bills ~$0.79/hr while running and storage-only while stopped, so stop
 # it as soon as a batch of GPU work is done. Always `stop`, never `destroy`:
@@ -35,6 +35,20 @@ bench-noise:
 
 bench-scaling:
 	./scripts/remote.sh python3 -B -m braid.bench.scan_scaling
+
+# The measurement the PR eval bot's verdict is a function of -- same arm, same
+# batches, same prompt length, quant set and state dtype. Run this before
+# claiming a speedup: a number from a nearby configuration will not agree with
+# the one the bot posts, and there is no way to tell afterwards which of the
+# two was measuring what.
+#
+# The command is PRINTED BY THE BOT rather than copied here, so the two cannot
+# drift; both flags are pure lookups and need no GPU, box or token. Command
+# substitution runs at recipe time, not parse time, so no other target pays
+# for it.
+bench-eval:
+	@echo "the verdict reads the '$$(python3 -B scripts/pr_eval_bot.py --print-eval-arm)' rows; every other arm is context"
+	./scripts/remote.sh $$(python3 -B scripts/pr_eval_bot.py --print-bench-cmd)
 
 # Lint runs LOCALLY -- it needs no GPU, so it costs nothing and there is no
 # reason to burn box time on it. Config lives in pyproject.toml.

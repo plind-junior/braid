@@ -10,16 +10,21 @@
 > method stated — or clearly labelled **projected**. A delta that does not
 > clear the noise floor (`make bench-noise`), or that compares against a
 > different session's baseline, is not a result.
+>
+> Fill the table from **`make bench-eval`** — the eval bot's exact
+> configuration. Read the **`graphed-kvbucket`** rows: that is the arm the
+> verdict is computed from, and a number from any other arm will not agree
+> with the one the bot posts on this PR.
 
 - [ ] Tested on **RTX 5090** — `make test-remote` passes on this branch
 
-| | decode tok/s (B=16) | decode tok/s (B=64) |
+| `graphed-kvbucket` | decode tok/s (B=16) | decode tok/s (B=64) |
 |---|--:|--:|
 | before (main) | | |
 | after (this PR) | | |
 
 ```text
-# paste the bench output backing the table (make bench-scaling), before -> after
+# paste the bench output backing the table (make bench-eval), before -> after
 ```
 
 ## If this PR touches a kernel (`braid/kernels/`)

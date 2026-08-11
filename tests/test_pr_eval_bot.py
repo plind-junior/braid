@@ -606,5 +606,49 @@ class Eligibility(unittest.TestCase):
         self.assertFalse(bot.eligible(done)[0])
 
 
+class ReproducibleBenchConfig(unittest.TestCase):
+    """A contributor must be able to measure what the bot measures.
+
+    The eval reads one arm at two batches with a specific prompt length,
+    quant set and state dtype. If `make bench-eval` and the PR template drift
+    from that, a contributor benches a nearby configuration, sees a different
+    delta, and has no way to explain the disagreement with the posted verdict.
+    So the Makefile is required to ASK the bot for the command rather than
+    keep a copy, and these tests fail the moment a copy reappears.
+    """
+    ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+    def test_human_and_json_forms_differ_only_by_json(self):
+        human = bot.bench_cmd(bot.EVAL_BATCHES, json_out=False)
+        self.assertEqual(bot.bench_cmd(bot.EVAL_BATCHES), human + " --json")
+
+    def test_printed_command_names_the_scored_batches(self):
+        human = bot.bench_cmd(bot.EVAL_BATCHES, json_out=False)
+        self.assertIn("--batches 16 64", human)
+        self.assertIn("braid.bench.decode_speed", human)
+
+    def test_makefile_derives_the_command_instead_of_copying_it(self):
+        mk = (self.ROOT / "Makefile").read_text()
+        self.assertIn("bench-eval:", mk)
+        self.assertIn("--print-bench-cmd", mk)
+        recipe = mk.split("bench-eval:", 1)[1].split("\n\n", 1)[0]
+        self.assertNotIn("decode_speed", recipe,
+                         "bench-eval must ask the bot for the command, not repeat it")
+
+    def test_pr_template_points_at_bench_eval_and_names_the_arm(self):
+        tpl = (self.ROOT / ".github" / "PULL_REQUEST_TEMPLATE.md").read_text()
+        self.assertIn("make bench-eval", tpl)
+        self.assertIn(bot.ARM, tpl)
+        self.assertNotIn("make bench-scaling", tpl,
+                         "scan_scaling is a different benchmark; it is not what is scored")
+
+    def test_contributing_names_the_arm_and_the_batches(self):
+        doc = (self.ROOT / "CONTRIBUTING.md").read_text()
+        self.assertIn("make bench-eval", doc)
+        self.assertIn(bot.ARM, doc)
+        for b in bot.EVAL_BATCHES:
+            self.assertIn(f"B={b}", doc)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
