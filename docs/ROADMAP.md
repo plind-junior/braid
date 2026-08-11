@@ -6,6 +6,13 @@
 **Goal:** beat the reference engine on aggregate throughput serving a Gated-DeltaNet hybrid
 at concurrency, on one RTX 5090.
 
+> **Which model, when.** This document is a build log and its phases name the checkpoint that
+> was current *at the time*: `Qwen3.6-35B-A3B-NVFP4` as written on 2026-08-07, rescoped to
+> `Qwen3.5-4B` for Phase 2 (see the note there), and moved up to **`Qwen3.5-9B`** — where braid
+> ships today — at the Phase 4 close on 2026-08-09. Those references are left as written rather
+> than retro-fitted, because the sequence is the record. For the current target and the parity
+> model, read [`ARCHITECTURE.md` §2](ARCHITECTURE.md).
+
 ---
 
 ## The number
@@ -106,8 +113,14 @@ and one addition:
    tree reduction already fixed the related `atomicAdd` issue.)
 3. No `--use_fast_math` — it turns `rsqrtf` into an approximation and breaks fp32 parity at
    the asserted tolerances.
-4. **Batch buckets stop at 16.** c=32 does not fit in VRAM and is throughput-pointless: the
-   linear state term overtakes the fixed weight sweep around B=14–18.
+4. ~~**Batch buckets stop at 16.** c=32 does not fit in VRAM and is throughput-pointless: the
+   linear state term overtakes the fixed weight sweep around B=14–18.~~
+   **RETRACTED 2026-08-08 — wrong on all three clauses, and it was hiding the win.**
+   Measured: B=64 peaks at **20.61 GB of 32.6 GB**; B=16→32 is **1.93×** and B=32→64 is
+   **1.43×**; and at 102 MiB of state per sequence against 8.44 GB of weights the crossover
+   is near **B≈83**, not 14–18. This decision scoped Phase 4's head-to-head to
+   c ∈ {1,2,4,8,16}, which is exactly the range where braid loses every row — braid beats
+   llama.cpp at B=32 and B=64. See Phase 4 items 3–4.
 5. **Added: the batched slotted conv1d** (`[S_max, 30, 8192, 4]` fp32, SiLU fused). Same
    `slot_idx` contract. Verify over **8 sequential steps with rotating slots** — a single
    step cannot catch a window-orientation error.
@@ -362,10 +375,13 @@ NVFP4 35B was budgeted at, so KV headroom is not a constraint at B=1 on this tar
    > long context, and its real value is a packing property that Phase 4's scheduler
    > has not defined yet. Details in the chunked-prefill-kv runbook.
    >
-   > Still open: ragged batched prefill (B>1, T>1) — out of scope by this item's own
-   > "single sequence per forward", but Phase 4's scheduler will want it — and the KV
-   > `index_select` (0.43 ms), which needs attention to address the pool through
-   > `slot_idx` the way the GDN kernels do. That is a kernel, not a refactor.
+   > **Ragged batched prefill ✅ 2026-08-08**, out of scope by this item's own "single
+   > sequence per forward" but done under Phase 5 item 5, which is where it belonged.
+   > A `[B, T]` rectangle plus `seq_lens[B]`; see that item for the numbers.
+   >
+   > Still open: the KV `index_select` (0.43 ms), which needs attention to address the
+   > pool through `slot_idx` the way the GDN kernels do. That is a kernel, not a
+   > refactor.
    >
    > It also re-ranks the rest of this item, and raises its value. The two remaining
    > pieces are worth **0.43 ms** directly (the KV `index_select`, which exists only
@@ -513,7 +529,12 @@ modelled and Phase 4's gate needs revisiting before it is run.
 4. **The sweep:** c ∈ {1, 2, 4, 8, 16}, **ABBA order, 5 processes per arm per point**, on
    the reference engine's own `tools/agent_bench.py` where possible.
 
-> ### Items 1–2 ✅ 2026-08-08. **Items 3–4 are BLOCKED, and not on schedule.**
+> ### Items 1–2 ✅ 2026-08-08. Items 3–4 were BLOCKED; **unblocked the same day.**
+>
+> The block was braid's own prefill, not the reference engine. It is fixed — Phase 5
+> item 5 below — and the paragraphs that follow are kept as written, with the
+> resolution after them, because the reasoning that promoted item 5 to blocking is
+> the reason the head-to-head is now worth running.
 >
 > `braid/serve/{scheduler,server}.py` and `braid/bench/serve_bench.py`. Continuous
 > batching, admission-only, chunked prefill, per-row sampling, SSE over stdlib
@@ -544,6 +565,113 @@ modelled and Phase 4's gate needs revisiting before it is run.
 > `prefill_chunk` trades the ITL tail against throughput (490 ms p99 / 114.5 tok/s at
 > 256, versus 68 ms / 58.6 at 8) with no good setting. Full curve in the serving
 > runbook.
+>
+> #### ✅ Resolved 2026-08-08 — and the "no good setting" reading was an artifact
+>
+> Ragged batched prefill landed (Phase 5 item 5). At c=16, 128-token prompts, medians
+> of 3 processes: **aggregate 122.1 → 850.1 tok/s (6.96x)**, prefill **270 → 4,301
+> tok/s (15.9x)**, prefill's share of the wall clock **90% → 40%**.
+>
+> The `prefill_chunk` sentence above measured correctly and concluded wrongly. Its ITL
+> tail was not the price of a wide prefill tick; it was the price of **many narrow
+> ones**, each blocking decode for the same fixed scan loop. Batching the rows removes
+> the tail and raises throughput at the same time — at c=16, ITL p99 goes **488 ms →
+> 15.3 ms** while aggregate rises 7x. There is a good setting, and it is "batch every
+> resident row", which is now the default.
+
+> ### Items 3–4 ✅ RUN 2026-08-08. **Verdict: NO-GO against the locked target,
+> but braid beats llama.cpp at B ≥ 32.**
+>
+> **Item 3 — the baseline reproduces.** llama.cpp re-measured on this box one day
+> after the runbook: tg128 251.59 vs 251.84 (−0.10%), S_TG at npl 1/8/16 250.52 /
+> 1,403.55 / 1,881.98 vs 250.11 / 1,418.06 / 1,879.68 (+0.16% / −1.02% / +0.12%). All
+> inside the 1.66% noise floor and far inside the ±10% gate.
+>
+> **Item 4 — the sweep.** Both arms in one session, ABBA order, 5 processes per arm per
+> point, `scripts/head_to_head.sh`. Decode-only aggregate, KV 128..256 on both arms.
+> Per-arm spreads 0.0–0.4%; host healthy throughout.
+>
+> | B | llama.cpp | braid BF16 | braid FP8-MLP | delta | |
+> |---:|---:|---:|---:|---:|:--|
+> | 1 | 250.0 | 131.3 (0.53×) | 131.7 (0.53×) | −47.3% | lose |
+> | 2 | 452.2 | 221.7 (0.49×) | 232.2 (0.51×) | −48.7% | lose |
+> | 4 | 810.7 | 433.0 (0.53×) | 451.8 (0.56×) | −44.3% | lose |
+> | 8 | 1,399.8 | 765.2 (0.55×) | 840.9 (0.60×) | −39.9% | lose |
+> | 16 | 1,874.8 | 1,425.2 (0.76×) | 1,573.7 (0.84×) | −16.1% | lose |
+> | 32 | 2,454.2 | 2,994.5 (1.22×) | **3,035.9 (1.24×)** | **+23.7%** | **win** |
+> | 64 | 2,915.9 | 4,169.9 (1.43×) | **4,333.4 (1.49×)** | **+48.6%** | **win** |
+>
+> **The GO/NO-GO fails.** The target is ≥+25% at B=16 and ≥+100% at B=64; braid gives
+> −16.1% and +48.6%. Per this phase's own clause: **stop and re-plan rather than
+> iterate.** §Re-plan below.
+>
+> #### ✅ CLOSED 2026-08-09: the target as WRITTEN is met, one model up, one day later
+>
+> On Qwen3.5-9B, after FP8-on-every-projection, fp16 state storage, the chunk-cached
+> prefill scan and the launch diet: **+26.5% at B=16 and +118.8% at B=64** (5 processes
+> per arm, every same-rep pairing clears both clauses, worst pairing +25.8%). The
+> re-scope below was adopted in the interim and published as such; it is now academic.
+> The batches named by the original target were never moved — the two NO-GO
+> publications above stand as the record of the path. README `95612cc` has the tables.
+>
+> **The thesis itself survives, and is now measured.** braid scales 32.9× from B=1 to
+> B=64 where llama.cpp scales 11.7×. The curve has the predicted shape; it crosses
+> later and by less than projected, landing at a consistent ~2/3 of the roofline
+> projection (65% / 66% / 74% / 67% at B=8/16/32/64).
+>
+> #### Two corrections, and the second is the important one
+>
+> **1. The published 0.85× at B=16 was not shape-matched.** `decode_speed.py` seeded
+> rows with an 8-token prompt, timing braid at KV 8..200 against llama.cpp's KV
+> 128..256. Decode attention reads the whole live KV every step, so braid was timed on
+> a cheaper step. Shape-matched BF16 at B=16 is **0.76×**. Fixed by `--prompt-len`,
+> which the head-to-head sets to the competitor's `-npp`.
+>
+> **2. Phase 1 item 4's "batch buckets stop at 16" was wrong on every clause, and it
+> was hiding the win.** It held that c=32 does not fit in VRAM and is
+> throughput-pointless because the linear state term overtakes the fixed weight sweep
+> at B=14–18. Measured:
+>
+> | claim | measured |
+> |---|---|
+> | c=32 does not fit in VRAM | B=64 peaks at **20.61 GB of 32.6 GB** (B=32: 15.75) |
+> | throughput-pointless | B=16→32 is **1.93×**, B=32→64 is **1.43×** |
+> | state overtakes weights at B=14–18 | 102 MiB/seq against 8.44 GB of weights ⇒ **B≈83** |
+>
+> This item scoped the sweep at c ∈ {1,2,4,8,16} — **exactly the range where braid
+> loses every row.** Run as written, it returns a clean NO-GO while the win sits one
+> bucket higher. A planning assumption that was never re-measured came within one
+> parameter of falsifying the project's central claim. That is the process failure to
+> carry forward, not the arithmetic error.
+
+### Re-plan, per the falsification clause
+
+The target was written before any of the curve existed. What the measurement says:
+
+1. **The crossover is real and reproducible, and it is at B=32.** The honest headline
+   is "braid wins above batch 16", not "braid hits the wall". Publish the whole curve.
+2. **The B=16 target clause is the one to question, not the engine.** braid is −16.1%
+   there and the deficit is weight bytes: BF16 8.44 GB against Q8_0 4.47 GB. FP8 on the
+   MLP alone (54% of weights) moved B=16 from 0.76× to 0.84×. Quantizing the rest is
+   the only lever with the size to close it, and it is arithmetic, not research.
+3. **The B=64 clause (+100%) is not reachable by quantization alone.** Full 8-bit
+   weights take braid to roughly parity on bytes with llama.cpp; the remaining gap to
+   +100% would have to come from the ~2/3-of-roofline efficiency, which is the
+   GEMM-dominated step, not the scan.
+4. **Raise the batch ceiling.** Every bucket above 16 is now known to fit and to pay.
+   The graph buckets, the scheduler capacity and the serving benchmark all still stop
+   at 16 because Phase 1 said to.
+
+**Recommended re-scope:** target **≥+20% at B=32 and ≥+50% at B=64**, both of which are
+already met, and treat B≤16 as published losses with a stated cause. That is a claim
+braid can defend today rather than one it is 1.49× away from.
+
+> **2026-08-09:** the re-scope served its purpose and is retired — the original
+> clauses are met on the 9B (see the closure note in the verdict block above).
+> Points 2 and 3 of the analysis above were both vindicated in the mechanism they
+> named: bytes closed the B=16 clause, and the B=64 clause was closed not by
+> quantization alone but by removing the non-GEMM work around the GEMMs (the launch
+> diet), exactly where point 3 said the remainder had to come from.
 
 **GO / NO-GO.** Braid's median aggregate at c=8 must exceed theirs at c=8 by more than
 the combined spread of the two arms, with every correctness pre-gate green — **and the c=1
@@ -570,13 +698,73 @@ ranks them, which is **not** the order the original spec had.
 
 | | Item | Why it ranks here |
 |---|---|---|
-| **5** | **Ragged batched prefill over the recurrent scan** | **Promoted from last to first.** `gdn_scan_chunkwise` is **44% of hybrid prefill**, on 32 of 170 SMs, and it is **structurally invisible to the reference engine** — their ncu capture regex matches none of the scan kernel names, so it has never had an arithmetic intensity or a lever entry in any of 12 committed runs. It is also their largest published deficit (1.55–2.17× behind llama.cpp on hybrid prefill), and prefill is the TTFT axis that agent fan-out actually pays. The original spec called prefill "not the metric"; that was wrong. |
+| **5** | **Ragged batched prefill over the recurrent scan** — ✅ **DONE 2026-08-08**, see below | **Promoted from last to first.** `gdn_scan_chunkwise` is **44% of hybrid prefill**, on 32 of 170 SMs, and it is **structurally invisible to the reference engine** — their ncu capture regex matches none of the scan kernel names, so it has never had an arithmetic intensity or a lever entry in any of 12 committed runs. It is also their largest published deficit (1.55–2.17× behind llama.cpp on hybrid prefill), and prefill is the TTFT axis that agent fan-out actually pays. The original spec called prefill "not the metric"; that was wrong. |
 | 6 | The fairness-quantum story | Free — it falls out of Phase 4. At c=8 a waiting stream's worst-case first-token delay under the reference engine's default is `(N−1) × 128 × 3.1 ms ≈ 2.8 s`; braid at B=8 gives every stream a token every ~1.1 ms. **Measurable against them today**, before braid exists. |
-| 7 | FP8 KV + FP16 h_state | Worth 640 MiB and 510 MiB at c=16 — the difference between a razor-thin c=16 and a comfortable one, and FP16 state halves the term that caps the curve. **Neither is refuted.** FP8 KV's per-family gate on Qwen3.5/3.6 is simply *unrun*; FP16 state's only failure in the reference engine was a buffer overrun, and they run FP16 state on Mamba2 today. |
+| 7 | FP8 KV + **FP16 h_state — ✅ DONE 2026-08-09** | Worth 640 MiB and 510 MiB at c=16 — the difference between a razor-thin c=16 and a comfortable one, and FP16 state halves the term that caps the curve. **Neither is refuted.** FP8 KV's per-family gate on Qwen3.5/3.6 is simply *unrun*; FP16 state's only failure in the reference engine was a buffer overrun, and they run FP16 state on Mamba2 today. |
 | 8 | FP8 row-scale GDN projections in the batched path | The reference engine's best hybrid decode lever (+19% at batch 1) is `M==1` only and evaporates at concurrency. ~10% of our batched step. **Per-row scales only** — one per-tensor scale over the fused pack costs +4% PPL. |
 | 9 | Quantizer with MoE expert calibration | **Bigger and harder than the original spec states.** "Default to `--calib-groups BD`" is *undefined on our target*: group D matches `mlp.down_proj.weight` by exact name, which does not exist on a MoE layer, and group B is refused by fold-safety. On Qwen3.6-35B-A3B, `BD` resolves to nothing. This is genuinely new per-expert group modelling, ~1,200 lines and 4–6 weeks — and their own diagnosis warns the objective may be wrong ("a checkpoint whose weights each reconstruct better can still be a worse model"). |
 | 10 | Pure-SSM (Mamba2 / Nemotron-H) | Highest ratio, lowest strategic value. The reference engine's CUDA graphs are structurally **off** for pure-SSM (`PureSsmLayers`: *"Mamba2 recurrent state is not graph-safe yet"*) stacked on the batch clamp — a 148 tok/s baseline where a comparable 30B reads 338. But it is one model family and they call the deficit arch-limited. |
 | 11 | Qwen3.8-27B | Gated on the weights publishing (~2026-08-10) **and** on confirming it inherits the Qwen3.6 hybrid layer pattern. If it ships as pure attention, the thesis does not apply and it is dropped. Their registry tops out at `QWEN36_MOE`, so here we would start level. |
+
+### Item 5 — done 2026-08-08, and what it did *not* do
+
+`seq_lens[B]` beside a right-padded `[B, T]` rectangle: pad columns are an exact
+identity on the recurrent state (`alpha = 1, beta = 0`), the conv window is re-saved
+from a per-row offset, and padded KV columns go to a sink position the reader never
+returns. 170 tests green, 13 net new — 10 in `tests/test_ragged_prefill.py`, plus a
+co-prefill non-vacuity assertion and a budget-floor test beside the scheduler gate.
+
+Measured, 128-token prompts, 64 new tokens, graphs on, CUDA kernels, bf16, medians of
+3 processes, spread ≤ 0.8%, box noise floor 1.70%:
+
+| c | aggregate tok/s | prefill tok/s | ITL p99 ms |
+|---|---|---|---|
+| | one row → batched | one row → batched | one row → batched |
+| 1 | 66.2 → 66.2 (1.00×) | 269 → 269 (1.0×) | 8.1 → 8.0 |
+| 2 | 83.7 → 123.0 (1.47×) | 270 → 553 (2.0×) | 482.6 → 9.7 |
+| 4 | 102.3 → 241.6 (2.36×) | 270 → 1,096 (4.1×) | 485.0 → 10.4 |
+| 8 | 113.7 → 447.9 (3.94×) | 269 → 2,175 (8.1×) | 487.7 → 12.6 |
+| 16 | **122.1 → 850.1 (6.96×)** | **270 → 4,301 (15.9×)** | **487.6 → 15.3** |
+
+Both arms are the same binary; the baseline arm is `prefill_budget` set to the prompt
+length, which admits exactly one row per forward. It reproduces the 2026-08-08 published
+figure (122.1 against 120) so the two arms are comparable rather than cross-day.
+
+**Prefill tok/s is exactly `270 × rows-per-forward`**, to 3 significant figures, up to
+the point the budget caps it. That is the whole mechanism and it is worth stating
+plainly: the scan's Python loop costs one iteration per *column*, not per token, so
+sixteen rows cost what one row costs. Nothing about the arithmetic got faster.
+
+### Item 5's leftover — the chunk scan — ✅ done 2026-08-09
+
+`gdn_prefill`: one launch per layer for a `[B, T]` chunk, state resident in registers
+across the chunk, arithmetic line-for-line identical to `gdn_decode_kernel`. Gated on
+**bit-identity against the decode kernel applied T times**, which is only possible
+because it is a chunk-cached *scalar* loop and not a WY/UT reformulation — exactly the
+shape the refutation ledger left open.
+
+Measured on Qwen3.5-9B, same binary and weights, scan toggled via
+`Engine.set_chunk_prefill`:
+
+| c | served tok/s | prefill tok/s | TTFT p50 | prefill % of wall |
+|---|---|---|---|---|
+| 1 | 56.9 → **97.3** | 255 → **3,585** | 514 → **47 ms** | 45% → 5% |
+| 16 | 828.3 → **1,165.9** | 4,073 → **14,045** | 1,755 → **1,040 ms** | 41% → 17% |
+| 32 | 1,171.7 → **1,888.4** | 4,253 → **13,601** | 2,732 → **1,406 ms** | 55% → 28% |
+| 64 | 1,129.5 → **2,561.0** | 3,079 → **12,913** | 6,318 → **2,265 ms** | 73% → 40% |
+
+Served throughput used to fall from c=32 to c=64; it now rises. ITL is unchanged to
+three significant figures in both arms — the control that says this is prefill and
+nothing else. Costs +0.03% perplexity for the fp32 l2norm the decode kernel already had.
+
+---
+
+**What is still on the table.** The loop still runs `T` iterations per layer, so prefill
+is still 40% of the wall clock at c=16 and the per-row rate is unchanged at c=1. Cutting
+the *iteration count* — a chunkwise scan holding the state resident across C tokens — is
+a separate and unrefuted lever. Note the refutation ledger rules out **tensor-core**
+chunkwise variants, not chunking: what beat them was "a plain chunk-cached scalar loop",
+which is precisely the shape this would take.
 
 ---
 
@@ -606,3 +794,11 @@ measurements. The three most likely to tempt us:
   WY/SSD as a later optimization" is dead ground.
 - **NVFP4 on the GDN projections.** Measured at −9% to −20% decode. Tuned FP16 wins on those
   shapes.
+
+- **4-bit weights at the batches braid wins at.** Added 2026-08-09 with the measurement.
+  `torch._weight_int4pack_mm` is present and fast where braid is weak — 3.13× over FP8 at
+  M=1, 1.66× at M=8 — but it is a GEMV kernel and collapses where braid is strong:
+  **0.22× at M=32, 0.12× at M=64**. It wins exactly where braid loses and loses exactly
+  where braid wins, so it does not serve the thesis. Adopting it at low batch would also
+  require moving the competitor to Q4_K_M in the same table, or the comparison is a
+  precision choice wearing a speedup's clothes. `scripts/fp4_probe.py`.
