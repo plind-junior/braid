@@ -161,6 +161,11 @@ bot checks out your merged tree, runs the suite on a real RTX 5090, benches it a
 `main` in the same session, and posts the table on your PR. See
 [CONTRIBUTING.md](CONTRIBUTING.md) for the rules and the workflow.
 
+Every runtime PR is measured on a real 5090 by the eval bot; the verdict is
+re-derived inside an Intel TDX machine and lands as an `eval:*` label, a
+required `braid/eval` commit status, and an auditable receipt under
+`refs/notes/braid-eval`. The full contract is in `CONTRIBUTING.md`.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
