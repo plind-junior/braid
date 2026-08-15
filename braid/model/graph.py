@@ -17,6 +17,8 @@ true of the whole model rather than of one kernel.
 arithmetic is concerned — they occupy slots, advance those slots' lengths, and
 write KV. They must therefore point at *scratch* slots that no live sequence
 owns, or a padded row will corrupt a real one's state.
+
+The capture-safety contract this class depends on is stated in CONTRIBUTING.md.
 """
 from __future__ import annotations
 
